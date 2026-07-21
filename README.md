@@ -1,4 +1,4 @@
-# tauri-starter
+# Codex Relay
 
 一个面向团队协作的 Tauri 2 桌面应用起始项目。前端使用 React、TypeScript 与 Vite，桌面端使用 Rust；默认不开放文件系统、Shell、外部网络或业务 IPC 权限。
 
