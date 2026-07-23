@@ -14,7 +14,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build --debug --bundles app",
+    "tauri:build": "tauri build --debug",
+    "tauri:package": "tauri build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "pnpm lint --fix",
@@ -31,7 +32,12 @@
   "dependencies": {
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "@tauri-apps/api": "^2"
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "@gsap/react": "^2.1.2",
+    "@phosphor-icons/react": "^2.1.10",
+    "gsap": "^3.13.0",
+    "recharts": "^2.15.1"
   },
   "devDependencies": {
     "@commitlint/cli": "^19.8.1",

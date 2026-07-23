@@ -1,0 +1,1033 @@
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowsClockwise,
+  CaretDown,
+  Check,
+  CheckCircle,
+  CloudArrowUp,
+  Key,
+  Plus,
+  Trash,
+  UserSwitch,
+} from "@phosphor-icons/react";
+import {
+  FormEvent,
+  KeyboardEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+
+import type {
+  DesktopWorkspaceMode,
+  MaskedProfile,
+  OAuthImportStatus,
+  ProfileQuota,
+  ProfileQuotaWindow,
+  ProfileSubscription,
+} from "../../shared/ipc";
+
+interface ProfilesProps {
+  profiles: MaskedProfile[];
+  busy: boolean;
+  onSelect: (id: string) => Promise<void>;
+  onStartOAuth: (profileId?: string) => Promise<OAuthImportStatus>;
+  onOAuthStatus: (attemptId: string) => Promise<OAuthImportStatus>;
+  onCancelOAuth: (attemptId: string) => Promise<void>;
+  onCompleteOAuth: (attemptId: string, alias?: string) => Promise<void>;
+  onSyncAccount: (id: string) => Promise<void>;
+  onDelete: (id: string, alias: string) => void;
+  workspaceMode?: DesktopWorkspaceMode;
+}
+
+type ImportFlow =
+  | { step: "picker" }
+  | { step: "authorizing"; status: OAuthImportStatus }
+  | { step: "naming"; status: OAuthImportStatus }
+  | null;
+
+type ProfileSortKey = "default" | "quota" | "subscription" | "reset";
+type ProfileSortDirection = "urgent" | "reverse";
+type OpenFilterMenu = "subscription" | "sort" | null;
+
+interface FilterMenuOption<T extends string> {
+  value: T;
+  label: string;
+}
+
+const ALL_SUBSCRIPTIONS = "all";
+const UNSYNCED_SUBSCRIPTION = "unsynced";
+const PROFILE_SORT_OPTIONS: FilterMenuOption<ProfileSortKey>[] = [
+  { value: "default", label: "默认顺序" },
+  { value: "quota", label: "剩余额度" },
+  { value: "subscription", label: "订阅剩余时间" },
+  { value: "reset", label: "额度重置时间" },
+];
+
+export function Profiles({
+  profiles,
+  busy,
+  onSelect,
+  onStartOAuth,
+  onOAuthStatus,
+  onCancelOAuth,
+  onCompleteOAuth,
+  onSyncAccount,
+  onDelete,
+  workspaceMode = "per_profile",
+}: ProfilesProps) {
+  const [flow, setFlow] = useState<ImportFlow>(null);
+  const [nameQuery, setNameQuery] = useState("");
+  const [emailQuery, setEmailQuery] = useState("");
+  const [subscriptionFilter, setSubscriptionFilter] = useState(ALL_SUBSCRIPTIONS);
+  const [sortKey, setSortKey] = useState<ProfileSortKey>("default");
+  const [sortDirection, setSortDirection] = useState<ProfileSortDirection>("urgent");
+  const [openMenu, setOpenMenu] = useState<OpenFilterMenu>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const completing = useRef(false);
+  const subscriptionTypes = useMemo(
+    () =>
+      [
+        ...new Set(
+          profiles.flatMap((profile) => {
+            const planType = profile.account?.subscription.plan_type;
+            return planType ? [planType] : [];
+          }),
+        ),
+      ].sort((left, right) =>
+        subscriptionPlanLabel(left).localeCompare(
+          subscriptionPlanLabel(right),
+          "zh-CN",
+        ),
+      ),
+    [profiles],
+  );
+  const subscriptionOptions = useMemo<FilterMenuOption<string>[]>(
+    () => [
+      { value: ALL_SUBSCRIPTIONS, label: "全部套餐" },
+      ...subscriptionTypes.map((planType) => ({
+        value: planType,
+        label: subscriptionPlanLabel(planType),
+      })),
+      { value: UNSYNCED_SUBSCRIPTION, label: "尚未同步" },
+    ],
+    [subscriptionTypes],
+  );
+  const visibleProfiles = useMemo(
+    () =>
+      profiles
+        .map((profile, index) => ({ profile, index }))
+        .filter(({ profile }) =>
+          matchesProfileFilters(profile, nameQuery, emailQuery, subscriptionFilter),
+        )
+        .sort((left, right) => {
+          const comparison = compareProfiles(
+            left.profile,
+            right.profile,
+            sortKey,
+            sortDirection,
+          );
+          return comparison || left.index - right.index;
+        })
+        .map(({ profile }) => profile),
+    [emailQuery, nameQuery, profiles, sortDirection, sortKey, subscriptionFilter],
+  );
+  const hasActiveFilters =
+    Boolean(nameQuery || emailQuery) ||
+    subscriptionFilter !== ALL_SUBSCRIPTIONS ||
+    sortKey !== "default";
+
+  const clearFilters = () => {
+    setNameQuery("");
+    setEmailQuery("");
+    setSubscriptionFilter(ALL_SUBSCRIPTIONS);
+    setSortKey("default");
+    setSortDirection("urgent");
+    setOpenMenu(null);
+  };
+
+  const closeFlow = useCallback(() => {
+    completing.current = false;
+    setFlow(null);
+    setImportError(null);
+  }, []);
+  const beginOAuth = async (profileId?: string) => {
+    setImportError(null);
+    try {
+      const status = await onStartOAuth(profileId);
+      setFlow({ step: "authorizing", status });
+    } catch {
+      setImportError("无法启动官方登录。请确认 Codex CLI 与系统安全存储可用后重试。");
+    }
+  };
+  const handleStatus = useCallback(
+    async (status: OAuthImportStatus) => {
+      if (status.phase === "authorizing") {
+        setFlow({ step: "authorizing", status });
+        return;
+      }
+      if (status.phase === "authenticated") {
+        if (status.profile_id) {
+          if (completing.current) return;
+          completing.current = true;
+          try {
+            await onCompleteOAuth(status.attempt_id);
+            closeFlow();
+          } catch {
+            setImportError("授权已完成，但无法更新档案状态。请重试或重新授权。");
+          }
+          return;
+        }
+        setFlow({ step: "naming", status });
+        return;
+      }
+      setImportError(status.message);
+      setFlow({ step: "picker" });
+    },
+    [closeFlow, onCompleteOAuth],
+  );
+
+  useEffect(() => {
+    if (flow?.step !== "authorizing") return;
+    const timer = window.setInterval(() => {
+      void onOAuthStatus(flow.status.attempt_id)
+        .then(handleStatus)
+        .catch(() => {
+          setImportError("无法读取授权状态；请取消后重试。");
+        });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [flow, handleStatus, onOAuthStatus]);
+
+  return (
+    <div className="page profiles-page">
+      <header className="page-heading" data-animate="heading">
+        <div>
+          <p className="section-kicker">Profiles</p>
+          <h1>档案与账号池</h1>
+          <p className="page-subtitle">
+            档案凭据仅保存到系统安全存储；这里始终显示掩码和状态。
+          </p>
+        </div>
+        <button
+          className="primary-button"
+          type="button"
+          onClick={() => setFlow({ step: "picker" })}
+        >
+          <Plus size={18} weight="bold" /> 添加档案
+        </button>
+      </header>
+      <section className="toolbar profile-filter-toolbar" data-animate="toolbar">
+        <div className="profile-filter-fields">
+          <label className="profile-filter-field">
+            <span>档案名称</span>
+            <input
+              value={nameQuery}
+              onChange={(event) => setNameQuery(event.target.value)}
+              placeholder="按档案名称筛选"
+            />
+          </label>
+          <label className="profile-filter-field">
+            <span>邮箱</span>
+            <input
+              value={emailQuery}
+              onChange={(event) => setEmailQuery(event.target.value)}
+              placeholder="按邮箱筛选"
+              type="search"
+            />
+          </label>
+          <div className="profile-filter-field">
+            <span>订阅类型</span>
+            <FilterMenu
+              id="subscription-filter"
+              label="订阅类型"
+              onChange={setSubscriptionFilter}
+              onOpenChange={(isOpen) => setOpenMenu(isOpen ? "subscription" : null)}
+              open={openMenu === "subscription"}
+              options={subscriptionOptions}
+              value={subscriptionFilter}
+            />
+          </div>
+          <div className="profile-filter-field profile-sort-field">
+            <span>排序方式</span>
+            <div className="profile-sort-controls">
+              <FilterMenu
+                id="profile-sort"
+                label="排序方式"
+                onChange={(nextSortKey) => {
+                  setSortKey(nextSortKey);
+                  if (nextSortKey !== "default") setSortDirection("urgent");
+                }}
+                onOpenChange={(isOpen) => setOpenMenu(isOpen ? "sort" : null)}
+                open={openMenu === "sort"}
+                options={PROFILE_SORT_OPTIONS}
+                value={sortKey}
+              />
+              <button
+                aria-label={
+                  sortKey === "default"
+                    ? "选择排序方式后可切换排序方向"
+                    : `当前${sortDirection === "urgent" ? "紧急优先" : "高值优先"}，点击切换`
+                }
+                className="profile-sort-direction"
+                disabled={sortKey === "default"}
+                onClick={() =>
+                  setSortDirection((direction) =>
+                    direction === "urgent" ? "reverse" : "urgent",
+                  )
+                }
+                title={
+                  sortKey === "default"
+                    ? "选择排序方式后可切换排序方向"
+                    : sortDirection === "urgent"
+                      ? "紧急优先"
+                      : "高值优先"
+                }
+                type="button"
+              >
+                {sortDirection === "urgent" ? (
+                  <ArrowDown size={16} />
+                ) : (
+                  <ArrowUp size={16} />
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="profile-filter-summary">
+          <span aria-live="polite" className="toolbar-count">
+            显示 {visibleProfiles.length} / 共 {profiles.length} 个档案
+          </span>
+          {hasActiveFilters && (
+            <button
+              className="text-button profile-filter-clear"
+              onClick={clearFilters}
+              type="button"
+            >
+              清除筛选
+            </button>
+          )}
+        </div>
+      </section>
+      <section className="privacy-banner" data-animate="notice">
+        <CloudArrowUp size={23} weight="fill" />
+        <div>
+          <strong>当前档案会按所选模式启动 Codex 工作区</strong>
+          <p>
+            添加账号时会保存 OAuth 凭据。当前模式为“{workspaceModeLabel(workspaceMode)}
+            ”；切换会更新默认 .codex/auth.json 与 Codex Auth 钥匙串，不会迁移 ChatGPT
+            Chat/Work 的独立登录会话。
+          </p>
+        </div>
+      </section>
+      {flow && (
+        <OAuthImportSheet
+          flow={flow}
+          busy={busy}
+          error={importError}
+          onClose={closeFlow}
+          onStart={() => void beginOAuth()}
+          onCancel={async (attemptId) => {
+            try {
+              await onCancelOAuth(attemptId);
+              closeFlow();
+            } catch {
+              setImportError("无法取消登录；请关闭官方登录页后重试。");
+            }
+          }}
+          onComplete={async (attemptId, alias) => {
+            try {
+              await onCompleteOAuth(attemptId, alias);
+              closeFlow();
+            } catch {
+              setImportError("无法保存档案。凭据未被复制到应用中，请修改名称后重试。");
+            }
+          }}
+        />
+      )}
+      <section className="profile-grid" data-animate="cards">
+        {visibleProfiles.map((profile) => (
+          <ProfileCard
+            key={profile.id}
+            profile={profile}
+            busy={busy}
+            onSelect={onSelect}
+            onReauthorize={() => void beginOAuth(profile.id)}
+            onSyncAccount={onSyncAccount}
+            onDelete={onDelete}
+          />
+        ))}
+        {!visibleProfiles.length && (
+          <article className="empty-state">
+            <CloudArrowUp size={38} weight="duotone" />
+            {profiles.length ? (
+              <>
+                <h2>没有匹配的档案</h2>
+                <p>请调整筛选条件，或清除筛选后查看全部档案。</p>
+                <button className="quiet-button" onClick={clearFilters} type="button">
+                  清除筛选
+                </button>
+              </>
+            ) : (
+              <>
+                <h2>从一个已获授权的连接开始</h2>
+                <p>通过官方 OpenAI / ChatGPT OAuth 登录创建受管 Codex 档案。</p>
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => setFlow({ step: "picker" })}
+                >
+                  <Plus size={17} /> 添加档案
+                </button>
+              </>
+            )}
+          </article>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function FilterMenu<T extends string>({
+  id,
+  label,
+  onChange,
+  onOpenChange,
+  open,
+  options,
+  value,
+}: {
+  id: string;
+  label: string;
+  onChange: (value: T) => void;
+  onOpenChange: (open: boolean) => void;
+  open: boolean;
+  options: FilterMenuOption<T>[];
+  value: T;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const selectedIndex = Math.max(
+    options.findIndex((option) => option.value === value),
+    0,
+  );
+
+  useEffect(() => {
+    if (!open) return;
+
+    optionRefs.current[selectedIndex]?.focus();
+  }, [open, selectedIndex]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const closeOnOutsidePointerDown = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !containerRef.current?.contains(event.target)
+      ) {
+        onOpenChange(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", closeOnOutsidePointerDown);
+    return () => window.removeEventListener("pointerdown", closeOnOutsidePointerDown);
+  }, [onOpenChange, open]);
+
+  const closeAndRestoreFocus = () => {
+    onOpenChange(false);
+    triggerRef.current?.focus();
+  };
+  const selectOption = (option: FilterMenuOption<T>) => {
+    onChange(option.value);
+    closeAndRestoreFocus();
+  };
+  const moveFocus = (index: number) => {
+    optionRefs.current[(index + options.length) % options.length]?.focus();
+  };
+  const handleOptionKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveFocus(index + 1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveFocus(index - 1);
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      moveFocus(0);
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      moveFocus(options.length - 1);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeAndRestoreFocus();
+      return;
+    }
+    if (event.key === "Tab") {
+      onOpenChange(false);
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectOption(options[index]);
+    }
+  };
+  const selectedOption = options[selectedIndex];
+
+  return (
+    <div className={`profile-menu ${open ? "is-open" : ""}`} ref={containerRef}>
+      <button
+        aria-controls={`${id}-listbox`}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        aria-label={`${label}：${selectedOption.label}`}
+        className="profile-menu-trigger"
+        onClick={() => onOpenChange(!open)}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            onOpenChange(true);
+          }
+        }}
+        ref={triggerRef}
+        type="button"
+      >
+        <span>{selectedOption.label}</span>
+        <CaretDown aria-hidden="true" className="profile-menu-caret" size={16} />
+      </button>
+      {open && (
+        <div
+          aria-label={`${label}选项`}
+          className="profile-menu-list"
+          id={`${id}-listbox`}
+          role="listbox"
+        >
+          {options.map((option, index) => {
+            const selected = option.value === value;
+            return (
+              <button
+                aria-selected={selected}
+                className="profile-menu-option"
+                key={option.value}
+                onClick={(event) => {
+                  if (event.detail === 0) selectOption(option);
+                }}
+                onKeyDown={(event) => handleOptionKeyDown(event, index)}
+                onPointerDown={(event) => {
+                  event.preventDefault();
+                  selectOption(option);
+                }}
+                ref={(element) => {
+                  optionRefs.current[index] = element;
+                }}
+                role="option"
+                type="button"
+              >
+                <span>{option.label}</span>
+                {selected && <Check aria-hidden="true" size={16} weight="bold" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function matchesProfileFilters(
+  profile: MaskedProfile,
+  nameQuery: string,
+  emailQuery: string,
+  subscriptionFilter: string,
+) {
+  const normalizedName = nameQuery.trim().toLowerCase();
+  const normalizedEmail = emailQuery.trim().toLowerCase();
+  const profileEmail = profile.account?.email?.toLowerCase() ?? "";
+  const planType = profile.account?.subscription.plan_type ?? null;
+
+  return (
+    (!normalizedName || profile.alias.toLowerCase().includes(normalizedName)) &&
+    (!normalizedEmail || profileEmail.includes(normalizedEmail)) &&
+    (subscriptionFilter === ALL_SUBSCRIPTIONS ||
+      (subscriptionFilter === UNSYNCED_SUBSCRIPTION
+        ? profile.kind === "codex_oauth" && !planType
+        : planType === subscriptionFilter))
+  );
+}
+
+function compareProfiles(
+  left: MaskedProfile,
+  right: MaskedProfile,
+  sortKey: ProfileSortKey,
+  sortDirection: ProfileSortDirection,
+) {
+  if (sortKey === "default") return 0;
+
+  const leftValue = profileSortValue(left, sortKey);
+  const rightValue = profileSortValue(right, sortKey);
+  if (leftValue === null) return rightValue === null ? 0 : 1;
+  if (rightValue === null) return -1;
+
+  const comparison = leftValue - rightValue;
+  return sortDirection === "urgent" ? comparison : -comparison;
+}
+
+function profileSortValue(
+  profile: MaskedProfile,
+  sortKey: Exclude<ProfileSortKey, "default">,
+) {
+  if (sortKey === "subscription") {
+    return profile.account?.subscription.period_ends_at_ms ?? null;
+  }
+
+  const windows = quotaWindows(profile.account?.quota);
+  const values = windows
+    .map((window) =>
+      sortKey === "quota" ? window.remaining_percent : window.resets_at_ms,
+    )
+    .filter(
+      (value): value is number => typeof value === "number" && Number.isFinite(value),
+    );
+
+  return values.length ? Math.min(...values) : null;
+}
+
+function quotaWindows(quota: ProfileQuota | null | undefined) {
+  const bucketWindows =
+    quota?.buckets.flatMap((bucket) => [bucket.primary, bucket.secondary]) ?? [];
+  const windows = bucketWindows.length
+    ? bucketWindows
+    : [quota?.primary, quota?.secondary];
+  return windows.filter((window): window is ProfileQuotaWindow => Boolean(window));
+}
+
+function workspaceModeLabel(mode: DesktopWorkspaceMode) {
+  return {
+    fresh: "每次全新启动",
+    per_profile: "账号独立工作区",
+    shared: "共享原客户端状态",
+  }[mode];
+}
+
+function OAuthImportSheet({
+  flow,
+  busy,
+  error,
+  onClose,
+  onStart,
+  onCancel,
+  onComplete,
+}: {
+  flow: Exclude<ImportFlow, null>;
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onStart: () => void;
+  onCancel: (attemptId: string) => Promise<void>;
+  onComplete: (attemptId: string, alias: string) => Promise<void>;
+}) {
+  const [alias, setAlias] = useState("");
+  const dismiss = () => {
+    if (flow.step === "authorizing" || flow.step === "naming") {
+      void onCancel(flow.status.attempt_id);
+      return;
+    }
+    onClose();
+  };
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (flow.step === "naming") void onComplete(flow.status.attempt_id, alias);
+  };
+  return (
+    <section className="form-sheet" aria-labelledby="oauth-import-title">
+      <div className="form-sheet-heading">
+        <div>
+          <p className="section-kicker">Import profile</p>
+          <h2 id="oauth-import-title">
+            {flow.step === "naming" ? "为新档案命名" : "选择导入方式"}
+          </h2>
+        </div>
+        {flow.step === "authorizing" ? (
+          <button
+            className="text-button"
+            type="button"
+            onClick={() => void onCancel(flow.status.attempt_id)}
+          >
+            取消登录
+          </button>
+        ) : (
+          <button className="text-button" type="button" onClick={dismiss}>
+            取消
+          </button>
+        )}
+      </div>
+      {error && <p className="form-note error-note">{error}</p>}
+      {flow.step === "picker" && (
+        <div className="oauth-option">
+          <div>
+            <strong>使用 OpenAI / ChatGPT 登录</strong>
+            <p>
+              将在默认浏览器中打开官方 OAuth 页面。完成后会将凭据保存到 Relay
+              Keychain，后续切换无需再次授权。
+            </p>
+          </div>
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busy}
+            onClick={onStart}
+          >
+            继续使用 OAuth
+          </button>
+        </div>
+      )}
+      {flow.step === "authorizing" && (
+        <div className="oauth-progress" role="status">
+          <strong>等待默认浏览器授权完成</strong>
+          <p>{flow.status.message}</p>
+          <p>请在默认浏览器完成登录。凭据会在创建档案后保存，后续切换无需重新登录。</p>
+        </div>
+      )}
+      {flow.step === "naming" && (
+        <form onSubmit={submit}>
+          <label>
+            档案名称
+            <input
+              required
+              autoFocus
+              value={alias}
+              onChange={(event) => setAlias(event.target.value)}
+              placeholder="例如：个人 OpenAI"
+            />
+          </label>
+          <p className="form-note">模型能力将先标记为未知，且不会自动加入账号池。</p>
+          <div className="form-actions">
+            <button className="quiet-button" type="button" onClick={dismiss}>
+              取消
+            </button>
+            <button className="primary-button" disabled={busy} type="submit">
+              创建档案
+            </button>
+          </div>
+        </form>
+      )}
+    </section>
+  );
+}
+
+function ProfileCard({
+  profile,
+  busy,
+  onSelect,
+  onReauthorize,
+  onSyncAccount,
+  onDelete,
+}: {
+  profile: MaskedProfile;
+  busy: boolean;
+  onSelect: (id: string) => Promise<void>;
+  onReauthorize: () => void;
+  onSyncAccount: (id: string) => Promise<void>;
+  onDelete: (id: string, alias: string) => void;
+}) {
+  const supportsManagedCurrentProfile =
+    profile.kind === "codex_oauth" && profile.enabled && profile.credential_configured;
+  const keychainAuthorizationRequired =
+    profile.account?.quota.last_error ===
+    "后台同步未读取钥匙串；点击“同步资料”后可在系统弹窗中授权。";
+  return (
+    <article className={`profile-card ${profile.is_current ? "is-current" : ""}`}>
+      <div className="profile-card-top">
+        <div className="profile-avatar large">
+          {profile.alias.slice(0, 1).toUpperCase()}
+        </div>
+        <div className="profile-title">
+          <h2>{profile.alias}</h2>
+          {profile.kind === "codex_oauth" && (
+            <p className="profile-email" title={profile.account?.email ?? undefined}>
+              {profile.account?.email || "邮箱尚未同步"}
+            </p>
+          )}
+          <span
+            className={`status-pill compact ${profile.enabled ? "success" : "neutral"}`}
+          >
+            <i />
+            {profile.enabled ? "已启用" : "已停用"}
+          </span>
+        </div>
+        {profile.is_current && (
+          <span className="current-badge">
+            <CheckCircle size={15} weight="fill" /> 当前
+          </span>
+        )}
+      </div>
+      {profile.kind === "codex_oauth" && (
+        <div className="profile-overview">
+          <SubscriptionDetails subscription={profile.account?.subscription} />
+          <QuotaDetails quota={profile.account?.quota} />
+        </div>
+      )}
+      {!supportsManagedCurrentProfile && (
+        <p className="profile-runtime-note">
+          {profile.kind === "codex_oauth" && !profile.credential_configured
+            ? "此档案的旧凭据无法迁移；请重新授权后再切换。"
+            : "当前仅支持凭据已保存的 OAuth 档案作为受管 Codex 当前档案。"}
+        </p>
+      )}
+      <div className="profile-actions">
+        <button
+          className="icon-button"
+          aria-label={`设为当前档案：${profile.alias}`}
+          title={
+            !supportsManagedCurrentProfile
+              ? "当前仅支持凭据已保存的 OAuth 档案用于受管 Codex 会话"
+              : profile.is_current
+                ? "重新应用当前档案并启动独立 ChatGPT/Codex 工作区"
+                : undefined
+          }
+          disabled={busy || !supportsManagedCurrentProfile}
+          onClick={() => void onSelect(profile.id)}
+        >
+          <UserSwitch size={19} />
+        </button>
+        {profile.kind === "codex_oauth" ? (
+          <>
+            <button
+              className="primary-button compact-action profile-sync-button"
+              type="button"
+              disabled={busy || !profile.credential_configured}
+              onClick={() => void onSyncAccount(profile.id)}
+            >
+              <ArrowsClockwise size={15} />
+              {keychainAuthorizationRequired ? "解锁并同步" : "同步资料"}
+            </button>
+            <button
+              className="icon-button"
+              type="button"
+              aria-label={`${profile.credential_configured ? "更新凭据" : "重新授权"}：${profile.alias}`}
+              title={profile.credential_configured ? "更新凭据" : "重新授权"}
+              disabled={busy}
+              onClick={onReauthorize}
+            >
+              <Key size={18} />
+            </button>
+          </>
+        ) : (
+          <button className="icon-button" aria-label="凭据由系统安全存储管理" disabled>
+            <Key size={19} />
+          </button>
+        )}
+        <button
+          className="icon-button danger"
+          aria-label={`删除档案：${profile.alias}`}
+          disabled={busy}
+          onClick={() => onDelete(profile.id, profile.alias)}
+        >
+          <Trash size={19} />
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function QuotaDetails({ quota }: { quota?: ProfileQuota | null }) {
+  const keychainAuthorizationRequired =
+    quota?.last_error === "后台同步未读取钥匙串；点击“同步资料”后可在系统弹窗中授权。";
+  const buckets =
+    quota?.buckets.filter((bucket) => bucket.primary || bucket.secondary) ?? [];
+  const primaryBucket = buckets[0] ?? {
+    primary: quota?.primary ?? null,
+    secondary: quota?.secondary ?? null,
+  };
+  const windows = [
+    ["短期", primaryBucket.primary],
+    ["长期", primaryBucket.secondary],
+  ] as const;
+  const visibleWindows = windows.filter(
+    (window): window is ["短期" | "长期", ProfileQuotaWindow] => Boolean(window[1]),
+  );
+  const extraWindowCount = buckets
+    .slice(1)
+    .reduce(
+      (count, bucket) =>
+        count + Number(Boolean(bucket.primary)) + Number(Boolean(bucket.secondary)),
+      0,
+    );
+  const state = quotaStateLabel(quota, keychainAuthorizationRequired);
+  return (
+    <section className="profile-overview-section profile-quota-panel" aria-label="额度">
+      <OverviewHeading
+        label="额度"
+        state={state}
+        tone={quota?.rate_limit_reached_type ? "warning" : "neutral"}
+      />
+      {visibleWindows.length > 0 ? (
+        <>
+          <div
+            className={`quota-meter-grid ${visibleWindows.length === 1 ? "is-single" : ""}`}
+          >
+            {visibleWindows.map(([label, window]) => (
+              <QuotaMeter key={label} label={label} window={window} />
+            ))}
+          </div>
+          {extraWindowCount > 0 && (
+            <p className="quota-extra">另有 {extraWindowCount} 个额度窗口</p>
+          )}
+        </>
+      ) : (
+        <p className="profile-data-empty">
+          {keychainAuthorizationRequired ? "需要系统授权后同步" : "额度尚未同步"}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function SubscriptionDetails({
+  subscription,
+}: {
+  subscription?: ProfileSubscription | null;
+}) {
+  const periodLabel = subscription?.will_renew ? "距下次续费" : "距到期";
+  return (
+    <section
+      className="profile-overview-section profile-subscription-panel"
+      aria-label="订阅"
+    >
+      <OverviewHeading label="订阅" state={subscriptionStateLabel(subscription)} />
+      <div className="subscription-content">
+        <strong className="subscription-plan">
+          {subscriptionPlanLabel(subscription?.plan_type)}
+        </strong>
+        {subscription?.period_ends_at_ms ? (
+          <div className="subscription-countdown">
+            <span>{periodLabel}</span>
+            <strong>{formatRemainingTime(subscription.period_ends_at_ms)}</strong>
+          </div>
+        ) : (
+          <p className="profile-data-empty">
+            {subscription && subscription.status !== "unavailable"
+              ? "上游未提供续费日期"
+              : "订阅资料尚未同步"}
+          </p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function OverviewHeading({
+  label,
+  state,
+  tone = "neutral",
+}: {
+  label: string;
+  state: string | null;
+  tone?: "neutral" | "warning";
+}) {
+  return (
+    <div className="profile-overview-heading">
+      <span>{label}</span>
+      {state && <span className={`profile-data-state ${tone}`}>{state}</span>}
+    </div>
+  );
+}
+
+function QuotaMeter({
+  label,
+  window,
+}: {
+  label: "短期" | "长期";
+  window: ProfileQuotaWindow;
+}) {
+  const remaining = Math.round(Math.min(Math.max(window.remaining_percent, 0), 100));
+  const tone = remaining <= 10 ? "critical" : remaining <= 30 ? "warning" : "healthy";
+  return (
+    <div className="quota-meter">
+      <div className="quota-meter-heading">
+        <span>{label}</span>
+        <strong>{remaining}%</strong>
+      </div>
+      <div
+        aria-label={`${label}额度剩余 ${remaining}%`}
+        aria-valuemax={100}
+        aria-valuemin={0}
+        aria-valuenow={remaining}
+        className={`quota-progress ${tone}`}
+        role="progressbar"
+      >
+        <span style={{ width: `${remaining}%` }} />
+      </div>
+      <span className="quota-reset">{formatQuotaReset(window.resets_at_ms)}</span>
+    </div>
+  );
+}
+
+function subscriptionPlanLabel(planType?: string | null) {
+  return (
+    {
+      free: "ChatGPT Free",
+      go: "ChatGPT Go",
+      plus: "ChatGPT Plus",
+      pro: "ChatGPT Pro",
+      prolite: "ChatGPT Pro Lite",
+      team: "ChatGPT Team",
+      self_serve_business_usage_based: "ChatGPT Business",
+      business: "ChatGPT Business",
+      enterprise_cbp_usage_based: "ChatGPT Enterprise",
+      enterprise: "ChatGPT Enterprise",
+      edu: "ChatGPT Edu",
+    }[planType ?? ""] ?? (planType ? `未知套餐（${planType}）` : "套餐尚未同步")
+  );
+}
+
+function formatRemainingTime(periodEndsAtMs: number) {
+  const remainingMinutes = Math.ceil((periodEndsAtMs - Date.now()) / 60_000);
+  if (remainingMinutes <= 0) return "已到期";
+  const days = Math.floor(remainingMinutes / (24 * 60));
+  const hours = Math.floor((remainingMinutes % (24 * 60)) / 60);
+  return days > 0 ? `剩余 ${days} 天 ${hours} 小时` : `剩余 ${Math.max(hours, 1)} 小时`;
+}
+
+function formatQuotaReset(resetsAtMs: number | null) {
+  if (!resetsAtMs) return "重置时间未提供";
+  const remainingMinutes = Math.ceil((resetsAtMs - Date.now()) / 60_000);
+  if (remainingMinutes <= 0) return "正在重置";
+  const days = Math.floor(remainingMinutes / (24 * 60));
+  const hours = Math.floor((remainingMinutes % (24 * 60)) / 60);
+  return days > 0 ? `约 ${days} 天后重置` : `约 ${Math.max(hours, 1)} 小时后重置`;
+}
+
+function quotaStateLabel(
+  quota: ProfileQuota | null | undefined,
+  keychainAuthorizationRequired: boolean,
+) {
+  if (keychainAuthorizationRequired) return "需要授权";
+  if (!quota || quota.status === "unavailable") return "尚未同步";
+  if (quota.rate_limit_reached_type) return "额度受限";
+  if (quota.status === "stale") return "缓存已过期";
+  return null;
+}
+
+function subscriptionStateLabel(subscription: ProfileSubscription | null | undefined) {
+  if (!subscription || subscription.status === "unavailable") return "尚未同步";
+  if (subscription.status === "stale") return "缓存已过期";
+  if (subscription.will_renew === true) return "自动续费";
+  if (subscription.will_renew === false) return "到期结束";
+  return null;
+}
