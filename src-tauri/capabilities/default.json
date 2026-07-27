@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Minimum core capability for the main application window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "core:app:allow-set-app-theme",
+    "dialog:allow-open",
+    "dialog:allow-save"
+  ]
 }

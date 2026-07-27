@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::DateTime;
 use rand::RngCore;
@@ -26,6 +29,9 @@ use crate::{
         StartManagedTaskInput,
     },
     error::{AppError, AppResult},
+    oauth_credentials::{
+        credential_needs_refresh, refresh_credential, OAUTH_CLIENT_ID, OAUTH_TOKEN_URL,
+    },
     profiles::CodexOAuthCredential,
     secrets::SecretStore,
 };
@@ -36,9 +42,9 @@ const DESKTOP_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_APP_CANDIDATES: [&str; 2] = ["ChatGPT", "Codex"];
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const OAUTH_CALLBACK_PORT: u16 = 1455;
-const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
-const OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const PERSONAL_ACCESS_TOKEN_WHOAMI_URL: &str =
+    "https://auth.openai.com/api/accounts/v1/user-auth-credential/whoami";
 const OAUTH_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const RATE_LIMIT_READ_TIMEOUT: Duration = Duration::from_secs(12);
@@ -502,7 +508,33 @@ impl DesktopWorkspaceLaunch {
 struct AppServerAccountSnapshot {
     quota: ProfileQuota,
     email: Option<String>,
+    account_id: Option<String>,
     plan_type: Option<String>,
+}
+
+pub struct CodexModelRead {
+    pub credential: CodexOAuthCredential,
+    pub models: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct ImportAuthVerification {
+    pub auth_json: String,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
+}
+
+impl std::fmt::Debug for ImportAuthVerification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImportAuthVerification")
+            .field("auth_json", &"<redacted>")
+            .field("email", &self.email)
+            .field("account_id", &self.account_id)
+            .field("plan_type", &self.plan_type)
+            .finish()
+    }
 }
 
 fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSnapshot> {
@@ -554,6 +586,7 @@ fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSn
         let deadline = Instant::now() + RATE_LIMIT_READ_TIMEOUT;
         let mut account_seen = false;
         let mut email = None;
+        let mut account_id = None;
         let mut plan_type = None;
         let mut quota = None;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -562,11 +595,19 @@ fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSn
                 .map_err(|_| AppError::RuntimeUnavailable)?;
             let response: serde_json::Value =
                 serde_json::from_str(&line).map_err(|_| AppError::RuntimeUnavailable)?;
+            if (response.get("id") == Some(&serde_json::json!(2))
+                || response.get("id") == Some(&serde_json::json!(3)))
+                && response.get("error").is_some()
+            {
+                return Err(app_server_error(&response));
+            }
             if response.get("id") == Some(&serde_json::json!(2)) {
                 account_seen = true;
                 if let Some(result) = response.get("result") {
-                    let (next_email, next_plan_type) = parse_app_server_account(result);
+                    let (next_email, next_account_id, next_plan_type) =
+                        parse_app_server_account(result);
                     email = next_email;
+                    account_id = next_account_id;
                     plan_type = next_plan_type;
                 }
             }
@@ -583,6 +624,7 @@ fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSn
                                 .find_map(|bucket| bucket.plan_type.clone())
                         }),
                         email,
+                        account_id,
                         quota,
                     });
                 }
@@ -597,6 +639,7 @@ fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSn
                         .find_map(|bucket| bucket.plan_type.clone())
                 }),
                 email,
+                account_id,
                 quota,
             });
         }
@@ -605,6 +648,127 @@ fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSn
     let _ = child.kill();
     let _ = child.wait();
     result
+}
+
+fn read_models_from_app_server(home: &Path) -> AppResult<Vec<String>> {
+    let mut command = Command::new("codex");
+    command
+        .args(["app-server", "--stdio"])
+        .env("CODEX_HOME", home)
+        .env_remove("CODEX_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(|_| AppError::RuntimeUnavailable)?;
+    let result = (|| -> AppResult<Vec<String>> {
+        let mut stdin = child.stdin.take().ok_or(AppError::RuntimeUnavailable)?;
+        for request in [
+            serde_json::json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "codex-relay",
+                        "title": "Codex Relay",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {}
+                }
+            }),
+            serde_json::json!({"method": "initialized", "params": {}}),
+            serde_json::json!({
+                "method": "model/list",
+                "id": 2,
+                "params": {"includeHidden": false, "limit": 100}
+            }),
+        ] {
+            serde_json::to_writer(&mut stdin, &request)
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            stdin
+                .write_all(b"\n")
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+        }
+        stdin.flush().map_err(|_| AppError::RuntimeUnavailable)?;
+        let stdout = child.stdout.take().ok_or(AppError::RuntimeUnavailable)?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + RATE_LIMIT_READ_TIMEOUT;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let line = receiver
+                .recv_timeout(remaining)
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            let response: serde_json::Value =
+                serde_json::from_str(&line).map_err(|_| AppError::RuntimeUnavailable)?;
+            if response.get("id") != Some(&serde_json::json!(2)) {
+                continue;
+            }
+            if response.get("error").is_some() {
+                return Err(app_server_error(&response));
+            }
+            let mut models = response
+                .get("result")
+                .and_then(|result| result.get("data"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|model| {
+                    !model
+                        .get("hidden")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .filter_map(|model| {
+                    model
+                        .get("model")
+                        .or_else(|| model.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .filter(|model| !model.trim().is_empty())
+                .collect::<Vec<_>>();
+            models.sort();
+            models.dedup();
+            return (!models.is_empty())
+                .then_some(models)
+                .ok_or(AppError::UpstreamUnavailable);
+        }
+        Err(AppError::RuntimeUnavailable)
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn app_server_error(response: &serde_json::Value) -> AppError {
+    let error = response.get("error");
+    let code = error
+        .and_then(|value| value.get("code"))
+        .and_then(serde_json::Value::as_i64);
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(code, Some(401 | 403))
+        || [
+            "unauthorized",
+            "not authenticated",
+            "invalid token",
+            "login required",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        AppError::ProfileRuntimeUnavailable
+    } else {
+        AppError::RuntimeUnavailable
+    }
 }
 
 #[derive(Deserialize)]
@@ -694,18 +858,20 @@ fn rate_limit_bucket(fallback_id: Option<String>, limits: RateLimits) -> Profile
     }
 }
 
-fn parse_app_server_account(value: &serde_json::Value) -> (Option<String>, Option<String>) {
+fn parse_app_server_account(
+    value: &serde_json::Value,
+) -> (Option<String>, Option<String>, Option<String>) {
     let account = value.get("account");
-    if account
-        .and_then(|account| account.get("type"))
-        .and_then(|value| value.as_str())
-        != Some("chatgpt")
-    {
-        return (None, None);
+    if account.is_none() || account.is_some_and(serde_json::Value::is_null) {
+        return (None, None, None);
     }
     (
         account
             .and_then(|account| account.get("email"))
+            .and_then(|value| value.as_str())
+            .map(ToOwned::to_owned),
+        account
+            .and_then(|account| account.get("accountId").or_else(|| account.get("id")))
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned),
         account
@@ -1035,6 +1201,13 @@ pub struct QuotaRead {
     pub account_id: Option<String>,
 }
 
+pub struct AuthJsonQuotaRead {
+    pub quota: ProfileQuota,
+    pub subscription: ProfileSubscription,
+    pub email: Option<String>,
+    pub account_id: Option<String>,
+}
+
 fn rate_limit_window(window: RateLimitWindow) -> ProfileQuotaWindow {
     let used_percent = window.used_percent.clamp(0.0, 100.0);
     ProfileQuotaWindow {
@@ -1062,6 +1235,8 @@ pub struct CodexRuntime {
 
 impl CodexRuntime {
     pub fn new(root: PathBuf, secrets: Arc<dyn SecretStore>) -> Self {
+        let _ = fs::remove_dir_all(root.join("import-previews"));
+        let _ = fs::remove_dir_all(root.join("quota-refresh"));
         Self::with_dependencies(
             root,
             secrets,
@@ -1123,7 +1298,9 @@ impl CodexRuntime {
             .as_ref()
             .map(|snapshot| subscription_from_app_server(snapshot.plan_type.clone()))
             .unwrap_or_else(unavailable_subscription);
-        let mut account_id = None;
+        let mut account_id = app_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.account_id.clone());
         match direct_subscription {
             Ok(direct) => {
                 account_id = direct.account_id.clone();
@@ -1151,6 +1328,91 @@ impl CodexRuntime {
             email: app_snapshot.and_then(|snapshot| snapshot.email),
             account_id,
         })
+    }
+
+    /// Reads the official Codex account and rate-limit snapshots for auth modes
+    /// that are already represented as an auth.json file (PAT and Agent Identity).
+    /// The caller owns the Keychain read; this method only writes a private
+    /// per-profile runtime projection before immediately invoking app-server.
+    pub async fn read_profile_rate_limits_auth_json(
+        &self,
+        profile_id: &str,
+        auth_json: &str,
+    ) -> AppResult<AuthJsonQuotaRead> {
+        if auth_json.trim().is_empty() {
+            return Err(AppError::ValidationFailed);
+        }
+        let home = self
+            .root
+            .join("quota-refresh")
+            .join(format!("{profile_id}-{}", Uuid::new_v4()));
+        self.write_auth_json_to_home(&home, auth_json)?;
+        let result = self
+            .read_app_server_account(&home)
+            .await
+            .map(|snapshot| AuthJsonQuotaRead {
+                quota: snapshot.quota,
+                subscription: subscription_from_app_server(snapshot.plan_type),
+                email: snapshot.email,
+                account_id: snapshot.account_id,
+            });
+        let _ = fs::remove_dir_all(&home);
+        result
+    }
+
+    /// Verifies an imported auth.json using the same local Codex app-server
+    /// path that will later execute the selected profile. The auth file only
+    /// lives in a private temporary runtime directory for the duration of the
+    /// check and is never copied to Keychain until the user commits the item.
+    pub async fn verify_import_auth_json(
+        &self,
+        item_id: &str,
+        auth_json: &str,
+    ) -> AppResult<ImportAuthVerification> {
+        Uuid::parse_str(item_id).map_err(|_| AppError::ValidationFailed)?;
+        if auth_json.is_empty() {
+            return Err(AppError::ValidationFailed);
+        }
+        if let Some(token) = personal_access_token_from_auth_json(auth_json)? {
+            let identity = verify_personal_access_token(&token).await?;
+            return Ok(ImportAuthVerification {
+                auth_json: auth_json.to_owned(),
+                email: identity.email,
+                account_id: identity.account_id,
+                plan_type: identity.plan_type,
+            });
+        }
+        let auth_json = hydrate_refresh_only_auth_json(auth_json).await?;
+        let home = self.root.join("import-previews").join(item_id);
+        self.write_auth_json_to_home(&home, &auth_json)?;
+        let result =
+            self.read_app_server_account(&home)
+                .await
+                .map(|snapshot| ImportAuthVerification {
+                    auth_json,
+                    email: snapshot.email,
+                    account_id: snapshot.account_id,
+                    plan_type: snapshot.plan_type,
+                });
+        let _ = fs::remove_dir_all(&home);
+        result
+    }
+
+    pub async fn read_profile_models(
+        &self,
+        profile_id: &str,
+        mut credential: CodexOAuthCredential,
+    ) -> AppResult<CodexModelRead> {
+        if credential_needs_refresh(&credential) {
+            credential = refresh_credential(&credential).await?;
+        }
+        let home = self.profile_home(profile_id);
+        self.write_credential_to_home(&home, &credential)?;
+        let models =
+            tauri::async_runtime::spawn_blocking(move || read_models_from_app_server(&home))
+                .await
+                .unwrap_or(Err(AppError::RuntimeUnavailable))?;
+        Ok(CodexModelRead { credential, models })
     }
 
     async fn read_app_server_account(&self, home: &Path) -> AppResult<AppServerAccountSnapshot> {
@@ -1233,6 +1495,48 @@ impl CodexRuntime {
         ))
     }
 
+    pub fn activate_profile_auth_json(
+        self: &Arc<Self>,
+        profile: StoredProfile,
+        auth_json: String,
+        workspace: DesktopWorkspaceLaunch,
+    ) -> AppResult<CurrentProfileActivation> {
+        self.verify_profile(&profile)?;
+        let _operation = self.auth_operation.lock().map_err(|_| AppError::Internal)?;
+        if self
+            .current_profile_attempt
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .as_ref()
+            .is_some_and(|attempt| attempt.phase == CurrentProfileAttemptPhase::Switching)
+        {
+            return Err(AppError::Conflict);
+        }
+        let id = Uuid::new_v4().to_string();
+        let profile_id = profile.profile.id.clone();
+        let workspace_mode = workspace.mode();
+        *self
+            .current_profile_attempt
+            .lock()
+            .map_err(|_| AppError::Internal)? = Some(CurrentProfileAttempt {
+            id: id.clone(),
+            profile_id: profile_id.clone(),
+            phase: CurrentProfileAttemptPhase::Switching,
+            workspace_mode: workspace_mode.clone(),
+        });
+        let runtime = Arc::clone(self);
+        let worker_attempt_id = id.clone();
+        thread::spawn(move || {
+            runtime.complete_switch_auth_json(worker_attempt_id, profile_id, auth_json, workspace)
+        });
+        Ok(current_profile_status(
+            profile.profile.id,
+            Some(id),
+            CurrentProfileAttemptPhase::Switching,
+            workspace_mode,
+        ))
+    }
+
     fn complete_switch(
         self: Arc<Self>,
         attempt_id: String,
@@ -1255,6 +1559,36 @@ impl CodexRuntime {
             Ok(desktop_switch_phase(self.launch_profile_desktop(
                 &profile_id,
                 &credential,
+                &workspace,
+            )))
+        })();
+        if let Ok(mut attempt) = self.current_profile_attempt.lock() {
+            if attempt
+                .as_ref()
+                .is_some_and(|current| current.id == attempt_id)
+            {
+                if let Some(current) = attempt.as_mut() {
+                    current.phase = result.unwrap_or(CurrentProfileAttemptPhase::Failed);
+                }
+            }
+        }
+    }
+
+    fn complete_switch_auth_json(
+        self: Arc<Self>,
+        attempt_id: String,
+        profile_id: String,
+        auth_json: String,
+        workspace: DesktopWorkspaceLaunch,
+    ) {
+        let result = (|| -> AppResult<CurrentProfileAttemptPhase> {
+            if self.write_default_auth_json(&auth_json).is_err() {
+                return Ok(CurrentProfileAttemptPhase::AuthFileWriteFailed);
+            }
+            self.stop_managed_task()?;
+            Ok(desktop_switch_phase(self.launch_profile_desktop_auth_json(
+                &profile_id,
+                &auth_json,
                 &workspace,
             )))
         })();
@@ -1306,6 +1640,40 @@ impl CodexRuntime {
         }
         let home = self.profile_home(&profile.profile.id);
         self.write_credential_to_home(&home, &credential)?;
+        let mut task = self.managed_task.lock().map_err(|_| AppError::Internal)?;
+        if Self::refresh_task(&mut task)?.is_some() {
+            return Err(AppError::Conflict);
+        }
+        task.active = Some(ManagedTask {
+            profile_id: profile.profile.id.clone(),
+            process: self
+                .runner
+                .start_task(&home, &directory, &input.instruction)?,
+        });
+        task.last_phase = ManagedTaskPhase::Running;
+        task.last_profile_id = Some(profile.profile.id.clone());
+        Ok(task_status(
+            ManagedTaskPhase::Running,
+            Some(profile.profile.id.clone()),
+        ))
+    }
+
+    pub fn start_managed_task_auth_json(
+        &self,
+        profile: &StoredProfile,
+        auth_json: String,
+        input: StartManagedTaskInput,
+    ) -> AppResult<ManagedTaskStatus> {
+        if input.instruction.trim().is_empty() {
+            return Err(AppError::ValidationFailed);
+        }
+        self.verify_profile(profile)?;
+        let directory = PathBuf::from(input.working_directory);
+        if !directory.is_absolute() || !directory.is_dir() {
+            return Err(AppError::ValidationFailed);
+        }
+        let home = self.profile_home(&profile.profile.id);
+        self.write_auth_json_to_home(&home, &auth_json)?;
         let mut task = self.managed_task.lock().map_err(|_| AppError::Internal)?;
         if Self::refresh_task(&mut task)?.is_some() {
             return Err(AppError::Conflict);
@@ -1427,15 +1795,36 @@ impl CodexRuntime {
         let home = default_codex_home()?;
         self.write_credential_to_home(&home, credential)
     }
+
+    fn write_default_auth_json(&self, auth_json: &str) -> AppResult<()> {
+        let home = default_codex_home()?;
+        self.write_auth_json_to_home(&home, auth_json)
+    }
     fn write_credential_to_home(
         &self,
         home: &Path,
         credential: &CodexOAuthCredential,
     ) -> AppResult<()> {
+        self.write_auth_json_to_home(home, &credential.auth_json()?)
+    }
+
+    fn write_auth_json_to_home(&self, home: &Path, auth_json: &str) -> AppResult<()> {
         fs::create_dir_all(home).map_err(|_| AppError::RuntimeUnavailable)?;
+        #[cfg(unix)]
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700))
+            .map_err(|_| AppError::RuntimeUnavailable)?;
         let destination = home.join("auth.json");
         let temporary = home.join(format!(".auth-{}.tmp", Uuid::new_v4()));
-        fs::write(&temporary, credential.auth_json()?).map_err(|_| AppError::RuntimeUnavailable)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| AppError::RuntimeUnavailable)?;
+        file.write_all(auth_json.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|_| AppError::RuntimeUnavailable)?;
         fs::rename(temporary, destination).map_err(|_| AppError::RuntimeUnavailable)
     }
     fn launch_profile_desktop(
@@ -1448,6 +1837,26 @@ impl CodexRuntime {
         self.write_credential_to_home(&home, credential)?;
         let auth_json = credential.auth_json()?;
         self.desktop_credentials.project(&home, &auth_json)?;
+        let user_data_dir = match workspace {
+            DesktopWorkspaceLaunch::Fresh(id) => Some(self.fresh_desktop_user_data(id)),
+            DesktopWorkspaceLaunch::PerProfile => Some(self.profile_desktop_user_data(profile_id)),
+            DesktopWorkspaceLaunch::Shared => None,
+        };
+        if let Some(directory) = user_data_dir.as_deref() {
+            fs::create_dir_all(directory).map_err(|_| AppError::RuntimeUnavailable)?;
+        }
+        self.desktop.launch(&home, user_data_dir.as_deref())
+    }
+
+    fn launch_profile_desktop_auth_json(
+        &self,
+        profile_id: &str,
+        auth_json: &str,
+        workspace: &DesktopWorkspaceLaunch,
+    ) -> AppResult<()> {
+        let home = self.profile_home(profile_id);
+        self.write_auth_json_to_home(&home, auth_json)?;
+        self.desktop_credentials.project(&home, auth_json)?;
         let user_data_dir = match workspace {
             DesktopWorkspaceLaunch::Fresh(id) => Some(self.fresh_desktop_user_data(id)),
             DesktopWorkspaceLaunch::PerProfile => Some(self.profile_desktop_user_data(profile_id)),
@@ -1799,47 +2208,103 @@ async fn exchange_code(code: &str, verifier: &str) -> AppResult<CodexOAuthCreden
         last_refresh_ms: now_ms(),
     })
 }
-async fn refresh_credential(credential: &CodexOAuthCredential) -> AppResult<CodexOAuthCredential> {
-    #[derive(Deserialize)]
-    struct TokenResponse {
-        id_token: Option<String>,
-        access_token: String,
-        refresh_token: Option<String>,
-    }
-    let refresh = credential
-        .refresh_token
-        .as_deref()
-        .ok_or(AppError::ProfileRuntimeUnavailable)?;
+async fn hydrate_refresh_only_auth_json(auth_json: &str) -> AppResult<String> {
+    let Some(credential) = refresh_only_credential_from_auth_json(auth_json)? else {
+        return Ok(auth_json.to_owned());
+    };
+    refresh_credential(&credential).await?.auth_json()
+}
+
+fn personal_access_token_from_auth_json(auth_json: &str) -> AppResult<Option<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(auth_json).map_err(|_| AppError::ValidationFailed)?;
+    Ok(value
+        .get("personal_access_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned))
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalAccessTokenWhoamiResponse {
+    email: Option<String>,
+    chatgpt_account_id: Option<String>,
+    chatgpt_plan_type: Option<String>,
+}
+
+struct PersonalAccessTokenIdentity {
+    email: Option<String>,
+    account_id: Option<String>,
+    plan_type: Option<String>,
+}
+
+async fn verify_personal_access_token(token: &str) -> AppResult<PersonalAccessTokenIdentity> {
     let response = reqwest::Client::new()
-        .post(OAUTH_TOKEN_URL)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh),
-            ("client_id", OAUTH_CLIENT_ID),
-        ])
+        .get(PERSONAL_ACCESS_TOKEN_WHOAMI_URL)
+        .bearer_auth(token)
         .send()
         .await
         .map_err(|_| AppError::RuntimeUnavailable)?;
-    if !response.status().is_success() {
-        return Err(AppError::ProfileRuntimeUnavailable);
+    if response.status().as_u16() == 401 || response.status().as_u16() == 403 {
+        Err(AppError::ProfileRuntimeUnavailable)
+    } else if !response.status().is_success() {
+        Err(AppError::RuntimeUnavailable)
+    } else {
+        let response: PersonalAccessTokenWhoamiResponse = response
+            .json()
+            .await
+            .map_err(|_| AppError::RuntimeUnavailable)?;
+        Ok(personal_access_token_identity(response))
     }
-    let token: TokenResponse = response
-        .json()
-        .await
-        .map_err(|_| AppError::RuntimeUnavailable)?;
-    Ok(CodexOAuthCredential {
-        id_token: token
-            .id_token
-            .unwrap_or_else(|| credential.id_token.clone()),
-        access_token: token.access_token,
-        refresh_token: token
-            .refresh_token
-            .filter(|value| !value.is_empty())
-            .or_else(|| credential.refresh_token.clone()),
-        account_id: credential.account_id.clone(),
-        last_refresh_ms: now_ms(),
-    })
 }
+
+fn personal_access_token_identity(
+    response: PersonalAccessTokenWhoamiResponse,
+) -> PersonalAccessTokenIdentity {
+    PersonalAccessTokenIdentity {
+        email: response.email.filter(|value| !value.trim().is_empty()),
+        account_id: response
+            .chatgpt_account_id
+            .filter(|value| !value.trim().is_empty()),
+        plan_type: response
+            .chatgpt_plan_type
+            .filter(|value| !value.trim().is_empty()),
+    }
+}
+
+fn refresh_only_credential_from_auth_json(
+    auth_json: &str,
+) -> AppResult<Option<CodexOAuthCredential>> {
+    let value: serde_json::Value =
+        serde_json::from_str(auth_json).map_err(|_| AppError::ValidationFailed)?;
+    let tokens = value.get("tokens").and_then(serde_json::Value::as_object);
+    let access_token = tokens
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let refresh_token = tokens
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if access_token.is_some() || refresh_token.is_none() {
+        return Ok(None);
+    }
+    let account_id = tokens
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(Some(CodexOAuthCredential {
+        id_token: String::new(),
+        access_token: String::new(),
+        refresh_token: refresh_token.map(ToOwned::to_owned),
+        account_id,
+        last_refresh_ms: now_ms(),
+    }))
+}
+
 fn random_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -1860,17 +2325,6 @@ fn build_authorization_url(redirect: &str, verifier: &str, state: &str) -> AppRe
         .append_pair("state", state)
         .append_pair("originator", "codex_vscode");
     Ok(url.into())
-}
-fn credential_needs_refresh(credential: &CodexOAuthCredential) -> bool {
-    let payload = credential
-        .access_token
-        .split('.')
-        .nth(1)
-        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
-        .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok());
-    payload
-        .and_then(|value| value.get("exp").and_then(|value| value.as_i64()))
-        .is_some_and(|expiry| expiry * 1000 <= now_ms() + 300_000)
 }
 fn default_codex_home() -> AppResult<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -2000,6 +2454,8 @@ fn task_status(phase: ManagedTaskPhase, profile_id: Option<String>) -> ManagedTa
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
 
     #[test]
@@ -2034,6 +2490,24 @@ mod tests {
     #[test]
     fn rejects_malformed_rate_limit_responses() {
         assert!(parse_rate_limits_response(serde_json::json!({"id": 2, "result": {}})).is_err());
+    }
+
+    #[test]
+    fn separates_rejected_app_server_credentials_from_runtime_failures() {
+        assert!(matches!(
+            app_server_error(&serde_json::json!({
+                "id": 2,
+                "error": {"code": 401, "message": "Unauthorized"}
+            })),
+            AppError::ProfileRuntimeUnavailable
+        ));
+        assert!(matches!(
+            app_server_error(&serde_json::json!({
+                "id": 3,
+                "error": {"code": -32603, "message": "temporary server failure"}
+            })),
+            AppError::RuntimeUnavailable
+        ));
     }
 
     #[test]
@@ -2084,6 +2558,52 @@ mod tests {
                 .map(|window| window.remaining_percent),
             Some(60.0)
         );
+    }
+
+    #[test]
+    fn extracts_import_identity_without_exposing_auth_json() {
+        let (email, account_id, plan_type) = parse_app_server_account(&serde_json::json!({
+            "account": {
+                "type": "chatgpt",
+                "email": "oauth@example.com",
+                "accountId": "account-oauth",
+                "planType": "pro"
+            }
+        }));
+        assert_eq!(email.as_deref(), Some("oauth@example.com"));
+        assert_eq!(account_id.as_deref(), Some("account-oauth"));
+        assert_eq!(plan_type.as_deref(), Some("pro"));
+
+        let (email, account_id, plan_type) = parse_app_server_account(&serde_json::json!({
+            "account": {
+                "type": "agentIdentity",
+                "email": "agent@example.com",
+                "accountId": "account-agent",
+                "planType": "plus"
+            }
+        }));
+        assert_eq!(email.as_deref(), Some("agent@example.com"));
+        assert_eq!(account_id.as_deref(), Some("account-agent"));
+        assert_eq!(plan_type.as_deref(), Some("plus"));
+
+        let pat = personal_access_token_identity(PersonalAccessTokenWhoamiResponse {
+            email: Some("pat@example.com".into()),
+            chatgpt_account_id: Some("account-pat".into()),
+            chatgpt_plan_type: Some("plus".into()),
+        });
+        assert_eq!(pat.email.as_deref(), Some("pat@example.com"));
+        assert_eq!(pat.account_id.as_deref(), Some("account-pat"));
+        assert_eq!(pat.plan_type.as_deref(), Some("plus"));
+
+        let verification = ImportAuthVerification {
+            auth_json: r#"{"personal_access_token":"at-secret"}"#.into(),
+            email,
+            account_id,
+            plan_type,
+        };
+        let debug = format!("{verification:?}");
+        assert!(debug.contains("agent@example.com"));
+        assert!(!debug.contains("at-secret"));
     }
 
     #[test]
@@ -2233,6 +2753,36 @@ mod tests {
         assert_eq!(auth_value["agent_identity"], serde_json::Value::Null);
         assert!(auth_value["last_refresh"].is_string());
     }
+
+    #[test]
+    fn recognizes_refresh_only_auth_json_for_hydration() {
+        let refresh_only = serde_json::json!({
+            "tokens": {"refresh_token": "refresh", "account_id": "account"}
+        })
+        .to_string();
+        let credential = refresh_only_credential_from_auth_json(&refresh_only)
+            .unwrap()
+            .unwrap();
+        assert_eq!(credential.refresh_token.as_deref(), Some("refresh"));
+        assert_eq!(credential.account_id.as_deref(), Some("account"));
+
+        let complete = serde_json::json!({
+            "tokens": {"access_token": "access", "refresh_token": "refresh"}
+        })
+        .to_string();
+        assert!(refresh_only_credential_from_auth_json(&complete)
+            .unwrap()
+            .is_none());
+
+        let pat = serde_json::json!({"personal_access_token": "at-redacted"}).to_string();
+        assert_eq!(
+            personal_access_token_from_auth_json(&pat)
+                .unwrap()
+                .as_deref(),
+            Some("at-redacted")
+        );
+    }
+
     #[test]
     fn authorization_url_has_pkce_and_cockpit_originator() {
         let url =
@@ -2411,6 +2961,21 @@ mod tests {
             .access_token,
             "access"
         );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(home.join("auth.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         assert_eq!(
             keychain.projections.lock().unwrap().as_slice(),
             std::slice::from_ref(&home)

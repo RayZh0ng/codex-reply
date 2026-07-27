@@ -1,20 +1,20 @@
-import {
-  ArrowDown,
-  ArrowUp,
-  ArrowsClockwise,
-  CaretDown,
-  Check,
-  CheckCircle,
-  CloudArrowUp,
-  Key,
-  Plus,
-  Trash,
-  UserSwitch,
-} from "@phosphor-icons/react";
+import { ArrowDown } from "@phosphor-icons/react/ArrowDown";
+import { ArrowUp } from "@phosphor-icons/react/ArrowUp";
+import { ArrowsClockwise } from "@phosphor-icons/react/ArrowsClockwise";
+import { CaretDown } from "@phosphor-icons/react/CaretDown";
+import { Check } from "@phosphor-icons/react/Check";
+import { CheckCircle } from "@phosphor-icons/react/CheckCircle";
+import { CloudArrowUp } from "@phosphor-icons/react/CloudArrowUp";
+import { Key } from "@phosphor-icons/react/Key";
+import { Plus } from "@phosphor-icons/react/Plus";
+import { Trash } from "@phosphor-icons/react/Trash";
+import { UserSwitch } from "@phosphor-icons/react/UserSwitch";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   FormEvent,
   KeyboardEvent,
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -23,12 +23,18 @@ import {
 
 import type {
   DesktopWorkspaceMode,
+  ApiServiceTestReport,
+  GatewayProvider,
+  JsonProfileImportPreview,
+  JsonProfileImportResult,
   MaskedProfile,
   OAuthImportStatus,
   ProfileQuota,
   ProfileQuotaWindow,
   ProfileSubscription,
 } from "../../shared/ipc";
+import { api } from "../../shared/ipc";
+import { Select } from "../../shared/ui/Select";
 
 interface ProfilesProps {
   profiles: MaskedProfile[];
@@ -38,8 +44,19 @@ interface ProfilesProps {
   onOAuthStatus: (attemptId: string) => Promise<OAuthImportStatus>;
   onCancelOAuth: (attemptId: string) => Promise<void>;
   onCompleteOAuth: (attemptId: string, alias?: string) => Promise<void>;
-  onSyncAccount: (id: string) => Promise<void>;
+  onSyncAccount: (id: string) => Promise<MaskedProfile>;
+  onRefreshModels?: (id: string) => Promise<void>;
+  onCreateApiProfile?: (input: Record<string, unknown>) => Promise<void>;
+  onTogglePool?: (profile: MaskedProfile) => Promise<void>;
+  onConfigurePool?: (
+    profile: MaskedProfile,
+    priority: number,
+    weight: number,
+    models: string[],
+  ) => Promise<void>;
+  onActivateApiProfile?: (profile: MaskedProfile) => Promise<void>;
   onDelete: (id: string, alias: string) => void;
+  onJsonImportComplete?: () => Promise<void>;
   workspaceMode?: DesktopWorkspaceMode;
 }
 
@@ -47,6 +64,8 @@ type ImportFlow =
   | { step: "picker" }
   | { step: "authorizing"; status: OAuthImportStatus }
   | { step: "naming"; status: OAuthImportStatus }
+  | { step: "json"; preview: JsonProfileImportPreview }
+  | { step: "api" }
   | null;
 
 type ProfileSortKey = "default" | "quota" | "subscription" | "reset";
@@ -76,17 +95,27 @@ export function Profiles({
   onCancelOAuth,
   onCompleteOAuth,
   onSyncAccount,
+  onCreateApiProfile = async () => undefined,
+  onTogglePool = async () => undefined,
+  onActivateApiProfile = async () => undefined,
   onDelete,
+  onJsonImportComplete = async () => undefined,
   workspaceMode = "per_profile",
 }: ProfilesProps) {
   const [flow, setFlow] = useState<ImportFlow>(null);
   const [nameQuery, setNameQuery] = useState("");
   const [emailQuery, setEmailQuery] = useState("");
+  const deferredNameQuery = useDeferredValue(nameQuery);
+  const deferredEmailQuery = useDeferredValue(emailQuery);
   const [subscriptionFilter, setSubscriptionFilter] = useState(ALL_SUBSCRIPTIONS);
   const [sortKey, setSortKey] = useState<ProfileSortKey>("default");
   const [sortDirection, setSortDirection] = useState<ProfileSortDirection>("urgent");
   const [openMenu, setOpenMenu] = useState<OpenFilterMenu>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [selectedJsonItems, setSelectedJsonItems] = useState<Set<string>>(new Set());
+  const [jsonBusy, setJsonBusy] = useState(false);
+  const [jsonResult, setJsonResult] = useState<JsonProfileImportResult | null>(null);
+  const [refreshingProfileId, setRefreshingProfileId] = useState<string | null>(null);
   const completing = useRef(false);
   const subscriptionTypes = useMemo(
     () =>
@@ -121,7 +150,12 @@ export function Profiles({
       profiles
         .map((profile, index) => ({ profile, index }))
         .filter(({ profile }) =>
-          matchesProfileFilters(profile, nameQuery, emailQuery, subscriptionFilter),
+          matchesProfileFilters(
+            profile,
+            deferredNameQuery,
+            deferredEmailQuery,
+            subscriptionFilter,
+          ),
         )
         .sort((left, right) => {
           const comparison = compareProfiles(
@@ -133,7 +167,14 @@ export function Profiles({
           return comparison || left.index - right.index;
         })
         .map(({ profile }) => profile),
-    [emailQuery, nameQuery, profiles, sortDirection, sortKey, subscriptionFilter],
+    [
+      deferredEmailQuery,
+      deferredNameQuery,
+      profiles,
+      sortDirection,
+      sortKey,
+      subscriptionFilter,
+    ],
   );
   const hasActiveFilters =
     Boolean(nameQuery || emailQuery) ||
@@ -153,7 +194,90 @@ export function Profiles({
     completing.current = false;
     setFlow(null);
     setImportError(null);
+    setJsonResult(null);
   }, []);
+  const beginJsonImport = async () => {
+    setImportError(null);
+    try {
+      const selected = await open({
+        title: "选择要导入的账号 JSON 文件",
+        multiple: true,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      if (!paths.length) return;
+      setJsonBusy(true);
+      const preview = await api.previewJsonProfileImport(paths);
+      setJsonResult(null);
+      setSelectedJsonItems(
+        new Set(
+          preview.items
+            .filter((item) => item.status === "valid")
+            .map((item) => item.id),
+        ),
+      );
+      setFlow({ step: "json", preview });
+    } catch {
+      setImportError(
+        "无法解析或验证所选 JSON。请确认文件格式、Codex CLI 和网络连接后重试。",
+      );
+      setFlow({ step: "picker" });
+    } finally {
+      setJsonBusy(false);
+    }
+  };
+  const discardJsonPreview = async (previewId: string) => {
+    try {
+      await api.discardJsonProfileImport(previewId);
+    } finally {
+      closeFlow();
+    }
+  };
+  const retryJsonPreview = async (preview: JsonProfileImportPreview) => {
+    setImportError(null);
+    setJsonBusy(true);
+    try {
+      const nextPreview = await api.retryJsonProfileImport(preview.preview_id);
+      const previouslyUnverified = new Set(
+        preview.items
+          .filter((item) => item.status === "unverified")
+          .map((item) => item.id),
+      );
+      setSelectedJsonItems(
+        (current) =>
+          new Set(
+            nextPreview.items
+              .filter(
+                (item) =>
+                  item.status === "valid" &&
+                  (current.has(item.id) || previouslyUnverified.has(item.id)),
+              )
+              .map((item) => item.id),
+          ),
+      );
+      setFlow({ step: "json", preview: nextPreview });
+    } catch {
+      setImportError("重试预检未完成。预览已失效时请重新选择文件。");
+    } finally {
+      setJsonBusy(false);
+    }
+  };
+  const commitJsonPreview = async (preview: JsonProfileImportPreview) => {
+    if (!selectedJsonItems.size) return;
+    setJsonBusy(true);
+    try {
+      const result: JsonProfileImportResult = await api.commitJsonProfileImport(
+        preview.preview_id,
+        [...selectedJsonItems],
+      );
+      await onJsonImportComplete();
+      setJsonResult(result);
+    } catch {
+      setImportError("导入未完成。预览已失效时请重新选择文件。");
+    } finally {
+      setJsonBusy(false);
+    }
+  };
   const beginOAuth = async (profileId?: string) => {
     setImportError(null);
     try {
@@ -201,6 +325,19 @@ export function Profiles({
     }, 1000);
     return () => window.clearInterval(timer);
   }, [flow, handleStatus, onOAuthStatus]);
+
+  const refreshAccount = async (id: string) => {
+    if (refreshingProfileId) return;
+    setRefreshingProfileId(id);
+    try {
+      await onSyncAccount(id);
+    } catch {
+      // App-level error handling presents a safe failure message and the
+      // persisted profile state retains the last successful snapshot.
+    } finally {
+      setRefreshingProfileId(null);
+    }
+  };
 
   return (
     <div className="page profiles-page">
@@ -317,19 +454,58 @@ export function Profiles({
         <div>
           <strong>当前档案会按所选模式启动 Codex 工作区</strong>
           <p>
-            添加账号时会保存 OAuth 凭据。当前模式为“{workspaceModeLabel(workspaceMode)}
+            添加账号时会保存认证凭据。当前模式为“{workspaceModeLabel(workspaceMode)}
             ”；切换会更新默认 .codex/auth.json 与 Codex Auth 钥匙串，不会迁移 ChatGPT
             Chat/Work 的独立登录会话。
           </p>
         </div>
       </section>
-      {flow && (
+      {flow?.step === "json" ? (
+        <JsonImportSheet
+          busy={busy || jsonBusy}
+          error={importError}
+          preview={flow.preview}
+          result={jsonResult}
+          selected={selectedJsonItems}
+          onClose={() => void discardJsonPreview(flow.preview.preview_id)}
+          onCommit={() => void commitJsonPreview(flow.preview)}
+          onRetry={() => void retryJsonPreview(flow.preview)}
+          onToggle={(id) =>
+            setSelectedJsonItems((current) => {
+              const next = new Set(current);
+              if (next.has(id)) next.delete(id);
+              else next.add(id);
+              return next;
+            })
+          }
+          onSelectAll={() =>
+            setSelectedJsonItems(
+              new Set(
+                flow.preview.items
+                  .filter((item) => item.status === "valid")
+                  .map((item) => item.id),
+              ),
+            )
+          }
+        />
+      ) : flow?.step === "api" ? (
+        <ApiProfileSheet
+          busy={busy}
+          onClose={closeFlow}
+          onSubmit={async (input) => {
+            await onCreateApiProfile(input);
+            closeFlow();
+          }}
+        />
+      ) : flow ? (
         <OAuthImportSheet
           flow={flow}
           busy={busy}
           error={importError}
           onClose={closeFlow}
           onStart={() => void beginOAuth()}
+          onOpenJson={() => void beginJsonImport()}
+          onOpenApi={() => setFlow({ step: "api" })}
           onCancel={async (attemptId) => {
             try {
               await onCancelOAuth(attemptId);
@@ -347,7 +523,7 @@ export function Profiles({
             }
           }}
         />
-      )}
+      ) : null}
       <section className="profile-grid" data-animate="cards">
         {visibleProfiles.map((profile) => (
           <ProfileCard
@@ -356,7 +532,10 @@ export function Profiles({
             busy={busy}
             onSelect={onSelect}
             onReauthorize={() => void beginOAuth(profile.id)}
-            onSyncAccount={onSyncAccount}
+            onSyncAccount={() => refreshAccount(profile.id)}
+            onTogglePool={() => onTogglePool(profile)}
+            onActivateApiProfile={() => onActivateApiProfile(profile)}
+            refreshing={refreshingProfileId === profile.id}
             onDelete={onDelete}
           />
         ))}
@@ -630,14 +809,21 @@ function OAuthImportSheet({
   error,
   onClose,
   onStart,
+  onOpenJson,
+  onOpenApi,
   onCancel,
   onComplete,
 }: {
-  flow: Exclude<ImportFlow, null>;
+  flow: Exclude<
+    ImportFlow,
+    null | { step: "json"; preview: JsonProfileImportPreview } | { step: "api" }
+  >;
   busy: boolean;
   error: string | null;
   onClose: () => void;
   onStart: () => void;
+  onOpenJson: () => void;
+  onOpenApi: () => void;
   onCancel: (attemptId: string) => Promise<void>;
   onComplete: (attemptId: string, alias: string) => Promise<void>;
 }) {
@@ -678,22 +864,64 @@ function OAuthImportSheet({
       </div>
       {error && <p className="form-note error-note">{error}</p>}
       {flow.step === "picker" && (
-        <div className="oauth-option">
-          <div>
-            <strong>使用 OpenAI / ChatGPT 登录</strong>
-            <p>
-              将在默认浏览器中打开官方 OAuth 页面。完成后会将凭据保存到 Relay
-              Keychain，后续切换无需再次授权。
-            </p>
-          </div>
-          <button
-            className="primary-button"
-            type="button"
-            disabled={busy}
-            onClick={onStart}
-          >
-            继续使用 OAuth
-          </button>
+        <div className="import-method-grid">
+          <article className="import-method-card import-method-card-primary">
+            <span className="import-method-icon" aria-hidden="true">
+              <Key size={20} weight="duotone" />
+            </span>
+            <div>
+              <strong>使用 OpenAI / ChatGPT 登录</strong>
+              <p>
+                在默认浏览器完成官方 OAuth 授权；凭据会保存到 Relay
+                本地加密凭据库，后续切换无需再次登录。
+              </p>
+            </div>
+            <button
+              className="primary-button"
+              type="button"
+              disabled={busy}
+              onClick={onStart}
+            >
+              继续使用 OAuth
+            </button>
+          </article>
+          <article className="import-method-card">
+            <span className="import-method-icon" aria-hidden="true">
+              <CloudArrowUp size={20} weight="duotone" />
+            </span>
+            <div>
+              <strong>从 JSON 文件导入</strong>
+              <p>
+                支持 auth.json、session、Sub2API 导出、完整或部分 token、PAT 与 Agent
+                Identity。
+              </p>
+            </div>
+            <button
+              className="quiet-button"
+              type="button"
+              disabled={busy}
+              onClick={onOpenJson}
+            >
+              选择 JSON 文件
+            </button>
+          </article>
+          <article className="import-method-card">
+            <span className="import-method-icon" aria-hidden="true">
+              <CloudArrowUp size={20} weight="duotone" />
+            </span>
+            <div>
+              <strong>连接 API 上游</strong>
+              <p>添加 OpenAI、Anthropic、Gemini、Ollama 或兼容服务，并自动发现模型。</p>
+            </div>
+            <button
+              className="quiet-button"
+              type="button"
+              disabled={busy}
+              onClick={onOpenApi}
+            >
+              配置 API
+            </button>
+          </article>
         </div>
       )}
       {flow.step === "authorizing" && (
@@ -730,26 +958,309 @@ function OAuthImportSheet({
   );
 }
 
+function ApiProfileSheet({
+  busy,
+  onClose,
+  onSubmit,
+}: {
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (input: Record<string, unknown>) => Promise<void>;
+}) {
+  const [alias, setAlias] = useState("");
+  const [provider, setProvider] = useState<GatewayProvider>("openai");
+  const [baseUrl, setBaseUrl] = useState("https://api.openai.com");
+  const [apiKey, setApiKey] = useState("");
+  const [report, setReport] = useState<ApiServiceTestReport | null>(null);
+  const [testing, setTesting] = useState(false);
+  const test = async () => {
+    setTesting(true);
+    try {
+      setReport(
+        await api.testApiServiceProfile({
+          provider,
+          base_url: baseUrl,
+          api_key: apiKey,
+        }),
+      );
+    } finally {
+      setTesting(false);
+    }
+  };
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void onSubmit({
+      alias,
+      kind: "api_key",
+      provider,
+      base_url: baseUrl,
+      api_key: apiKey,
+      models: report?.status === "verified" ? report.models : [],
+      in_pool: false,
+      priority: 0,
+      weight: 1,
+    });
+  };
+  return (
+    <section className="form-sheet" aria-labelledby="api-profile-title">
+      <div className="form-sheet-heading">
+        <div>
+          <p className="section-kicker">Gateway upstream</p>
+          <h2 id="api-profile-title">连接 API 上游</h2>
+        </div>
+        <button className="text-button" type="button" onClick={onClose}>
+          取消
+        </button>
+      </div>
+      <form onSubmit={submit}>
+        <label>
+          档案名称
+          <input
+            required
+            value={alias}
+            onChange={(event) => setAlias(event.target.value)}
+          />
+        </label>
+        <label>
+          上游协议
+          <Select
+            ariaLabel="上游协议"
+            onValueChange={(value) => {
+              const next = value as GatewayProvider;
+              setProvider(next);
+              setBaseUrl(
+                {
+                  openai: "https://api.openai.com",
+                  openai_compatible: "",
+                  anthropic: "https://api.anthropic.com",
+                  gemini: "https://generativelanguage.googleapis.com",
+                  ollama: "http://127.0.0.1:11434",
+                }[next],
+              );
+            }}
+            options={[
+              { value: "openai", label: "OpenAI · Responses / Chat" },
+              { value: "openai_compatible", label: "OpenAI 兼容服务" },
+              { value: "anthropic", label: "Anthropic · Messages" },
+              { value: "gemini", label: "Gemini · GenerateContent" },
+              { value: "ollama", label: "Ollama · 本地模型" },
+            ]}
+            value={provider}
+          />
+        </label>
+        <label>
+          Base URL
+          <input
+            required
+            value={baseUrl}
+            onChange={(event) => setBaseUrl(event.target.value)}
+          />
+        </label>
+        <label>
+          API Key
+          <input
+            required
+            type="password"
+            value={apiKey}
+            onChange={(event) => setApiKey(event.target.value)}
+          />
+        </label>
+        <p className="form-note">保存后先刷新模型；检测到模型后即可加入网关账号池。</p>
+        {report && (
+          <div
+            className={`profile-test-report ${
+              report.status === "verified" ? "is-success" : "is-error"
+            }`}
+          >
+            <strong>
+              {report.status === "verified" ? "连接已验证" : "连接未验证"}
+            </strong>
+            <p>{report.message}</p>
+            <p>
+              {report.endpoint} · {report.latency_ms}ms
+              {report.http_status ? ` · HTTP ${report.http_status}` : ""}
+            </p>
+          </div>
+        )}
+        <div className="form-actions">
+          <button className="quiet-button" type="button" onClick={onClose}>
+            取消
+          </button>
+          <button className="primary-button" disabled={busy} type="submit">
+            保存并发现模型
+          </button>
+          <button
+            className="quiet-button"
+            disabled={busy || testing || !baseUrl || !apiKey}
+            type="button"
+            onClick={() => void test()}
+          >
+            {testing ? "正在测试…" : "测试连接"}
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function JsonImportSheet({
+  preview,
+  result,
+  selected,
+  busy,
+  error,
+  onClose,
+  onCommit,
+  onRetry,
+  onToggle,
+  onSelectAll,
+}: {
+  preview: JsonProfileImportPreview;
+  result: JsonProfileImportResult | null;
+  selected: Set<string>;
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onCommit: () => void;
+  onRetry: () => void;
+  onToggle: (id: string) => void;
+  onSelectAll: () => void;
+}) {
+  const validItems = preview.items.filter((item) => item.status === "valid");
+  const hasUnverifiedItems = preview.items.some((item) => item.status === "unverified");
+  return (
+    <section className="form-sheet" aria-labelledby="json-import-title">
+      <div className="form-sheet-heading">
+        <div>
+          <p className="section-kicker">JSON import</p>
+          <h2 id="json-import-title">选择要导入的账号</h2>
+        </div>
+        <button className="text-button" disabled={busy} type="button" onClick={onClose}>
+          取消
+        </button>
+      </div>
+      <p className="form-note">
+        已完成本地解析和联网验证。凭据不会显示在此处，只有勾选的有效账号会写入系统安全存储。
+      </p>
+      {error && <p className="form-note error-note">{error}</p>}
+      {result && (
+        <p
+          className={result.failed ? "form-note error-note" : "form-note success-note"}
+        >
+          导入完成：创建 {result.created}，更新 {result.updated}，跳过 {result.skipped}
+          ，失败 {result.failed}。
+        </p>
+      )}
+      <div className="form-actions">
+        <button
+          className="quiet-button"
+          disabled={busy}
+          type="button"
+          onClick={onSelectAll}
+        >
+          全选有效项 ({validItems.length})
+        </button>
+        {hasUnverifiedItems && (
+          <button
+            className="quiet-button"
+            disabled={busy}
+            type="button"
+            onClick={onRetry}
+          >
+            重试未验证项
+          </button>
+        )}
+      </div>
+      <div className="json-import-list">
+        {preview.items.map((item) => {
+          const selectable = item.status === "valid";
+          return (
+            <label className="json-import-item" key={item.id}>
+              <input
+                checked={selected.has(item.id)}
+                disabled={!selectable || busy}
+                onChange={() => onToggle(item.id)}
+                type="checkbox"
+              />
+              <span>
+                <strong>{item.alias}</strong>
+                <small>
+                  {item.file_name} · {authModeLabel(item.auth_mode)} · {item.source}
+                  {item.existing_profile_alias
+                    ? ` · 更新 ${item.existing_profile_alias}`
+                    : ""}
+                </small>
+                <small
+                  className={item.status === "valid" ? "success-note" : "error-note"}
+                >
+                  {item.message}
+                </small>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+      <div className="form-actions">
+        <button
+          className="quiet-button"
+          disabled={busy}
+          type="button"
+          onClick={onClose}
+        >
+          取消
+        </button>
+        {!result && (
+          <button
+            className="primary-button"
+            disabled={busy || !selected.size}
+            type="button"
+            onClick={onCommit}
+          >
+            导入 {selected.size} 个账号
+          </button>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function authModeLabel(mode: "oauth" | "agent_identity" | "personal_access_token") {
+  return {
+    oauth: "OAuth",
+    agent_identity: "Agent Identity",
+    personal_access_token: "个人访问令牌",
+  }[mode];
+}
+
+function isGatewayCapableProfile(profile: MaskedProfile) {
+  return profile.kind === "api_key" || profile.kind === "codex_oauth";
+}
+
 function ProfileCard({
   profile,
   busy,
   onSelect,
   onReauthorize,
   onSyncAccount,
+  onTogglePool,
+  onActivateApiProfile,
+  refreshing,
   onDelete,
 }: {
   profile: MaskedProfile;
   busy: boolean;
   onSelect: (id: string) => Promise<void>;
   onReauthorize: () => void;
-  onSyncAccount: (id: string) => Promise<void>;
+  onSyncAccount: () => Promise<void>;
+  onTogglePool: () => Promise<void>;
+  onActivateApiProfile: () => Promise<void>;
+  refreshing: boolean;
   onDelete: (id: string, alias: string) => void;
 }) {
   const supportsManagedCurrentProfile =
     profile.kind === "codex_oauth" && profile.enabled && profile.credential_configured;
-  const keychainAuthorizationRequired =
-    profile.account?.quota.last_error ===
-    "后台同步未读取钥匙串；点击“同步资料”后可在系统弹窗中授权。";
+  const authMode = profile.auth_mode ?? "oauth";
+  const gatewayCapable = isGatewayCapableProfile(profile);
   return (
     <article className={`profile-card ${profile.is_current ? "is-current" : ""}`}>
       <div className="profile-card-top">
@@ -758,17 +1269,21 @@ function ProfileCard({
         </div>
         <div className="profile-title">
           <h2>{profile.alias}</h2>
-          {profile.kind === "codex_oauth" && (
-            <p className="profile-email" title={profile.account?.email ?? undefined}>
-              {profile.account?.email || "邮箱尚未同步"}
+          {profile.kind === "codex_oauth" ? (
+            <p
+              className="profile-header-email"
+              title={profile.account?.email ?? undefined}
+            >
+              {profile.account?.email || "账号邮箱待同步"}
             </p>
+          ) : (
+            <span
+              className={`status-pill compact ${profile.enabled ? "success" : "neutral"}`}
+            >
+              <i />
+              {profile.enabled ? "已启用" : "已停用"}
+            </span>
           )}
-          <span
-            className={`status-pill compact ${profile.enabled ? "success" : "neutral"}`}
-          >
-            <i />
-            {profile.enabled ? "已启用" : "已停用"}
-          </span>
         </div>
         {profile.is_current && (
           <span className="current-badge">
@@ -777,25 +1292,79 @@ function ProfileCard({
         )}
       </div>
       {profile.kind === "codex_oauth" && (
-        <div className="profile-overview">
-          <SubscriptionDetails subscription={profile.account?.subscription} />
-          <QuotaDetails quota={profile.account?.quota} />
-        </div>
+        <ProfileUsageCard
+          account={profile.account}
+          authMode={authMode}
+          busy={busy}
+          refreshing={refreshing}
+          onRefresh={onSyncAccount}
+        />
+      )}
+      {gatewayCapable && (
+        <dl className="profile-facts">
+          <div>
+            <dt>可用模型</dt>
+            <dd>{profile.models.length} 个</dd>
+          </div>
+          <div>
+            <dt>网关状态</dt>
+            <dd>{profile.in_pool ? "已加入账号池" : "未加入"}</dd>
+          </div>
+          <div>
+            <dt>优先级 / 权重</dt>
+            <dd>
+              {profile.priority} / {profile.weight}
+            </dd>
+          </div>
+          <div>
+            <dt>冷却</dt>
+            <dd>{profile.cooldown_until_ms ? "冷却中" : "可用"}</dd>
+          </div>
+        </dl>
       )}
       {!supportsManagedCurrentProfile && (
         <p className="profile-runtime-note">
           {profile.kind === "codex_oauth" && !profile.credential_configured
             ? "此档案的旧凭据无法迁移；请重新授权后再切换。"
-            : "当前仅支持凭据已保存的 OAuth 档案作为受管 Codex 当前档案。"}
+            : "当前仅支持凭据已保存的 Codex 档案作为受管当前档案。"}
         </p>
       )}
       <div className="profile-actions">
+        {gatewayCapable && (
+          <button
+            className={
+              profile.in_pool
+                ? "quiet-button compact-action"
+                : "primary-button compact-action"
+            }
+            aria-label={`${profile.in_pool ? "移出网关账号池" : "加入网关账号池"}：${profile.alias}`}
+            title={
+              profile.in_pool ? "将此账号移出网关账号池" : "将此账号加入网关账号池"
+            }
+            disabled={busy}
+            type="button"
+            onClick={() => void onTogglePool()}
+          >
+            {profile.in_pool ? "移出网关" : "加入网关"}
+          </button>
+        )}
+        {profile.kind === "api_key" && (
+          <button
+            className="icon-button"
+            aria-label={`激活 API 服务：${profile.alias}`}
+            disabled={busy || profile.health !== "healthy" || !profile.models.length}
+            title="测试通过后，将此 API 服务激活到 Codex"
+            onClick={() => void onActivateApiProfile()}
+          >
+            <UserSwitch size={19} />
+          </button>
+        )}
         <button
           className="icon-button"
           aria-label={`设为当前档案：${profile.alias}`}
           title={
             !supportsManagedCurrentProfile
-              ? "当前仅支持凭据已保存的 OAuth 档案用于受管 Codex 会话"
+              ? "当前仅支持凭据已保存的 Codex 档案用于受管会话"
               : profile.is_current
                 ? "重新应用当前档案并启动独立 ChatGPT/Codex 工作区"
                 : undefined
@@ -805,31 +1374,16 @@ function ProfileCard({
         >
           <UserSwitch size={19} />
         </button>
-        {profile.kind === "codex_oauth" ? (
-          <>
-            <button
-              className="primary-button compact-action profile-sync-button"
-              type="button"
-              disabled={busy || !profile.credential_configured}
-              onClick={() => void onSyncAccount(profile.id)}
-            >
-              <ArrowsClockwise size={15} />
-              {keychainAuthorizationRequired ? "解锁并同步" : "同步资料"}
-            </button>
-            <button
-              className="icon-button"
-              type="button"
-              aria-label={`${profile.credential_configured ? "更新凭据" : "重新授权"}：${profile.alias}`}
-              title={profile.credential_configured ? "更新凭据" : "重新授权"}
-              disabled={busy}
-              onClick={onReauthorize}
-            >
-              <Key size={18} />
-            </button>
-          </>
-        ) : (
-          <button className="icon-button" aria-label="凭据由系统安全存储管理" disabled>
-            <Key size={19} />
+        {profile.kind === "codex_oauth" && (
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={`${profile.credential_configured ? "更新凭据" : "重新授权"}：${profile.alias}`}
+            title={profile.credential_configured ? "更新凭据" : "重新授权"}
+            disabled={busy}
+            onClick={onReauthorize}
+          >
+            <Key size={18} />
           </button>
         )}
         <button
@@ -845,7 +1399,21 @@ function ProfileCard({
   );
 }
 
-function QuotaDetails({ quota }: { quota?: ProfileQuota | null }) {
+function ProfileUsageCard({
+  account,
+  authMode,
+  busy,
+  refreshing,
+  onRefresh,
+}: {
+  account: MaskedProfile["account"];
+  authMode: "oauth" | "agent_identity" | "personal_access_token";
+  busy: boolean;
+  refreshing: boolean;
+  onRefresh: () => Promise<void>;
+}) {
+  const quota = account?.quota;
+  const subscription = account?.subscription;
   const keychainAuthorizationRequired =
     quota?.last_error === "后台同步未读取钥匙串；点击“同步资料”后可在系统弹窗中授权。";
   const buckets =
@@ -868,14 +1436,37 @@ function QuotaDetails({ quota }: { quota?: ProfileQuota | null }) {
         count + Number(Boolean(bucket.primary)) + Number(Boolean(bucket.secondary)),
       0,
     );
-  const state = quotaStateLabel(quota, keychainAuthorizationRequired);
+  const quotaState = quotaStateLabel(quota, keychainAuthorizationRequired);
+  const subscriptionState = subscriptionStateLabel(subscription);
+  const periodLabel = subscription?.will_renew ? "距下次续费" : "距到期";
   return (
-    <section className="profile-overview-section profile-quota-panel" aria-label="额度">
-      <OverviewHeading
-        label="额度"
-        state={state}
-        tone={quota?.rate_limit_reached_type ? "warning" : "neutral"}
-      />
+    <section className="profile-usage-card" aria-label="套餐与额度">
+      <div className="profile-usage-header">
+        <div>
+          <div className="profile-usage-labels">
+            <span>套餐与额度</span>
+            <span className="profile-auth-mode">{authModeLabel(authMode)}</span>
+          </div>
+          <strong>{subscriptionPlanLabel(subscription?.plan_type)}</strong>
+          <p>
+            {subscription?.period_ends_at_ms
+              ? `${periodLabel} ${formatRemainingTime(subscription.period_ends_at_ms)}`
+              : subscriptionState || "套餐资料尚未同步"}
+          </p>
+        </div>
+        <button
+          className="profile-refresh-button"
+          type="button"
+          disabled={busy || refreshing}
+          onClick={() => void onRefresh()}
+        >
+          <ArrowsClockwise
+            className={refreshing ? "is-spinning" : undefined}
+            size={16}
+          />
+          {refreshing ? "正在刷新" : "刷新资料"}
+        </button>
+      </div>
       {visibleWindows.length > 0 ? (
         <>
           <div
@@ -890,62 +1481,29 @@ function QuotaDetails({ quota }: { quota?: ProfileQuota | null }) {
           )}
         </>
       ) : (
-        <p className="profile-data-empty">
-          {keychainAuthorizationRequired ? "需要系统授权后同步" : "额度尚未同步"}
-        </p>
-      )}
-    </section>
-  );
-}
-
-function SubscriptionDetails({
-  subscription,
-}: {
-  subscription?: ProfileSubscription | null;
-}) {
-  const periodLabel = subscription?.will_renew ? "距下次续费" : "距到期";
-  return (
-    <section
-      className="profile-overview-section profile-subscription-panel"
-      aria-label="订阅"
-    >
-      <OverviewHeading label="订阅" state={subscriptionStateLabel(subscription)} />
-      <div className="subscription-content">
-        <strong className="subscription-plan">
-          {subscriptionPlanLabel(subscription?.plan_type)}
-        </strong>
-        {subscription?.period_ends_at_ms ? (
-          <div className="subscription-countdown">
-            <span>{periodLabel}</span>
-            <strong>{formatRemainingTime(subscription.period_ends_at_ms)}</strong>
-          </div>
-        ) : (
-          <p className="profile-data-empty">
-            {subscription && subscription.status !== "unavailable"
-              ? "上游未提供续费日期"
-              : "订阅资料尚未同步"}
+        <div className="profile-usage-empty">
+          <strong>{quotaState || "上游未返回额度"}</strong>
+          <p>
+            {keychainAuthorizationRequired
+              ? "需要系统授权后刷新"
+              : quota?.message || "该认证方式暂未返回可展示的 Codex 额度。"}
           </p>
-        )}
-      </div>
+        </div>
+      )}
+      <footer>
+        <span>最近更新 {formatProfileUpdatedAt(account?.updated_at_ms)}</span>
+        {quotaState && <span className="profile-data-state">{quotaState}</span>}
+      </footer>
     </section>
   );
 }
 
-function OverviewHeading({
-  label,
-  state,
-  tone = "neutral",
-}: {
-  label: string;
-  state: string | null;
-  tone?: "neutral" | "warning";
-}) {
-  return (
-    <div className="profile-overview-heading">
-      <span>{label}</span>
-      {state && <span className={`profile-data-state ${tone}`}>{state}</span>}
-    </div>
-  );
+function formatProfileUpdatedAt(updatedAtMs?: number | null) {
+  if (!updatedAtMs) return "未记录";
+  return new Intl.DateTimeFormat("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(updatedAtMs);
 }
 
 function QuotaMeter({

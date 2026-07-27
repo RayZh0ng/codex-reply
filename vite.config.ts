@@ -5,6 +5,22 @@ const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    cssCodeSplit: true,
+    reportCompressedSize: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          return /node_modules\/(?:\.pnpm\/)?(?:react|react-dom|scheduler)(?:@|\/)/.test(
+            id,
+          )
+            ? "react-vendor"
+            : undefined;
+        },
+      },
+    },
+    sourcemap: false,
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

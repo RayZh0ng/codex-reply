@@ -1,17 +1,13 @@
-import {
-  ArrowRight,
-  ChartLineUp,
-  Lightning,
-  Plus,
-  ShieldCheck,
-} from "@phosphor-icons/react";
+import { ArrowRight } from "@phosphor-icons/react/ArrowRight";
+import { ChartLineUp } from "@phosphor-icons/react/ChartLineUp";
+import { Lightning } from "@phosphor-icons/react/Lightning";
+import { Plus } from "@phosphor-icons/react/Plus";
+import { ShieldCheck } from "@phosphor-icons/react/ShieldCheck";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis } from "recharts";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import type {
   DashboardSnapshot,
-  DesktopWorkspaceMode,
   ManagedTaskStatus,
   StartManagedTaskInput,
 } from "../../shared/ipc";
@@ -20,10 +16,9 @@ interface DashboardProps {
   snapshot: DashboardSnapshot;
   taskStatus: ManagedTaskStatus;
   busy: boolean;
-  onNavigate: (page: "profiles" | "gateway" | "notifications") => void;
+  onNavigate: (page: "profiles" | "gateway" | "collaboration") => void;
   onStartTask: (input: StartManagedTaskInput) => Promise<void>;
   onRequestCancelTask: () => void;
-  workspaceMode?: DesktopWorkspaceMode;
 }
 
 function Metric({
@@ -51,7 +46,6 @@ function ManagedTaskCard({
   onNavigate,
   onStartTask,
   onRequestCancelTask,
-  workspaceMode = "per_profile",
 }: DashboardProps) {
   const [instruction, setInstruction] = useState("");
   const [workingDirectory, setWorkingDirectory] = useState<string | null>(null);
@@ -158,8 +152,8 @@ function ManagedTaskCard({
       )}
       <p className="managed-task-note">
         任务仅控制由 Relay 启动的 CLI 子进程。切换当前档案会投影已保存的凭据到默认
-        .codex/auth.json，并启动{workspaceModeLabel(workspaceMode)}；不会再次打开
-        OAuth， 也不会迁移 ChatGPT Chat/Work 会话。
+        .codex/auth.json，并启动{workspaceModeLabel(snapshot.workspace_mode)}
+        ；不会再次打开 OAuth，也不会迁移 ChatGPT Chat/Work 会话。
       </p>
     </article>
   );
@@ -175,7 +169,7 @@ function taskPhaseLabel(phase: ManagedTaskStatus["phase"]) {
   }[phase];
 }
 
-function workspaceModeLabel(mode: DesktopWorkspaceMode) {
+function workspaceModeLabel(mode: DashboardSnapshot["workspace_mode"]) {
   return {
     fresh: "本次全新 ChatGPT/Codex 工作区",
     per_profile: "档案专属的 ChatGPT/Codex 工作区",
@@ -190,19 +184,12 @@ export function Dashboard({
   onNavigate,
   onStartTask,
   onRequestCancelTask,
-  workspaceMode,
 }: DashboardProps) {
-  const { gateway, metrics, profiles, notifications } = snapshot;
-  const trend = [
-    { day: "一", requests: 0 },
-    { day: "二", requests: 0 },
-    { day: "三", requests: 0 },
-    { day: "四", requests: 0 },
-    { day: "五", requests: metrics.total_requests },
-    { day: "六", requests: 0 },
-    { day: "日", requests: 0 },
-  ];
-  const availableChannels = notifications.filter((channel) => channel.enabled).length;
+  const { collaboration, gateway, metrics, profiles } = snapshot;
+  const trend = useMemo(
+    () => [0, 0, 0, 0, metrics.total_requests, 0, 0],
+    [metrics.total_requests],
+  );
 
   return (
     <div className="page dashboard-page">
@@ -211,7 +198,7 @@ export function Dashboard({
           <p className="section-kicker">Overview</p>
           <h1>今天，服务一切就绪。</h1>
           <p className="page-subtitle">
-            在这里查看本机网关、账号池与通知投递的安全状态。
+            在这里查看本机网关、账号池与群聊协作入口的安全状态。
           </p>
         </div>
         <button
@@ -239,12 +226,12 @@ export function Dashboard({
             <i /> {gateway.running ? "网关运行中" : "网关未启动"}
           </span>
           <h2 id="gateway-heading">
-            {gateway.running ? "本机 API 已受到保护" : "先配置一个安全的本机网关"}
+            {gateway.running ? "局域网 API 已受到保护" : "先配置一个安全的局域网网关"}
           </h2>
           <p>
             {gateway.running
-              ? `监听 ${gateway.bind_mode === "lan" ? "受控局域网" : "仅本机回环"} · ${gateway.available_profiles} 个可用成员`
-              : "默认只允许本机回环访问；启用局域网时会要求白名单与客户端 Key。"}
+              ? `监听 ${gateway.bind_address} · ${gateway.available_profiles} 个可用成员`
+              : "选择私有网络地址后启动；CIDR 可选，但始终需要客户端 Key。"}
           </p>
           <button
             className="primary-button"
@@ -287,9 +274,9 @@ export function Dashboard({
           detail="不会记录请求或响应正文"
         />
         <Metric
-          label="通知频道"
-          value={String(availableChannels)}
-          detail="仅发送脱敏状态摘要"
+          label="协作入口"
+          value={String(collaboration.enabled_bots)}
+          detail={`${collaboration.bound_chats} 个已绑定群 · ${collaboration.active_sessions} 个运行中`}
         />
       </section>
 
@@ -303,13 +290,7 @@ export function Dashboard({
             <ChartLineUp size={22} />
           </div>
           <div className="chart-wrap">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={trend} barSize={18}>
-                <XAxis dataKey="day" axisLine={false} tickLine={false} />
-                <Tooltip cursor={{ fill: "rgba(31, 100, 214, .05)" }} />
-                <Bar dataKey="requests" fill="#207ce8" radius={[7, 7, 3, 3]} />
-              </BarChart>
-            </ResponsiveContainer>
+            <RequestTrendChart values={trend} />
           </div>
         </article>
         <article className="surface-card pool-card">
@@ -367,9 +348,46 @@ export function Dashboard({
           onNavigate={onNavigate}
           onStartTask={onStartTask}
           onRequestCancelTask={onRequestCancelTask}
-          workspaceMode={workspaceMode}
         />
       </section>
     </div>
+  );
+}
+
+function RequestTrendChart({ values }: { values: number[] }) {
+  const days = ["一", "二", "三", "四", "五", "六", "日"];
+  const maximum = Math.max(1, ...values);
+  return (
+    <svg
+      aria-label={`近七日请求趋势，总计 ${values.reduce((sum, value) => sum + value, 0)} 次请求`}
+      className="trend-chart"
+      role="img"
+      viewBox="0 0 560 190"
+    >
+      {values.map((value, index) => {
+        const height = value ? Math.max(8, (value / maximum) * 118) : 2;
+        const x = 31 + index * 80;
+        const y = 144 - height;
+        return (
+          <g key={days[index]}>
+            <rect
+              className={value ? "trend-bar is-active" : "trend-bar"}
+              height={height}
+              rx="8"
+              width="18"
+              x={x}
+              y={y}
+            >
+              <title>
+                星期{days[index]}：{value} 次请求
+              </title>
+            </rect>
+            <text className="trend-label" textAnchor="middle" x={x + 9} y="178">
+              {days[index]}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
   );
 }

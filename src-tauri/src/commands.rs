@@ -1,8 +1,11 @@
 use std::{
-    collections::HashMap,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::collections::HashMap;
 
 use futures_util::{stream, StreamExt};
 
@@ -16,44 +19,48 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::{
+    codex_gateway,
     codex_runtime::{CodexRuntime, DesktopWorkspaceLaunch},
+    collaboration::CollaborationManager,
     database::Repository,
     domain::{
-        CancelManagedTaskInput, CompleteOAuthImportInput, CreateClientKeyInput, CreateProfileInput,
-        CreatedClientKey, CurrentProfileActivation, CurrentProfileActivationStatusInput,
-        DashboardSnapshot, DeleteDesktopWorkspaceInput, DesktopWorkspaceHistoryItem,
-        DesktopWorkspaceMode, DesktopWorkspaceSettings, GatewayStatus, ManagedTaskStatus,
-        MaskedChannel, MaskedClientKey, MaskedProfile, OAuthImportStatus,
-        ProfileQuotaRefreshReport, RestoreDesktopWorkspaceInput, SelectCurrentProfileInput,
-        StartManagedTaskInput, StartOAuthImportInput, TestChannelInput,
-        UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput, UpdateProfileInput,
-        UpsertChannelInput,
+        CancelCodexSessionInput, CancelManagedTaskInput, CodexAuthMode, CodexSessionSummary,
+        CollaborationCallbackStatus, CollaborationProjectBinding, CollaborationProvider,
+        CommitJsonProfileImportInput, CompleteOAuthImportInput, ContinueCodexSessionInput,
+        CreateClientKeyInput, CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
+        CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCollaborationBotInput,
+        DeleteCollaborationProjectBindingInput, DeleteDesktopWorkspaceInput, DeleteFeishuBotInput,
+        DeleteFeishuProjectBindingInput, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
+        DesktopWorkspaceSettings, DiscardJsonProfileImportInput, FeishuProjectBinding,
+        GatewayCodexConfigStatus, GatewayStatus, JsonProfileImportPreview, JsonProfileImportResult,
+        ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey, MaskedCollaborationBot,
+        MaskedFeishuBot, MaskedProfile, OAuthImportStatus, PreviewJsonProfileImportInput,
+        ProfileQuotaRefreshReport, RestoreDesktopWorkspaceInput, RetryJsonProfileImportInput,
+        SelectCurrentProfileInput, StartManagedTaskInput, StartOAuthImportInput,
+        TestApiServiceInput, UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput,
+        UpdateProfileInput, UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput,
+        UpsertFeishuBotInput, UpsertFeishuProjectBindingInput,
     },
     error::{AppError, AppResult},
-    gateway::{validate_binding, GatewayManager},
-    notifications, profiles,
+    gateway::{
+        available_lan_addresses, configure_gateway_upstream_proxy, discover_profile_models,
+        test_api_service, validate_binding, GatewayManager,
+    },
+    oauth_credentials::{CredentialAccess as OAuthCredentialAccess, OAuthCredentialStore},
+    profiles,
     secrets::SecretStore,
 };
 
 pub struct AppState {
     pub repository: Arc<Repository>,
+    pub data_dir: PathBuf,
     pub secrets: Arc<dyn SecretStore>,
     pub gateway: Arc<GatewayManager>,
     pub runtime: Arc<CodexRuntime>,
+    pub collaboration: Arc<CollaborationManager>,
     pub quota_refresh_lock: tokio::sync::Mutex<()>,
-    pub(crate) oauth_credentials: std::sync::Mutex<HashMap<String, CachedOAuthCredential>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct CachedOAuthCredential {
-    credential: profiles::CodexOAuthCredential,
-    persistence_pending: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OAuthCredentialAccess {
-    Background,
-    UserInitiated,
+    pub(crate) oauth_credentials: Arc<OAuthCredentialStore>,
+    pub json_imports: crate::profile_import::JsonProfileImportStore,
 }
 
 #[tauri::command]
@@ -67,12 +74,8 @@ pub fn dashboard_snapshot(state: State<'_, AppState>) -> AppResult<DashboardSnap
             .map(|stored| stored.profile)
             .collect(),
         metrics: state.repository.metrics()?,
-        notifications: state
-            .repository
-            .list_channels()?
-            .into_iter()
-            .map(|stored| stored.channel)
-            .collect(),
+        workspace_mode: state.repository.desktop_workspace_mode()?,
+        collaboration: state.repository.collaboration_summary()?,
     })
 }
 
@@ -100,6 +103,44 @@ pub async fn update_profile(
     state: State<'_, AppState>,
 ) -> AppResult<MaskedProfile> {
     profiles::update_profile(&state.repository, state.secrets.clone(), input).await
+}
+
+#[tauri::command]
+pub async fn preview_json_profile_import(
+    input: PreviewJsonProfileImportInput,
+    state: State<'_, AppState>,
+) -> AppResult<JsonProfileImportPreview> {
+    state
+        .json_imports
+        .preview(input, &state.repository, &state.runtime)
+        .await
+}
+
+#[tauri::command]
+pub async fn commit_json_profile_import(
+    input: CommitJsonProfileImportInput,
+    state: State<'_, AppState>,
+) -> AppResult<JsonProfileImportResult> {
+    state
+        .json_imports
+        .commit(input, &state.repository, state.secrets.clone())
+        .await
+}
+
+#[tauri::command]
+pub async fn retry_json_profile_import(
+    input: RetryJsonProfileImportInput,
+    state: State<'_, AppState>,
+) -> AppResult<JsonProfileImportPreview> {
+    state.json_imports.retry(input, &state.runtime).await
+}
+
+#[tauri::command]
+pub fn discard_json_profile_import(
+    input: DiscardJsonProfileImportInput,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    state.json_imports.discard(input)
 }
 
 #[tauri::command]
@@ -165,22 +206,48 @@ async fn sync_profile_quota(
     access: OAuthCredentialAccess,
 ) -> AppResult<MaskedProfile> {
     let profile = state.repository.profile(id)?;
-    let credential = oauth_credential(state, &profile, access).await?;
-    match state.runtime.read_profile_rate_limits(id, credential).await {
-        Ok(result) => {
-            persist_oauth_credential(state, &profile, &result.credential, access).await?;
-            profiles::save_oauth_credential_metadata(&state.repository, id, &result.credential)?;
-            profiles::sync_oauth_account_info_with_snapshot(
-                &state.repository,
-                id,
-                &result.credential,
-                result.quota,
-                result.subscription,
-                result.email,
-                result.account_id,
-            )
+    match profile.profile.auth_mode.clone() {
+        CodexAuthMode::OAuth => {
+            let credential = oauth_credential(state, &profile, access).await?;
+            match state.runtime.read_profile_rate_limits(id, credential).await {
+                Ok(result) => {
+                    persist_oauth_credential(state, &profile, &result.credential, access).await?;
+                    profiles::save_oauth_credential_metadata(
+                        &state.repository,
+                        id,
+                        &result.credential,
+                    )?;
+                    profiles::sync_oauth_account_info_with_snapshot(
+                        &state.repository,
+                        id,
+                        &result.credential,
+                        result.quota,
+                        result.subscription,
+                        result.email,
+                        result.account_id,
+                    )
+                }
+                Err(_) => profiles::mark_quota_stale(&state.repository, id),
+            }
         }
-        Err(_) => profiles::mark_quota_stale(&state.repository, id),
+        CodexAuthMode::AgentIdentity | CodexAuthMode::PersonalAccessToken => {
+            let auth_json = imported_auth_json(state, &profile, access).await?;
+            match state
+                .runtime
+                .read_profile_rate_limits_auth_json(id, &auth_json)
+                .await
+            {
+                Ok(result) => profiles::sync_codex_account_info_with_snapshot(
+                    &state.repository,
+                    id,
+                    result.quota,
+                    result.subscription,
+                    result.email,
+                    result.account_id,
+                ),
+                Err(_) => profiles::mark_quota_stale(&state.repository, id),
+            }
+        }
     }
 }
 
@@ -228,12 +295,7 @@ pub async fn select_current_profile(
         return Err(AppError::ConfirmationRequired);
     }
     let profile = state.repository.profile(&input.id)?;
-    let credential = oauth_credential(
-        state.inner(),
-        &profile,
-        OAuthCredentialAccess::UserInitiated,
-    )
-    .await?;
+    let credential = active_profile_credential(state.inner(), &profile).await?;
     if mode == DesktopWorkspaceMode::Shared {
         state.runtime.quit_desktop_for_shared_switch()?;
     }
@@ -248,9 +310,14 @@ pub async fn select_current_profile(
         DesktopWorkspaceMode::PerProfile => DesktopWorkspaceLaunch::PerProfile,
         DesktopWorkspaceMode::Shared => DesktopWorkspaceLaunch::Shared,
     };
-    let activation = state
-        .runtime
-        .activate_profile(profile, credential, workspace)?;
+    let activation = match credential {
+        ActiveProfileCredential::OAuth(credential) => state
+            .runtime
+            .activate_profile(profile, credential, workspace)?,
+        ActiveProfileCredential::AuthJson(auth_json) => state
+            .runtime
+            .activate_profile_auth_json(profile, auth_json, workspace)?,
+    };
     Ok(activation)
 }
 
@@ -286,20 +353,22 @@ pub async fn restore_desktop_workspace(
 ) -> AppResult<CurrentProfileActivation> {
     let workspace = state.repository.desktop_workspace(&input.id)?;
     let profile = state.repository.profile(&workspace.profile_id)?;
-    let credential = oauth_credential(
-        state.inner(),
-        &profile,
-        OAuthCredentialAccess::UserInitiated,
-    )
-    .await?;
+    let credential = active_profile_credential(state.inner(), &profile).await?;
     state
         .repository
         .touch_desktop_workspace(&workspace.id, now_ms())?;
-    state.runtime.activate_profile(
-        profile,
-        credential,
-        DesktopWorkspaceLaunch::Fresh(workspace.id),
-    )
+    match credential {
+        ActiveProfileCredential::OAuth(credential) => state.runtime.activate_profile(
+            profile,
+            credential,
+            DesktopWorkspaceLaunch::Fresh(workspace.id),
+        ),
+        ActiveProfileCredential::AuthJson(auth_json) => state.runtime.activate_profile_auth_json(
+            profile,
+            auth_json,
+            DesktopWorkspaceLaunch::Fresh(workspace.id),
+        ),
+    }
 }
 
 #[tauri::command]
@@ -358,15 +427,14 @@ pub async fn start_managed_task(
         .into_iter()
         .find(|stored| stored.profile.is_current)
         .ok_or(AppError::CurrentProfileRequired)?;
-    let credential = oauth_credential(
-        state.inner(),
-        &profile,
-        OAuthCredentialAccess::UserInitiated,
-    )
-    .await?;
-    state
-        .runtime
-        .start_managed_task(&profile, credential, input)
+    match active_profile_credential(state.inner(), &profile).await? {
+        ActiveProfileCredential::OAuth(credential) => state
+            .runtime
+            .start_managed_task(&profile, credential, input),
+        ActiveProfileCredential::AuthJson(auth_json) => state
+            .runtime
+            .start_managed_task_auth_json(&profile, auth_json, input),
+    }
 }
 
 #[tauri::command]
@@ -383,11 +451,11 @@ pub fn gateway_status(state: State<'_, AppState>) -> AppResult<GatewayStatus> {
 }
 
 #[tauri::command]
-pub fn update_gateway(
+pub async fn update_gateway(
     input: UpdateGatewayInput,
     state: State<'_, AppState>,
 ) -> AppResult<GatewayStatus> {
-    if input.bind_mode == "lan" && !input.confirmed_lan {
+    if input.bind_mode != "lan" || !input.confirmed_lan {
         return Err(AppError::ConfirmationRequired);
     }
     let address = input
@@ -395,9 +463,22 @@ pub fn update_gateway(
         .parse()
         .map_err(|_| AppError::ValidationFailed)?;
     validate_binding(&input.bind_mode, address, &input.cidrs)?;
+    if !available_lan_addresses()
+        .iter()
+        .any(|candidate| candidate.address == input.bind_address)
+    {
+        return Err(AppError::ForbiddenNetworkTarget);
+    }
     if state.gateway.is_running() {
         return Err(AppError::Conflict);
     }
+    configure_gateway_upstream_proxy(
+        &state.repository,
+        state.secrets.clone(),
+        input.upstream_proxy_mode.as_deref(),
+        input.upstream_proxy_url.as_deref(),
+    )
+    .await?;
     state.repository.update_gateway_settings(
         &input.bind_mode,
         &input.bind_address,
@@ -415,6 +496,95 @@ pub async fn start_gateway(state: State<'_, AppState>) -> AppResult<GatewayStatu
 #[tauri::command]
 pub fn stop_gateway(state: State<'_, AppState>) -> AppResult<GatewayStatus> {
     state.gateway.stop()
+}
+
+#[tauri::command]
+pub fn export_gateway_ca(destination: String, state: State<'_, AppState>) -> AppResult<()> {
+    state.gateway.export_ca(std::path::Path::new(&destination))
+}
+
+#[tauri::command]
+pub fn trust_gateway_ca(state: State<'_, AppState>) -> AppResult<()> {
+    state.gateway.trust_ca_in_macos_keychain()
+}
+
+#[tauri::command]
+pub async fn codex_gateway_config_status() -> AppResult<GatewayCodexConfigStatus> {
+    codex_gateway::status().await
+}
+
+#[tauri::command]
+pub async fn enable_codex_gateway(
+    state: State<'_, AppState>,
+) -> AppResult<GatewayCodexConfigStatus> {
+    codex_gateway::enable(
+        &state.repository,
+        state.secrets.clone(),
+        state.gateway.status()?,
+        &state.data_dir,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn disable_codex_gateway(
+    state: State<'_, AppState>,
+) -> AppResult<GatewayCodexConfigStatus> {
+    codex_gateway::disable(state.secrets.clone()).await
+}
+
+#[tauri::command]
+pub async fn activate_api_service_profile(
+    id: String,
+    state: State<'_, AppState>,
+) -> AppResult<GatewayCodexConfigStatus> {
+    codex_gateway::enable_api_profile(
+        &state.repository,
+        state.secrets.clone(),
+        &id,
+        &state.data_dir,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn refresh_profile_models(
+    id: String,
+    state: State<'_, AppState>,
+) -> AppResult<MaskedProfile> {
+    let mut profile = state.repository.profile(&id)?;
+    if profile.profile.kind == crate::domain::ProfileKind::ApiKey {
+        return discover_profile_models(&state.repository, state.secrets.clone(), &id).await;
+    }
+    if profile.profile.auth_mode != CodexAuthMode::OAuth {
+        return Err(AppError::ValidationFailed);
+    }
+    let credential = state
+        .oauth_credentials
+        .current_or_refresh(&profile, OAuthCredentialAccess::UserInitiated)
+        .await?;
+    let result = state.runtime.read_profile_models(&id, credential).await?;
+    state
+        .oauth_credentials
+        .persist(
+            &profile,
+            &result.credential,
+            OAuthCredentialAccess::UserInitiated,
+        )
+        .await?;
+    profiles::save_oauth_credential_metadata(&state.repository, &id, &result.credential)?;
+    profile = state.repository.profile(&id)?;
+    profile.profile.models = result.models;
+    profile.profile.health = "healthy".to_owned();
+    state.repository.update_profile(&profile)?;
+    Ok(profile.profile)
+}
+
+#[tauri::command]
+pub async fn test_api_service_profile(
+    input: TestApiServiceInput,
+) -> AppResult<crate::domain::ApiServiceTestReport> {
+    test_api_service(&input.provider, &input.base_url, &input.api_key).await
 }
 
 #[tauri::command]
@@ -455,6 +625,8 @@ pub async fn create_client_key(
         created_at_ms: now_ms(),
         last_used_at_ms: None,
         revoked: false,
+        managed_by: "user".to_owned(),
+        can_revoke: true,
     };
     if let Err(error) = state.repository.insert_client_key(&key, &hash, &secret_ref) {
         let _ = state.secrets.delete(&secret_ref).await;
@@ -482,38 +654,240 @@ pub async fn revoke_client_key(
 }
 
 #[tauri::command]
-pub fn list_channels(state: State<'_, AppState>) -> AppResult<Vec<MaskedChannel>> {
+pub async fn list_collaboration_bots(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<MaskedCollaborationBot>> {
+    state.collaboration.list_bots().await
+}
+
+#[tauri::command]
+pub async fn upsert_collaboration_bot(
+    input: UpsertCollaborationBotInput,
+    state: State<'_, AppState>,
+) -> AppResult<MaskedCollaborationBot> {
+    state.collaboration.upsert_bot(input).await
+}
+
+#[tauri::command]
+pub async fn test_collaboration_bot(
+    id: String,
+    state: State<'_, AppState>,
+) -> AppResult<MaskedCollaborationBot> {
+    state.collaboration.test_bot(id).await
+}
+
+#[tauri::command]
+pub async fn delete_collaboration_bot(
+    input: DeleteCollaborationBotInput,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    state.collaboration.delete_bot(input).await
+}
+
+#[tauri::command]
+pub fn list_collaboration_project_bindings(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<CollaborationProjectBinding>> {
+    state.collaboration.list_bindings()
+}
+
+#[tauri::command]
+pub fn upsert_collaboration_project_binding(
+    input: UpsertCollaborationProjectBindingInput,
+    state: State<'_, AppState>,
+) -> AppResult<CollaborationProjectBinding> {
+    state.collaboration.upsert_binding(input)
+}
+
+#[tauri::command]
+pub fn delete_collaboration_project_binding(
+    input: DeleteCollaborationProjectBindingInput,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    state.collaboration.delete_binding(input)
+}
+
+#[tauri::command]
+pub async fn register_discord_commands(
+    id: String,
+    state: State<'_, AppState>,
+) -> AppResult<MaskedCollaborationBot> {
+    state.collaboration.register_discord_commands(id).await
+}
+
+#[tauri::command]
+pub fn collaboration_callback_status(
+    state: State<'_, AppState>,
+) -> AppResult<CollaborationCallbackStatus> {
+    state.collaboration.callback_status()
+}
+
+#[tauri::command]
+pub async fn list_feishu_bots(state: State<'_, AppState>) -> AppResult<Vec<MaskedFeishuBot>> {
     Ok(state
-        .repository
-        .list_channels()?
+        .collaboration
+        .list_bots()
+        .await?
         .into_iter()
-        .map(|stored| stored.channel)
+        .filter(|bot| bot.provider == CollaborationProvider::Feishu)
+        .map(feishu_bot_from_collaboration)
         .collect())
 }
 
 #[tauri::command]
-pub async fn upsert_channel(
-    input: UpsertChannelInput,
+pub async fn upsert_feishu_bot(
+    input: UpsertFeishuBotInput,
     state: State<'_, AppState>,
-) -> AppResult<MaskedChannel> {
-    notifications::upsert_channel(&state.repository, state.secrets.clone(), input).await
+) -> AppResult<MaskedFeishuBot> {
+    let bot = state
+        .collaboration
+        .upsert_bot(UpsertCollaborationBotInput {
+            id: input.id,
+            provider: CollaborationProvider::Feishu,
+            name: input.name,
+            enabled: input.enabled,
+            confirmed: input.confirmed,
+            app_id: Some(input.app_id),
+            app_secret: input.app_secret,
+            client_secret: None,
+            corp_id: None,
+            agent_id: None,
+            secret: None,
+            token: None,
+            encoding_aes_key: None,
+            callback_public_url: None,
+            application_id: None,
+            bot_token: None,
+            guild_id: None,
+        })
+        .await?;
+    Ok(feishu_bot_from_collaboration(bot))
 }
 
 #[tauri::command]
-pub async fn test_channel(
-    input: TestChannelInput,
-    state: State<'_, AppState>,
-) -> AppResult<MaskedChannel> {
-    notifications::test_channel(&state.repository, state.secrets.clone(), input).await
+pub async fn test_feishu_bot(id: String, state: State<'_, AppState>) -> AppResult<MaskedFeishuBot> {
+    state
+        .collaboration
+        .test_bot(id)
+        .await
+        .map(feishu_bot_from_collaboration)
 }
 
 #[tauri::command]
-pub async fn delete_channel(
-    id: String,
-    confirmed: bool,
+pub async fn delete_feishu_bot(
+    input: DeleteFeishuBotInput,
     state: State<'_, AppState>,
 ) -> AppResult<()> {
-    notifications::delete_channel(&state.repository, state.secrets.clone(), &id, confirmed).await
+    state
+        .collaboration
+        .delete_bot(DeleteCollaborationBotInput {
+            id: input.id,
+            confirmed: input.confirmed,
+        })
+        .await
+}
+
+#[tauri::command]
+pub fn list_feishu_project_bindings(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<FeishuProjectBinding>> {
+    Ok(state
+        .collaboration
+        .list_bindings()?
+        .into_iter()
+        .filter(|binding| binding.provider == CollaborationProvider::Feishu)
+        .map(feishu_binding_from_collaboration)
+        .collect())
+}
+
+#[tauri::command]
+pub fn upsert_feishu_project_binding(
+    input: UpsertFeishuProjectBindingInput,
+    state: State<'_, AppState>,
+) -> AppResult<FeishuProjectBinding> {
+    state
+        .collaboration
+        .upsert_binding(UpsertCollaborationProjectBindingInput {
+            id: input.id,
+            bot_id: input.bot_id,
+            project_name: input.project_name,
+            project_slug: input.project_slug,
+            working_directory: input.working_directory,
+            profile_id: input.profile_id,
+            enabled: input.enabled,
+            concurrency_limit: input.concurrency_limit,
+            confirmed: input.confirmed,
+        })
+        .map(feishu_binding_from_collaboration)
+}
+
+#[tauri::command]
+pub fn delete_feishu_project_binding(
+    input: DeleteFeishuProjectBindingInput,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    state
+        .collaboration
+        .delete_binding(DeleteCollaborationProjectBindingInput {
+            id: input.id,
+            confirmed: input.confirmed,
+        })
+}
+
+#[tauri::command]
+pub fn list_codex_sessions(
+    input: ListCodexSessionsInput,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<CodexSessionSummary>> {
+    state.collaboration.list_sessions(input)
+}
+
+#[tauri::command]
+pub async fn cancel_codex_session(
+    input: CancelCodexSessionInput,
+    state: State<'_, AppState>,
+) -> AppResult<CodexSessionSummary> {
+    state.collaboration.cancel_session(input).await
+}
+
+#[tauri::command]
+pub async fn continue_codex_session(
+    input: ContinueCodexSessionInput,
+    state: State<'_, AppState>,
+) -> AppResult<CodexSessionSummary> {
+    state.collaboration.continue_session(input).await
+}
+
+fn feishu_bot_from_collaboration(bot: MaskedCollaborationBot) -> MaskedFeishuBot {
+    MaskedFeishuBot {
+        id: bot.id,
+        name: bot.name,
+        app_id: bot.config_summary.clone(),
+        app_id_mask: bot.credential_mask,
+        enabled: bot.enabled,
+        connection_status: bot.connection_status,
+        last_error: bot.last_error,
+        updated_at_ms: bot.updated_at_ms,
+    }
+}
+
+fn feishu_binding_from_collaboration(binding: CollaborationProjectBinding) -> FeishuProjectBinding {
+    FeishuProjectBinding {
+        id: binding.id,
+        bot_id: binding.bot_id,
+        bot_name: binding.bot_name,
+        project_name: binding.project_name,
+        project_slug: binding.project_slug,
+        working_directory: binding.working_directory,
+        profile_id: binding.profile_id,
+        profile_alias: binding.profile_alias,
+        chat_id: binding.chat_id,
+        bind_code: binding.bind_code,
+        enabled: binding.enabled,
+        concurrency_limit: binding.concurrency_limit,
+        created_at_ms: binding.created_at_ms,
+        updated_at_ms: binding.updated_at_ms,
+    }
 }
 
 #[tauri::command]
@@ -615,19 +989,23 @@ async fn oauth_credential(
     profile: &crate::database::StoredProfile,
     access: OAuthCredentialAccess,
 ) -> AppResult<crate::profiles::CodexOAuthCredential> {
-    if profile.profile.kind != crate::domain::ProfileKind::CodexOauth {
+    state.oauth_credentials.load(profile, access).await
+}
+
+async fn imported_auth_json(
+    state: &AppState,
+    profile: &crate::database::StoredProfile,
+    access: OAuthCredentialAccess,
+) -> AppResult<String> {
+    if profile.profile.kind != crate::domain::ProfileKind::CodexOauth
+        || profile.profile.auth_mode == CodexAuthMode::OAuth
+    {
         return Err(AppError::ProfileRuntimeUnavailable);
     }
     let reference = profile
         .secret_ref
         .as_deref()
         .ok_or(AppError::ProfileRuntimeUnavailable)?;
-    if let Some(cached) = cached_oauth_credential(state, &profile.profile.id)? {
-        if cached.persistence_pending && access == OAuthCredentialAccess::UserInitiated {
-            persist_oauth_credential(state, profile, &cached.credential, access).await?;
-        }
-        return Ok(cached.credential);
-    }
     let value = match access {
         OAuthCredentialAccess::Background => {
             state.secrets.get_without_user_interaction(reference).await
@@ -638,10 +1016,48 @@ async fn oauth_credential(
         AppError::NotFound => AppError::ProfileRuntimeUnavailable,
         other => other,
     })?;
-    let credential: crate::profiles::CodexOAuthCredential =
+    let credential: crate::profiles::ImportedAuthFileCredential =
         serde_json::from_str(&value).map_err(|_| AppError::ProfileRuntimeUnavailable)?;
-    cache_oauth_credential(state, &profile.profile.id, credential.clone(), false)?;
-    Ok(credential)
+    if credential.auth_mode != profile.profile.auth_mode || credential.auth_json.trim().is_empty() {
+        return Err(AppError::ProfileRuntimeUnavailable);
+    }
+    Ok(credential.auth_json)
+}
+
+enum ActiveProfileCredential {
+    OAuth(crate::profiles::CodexOAuthCredential),
+    AuthJson(String),
+}
+
+async fn active_profile_credential(
+    state: &AppState,
+    profile: &crate::database::StoredProfile,
+) -> AppResult<ActiveProfileCredential> {
+    if profile.profile.auth_mode == CodexAuthMode::OAuth {
+        if let Ok(credential) =
+            oauth_credential(state, profile, OAuthCredentialAccess::UserInitiated).await
+        {
+            return Ok(ActiveProfileCredential::OAuth(credential));
+        }
+    }
+    let reference = profile
+        .secret_ref
+        .as_deref()
+        .ok_or(AppError::ProfileRuntimeUnavailable)?;
+    let value = state
+        .secrets
+        .get(reference)
+        .await
+        .map_err(|error| match error {
+            AppError::NotFound => AppError::ProfileRuntimeUnavailable,
+            other => other,
+        })?;
+    let credential: crate::profiles::ImportedAuthFileCredential =
+        serde_json::from_str(&value).map_err(|_| AppError::ProfileRuntimeUnavailable)?;
+    if credential.auth_mode != profile.profile.auth_mode || credential.auth_json.is_empty() {
+        return Err(AppError::ProfileRuntimeUnavailable);
+    }
+    Ok(ActiveProfileCredential::AuthJson(credential.auth_json))
 }
 
 async fn persist_oauth_credential(
@@ -650,47 +1066,10 @@ async fn persist_oauth_credential(
     credential: &crate::profiles::CodexOAuthCredential,
     access: OAuthCredentialAccess,
 ) -> AppResult<()> {
-    let previous = cached_oauth_credential(state, &profile.profile.id)?;
-    if previous
-        .as_ref()
-        .is_some_and(|cached| cached.credential == *credential && !cached.persistence_pending)
-    {
-        return Ok(());
-    }
-    let reference = profile
-        .secret_ref
-        .as_deref()
-        .ok_or(AppError::ProfileRuntimeUnavailable)?;
-    let encoded = serde_json::to_string(credential).map_err(|_| AppError::Internal)?;
-    let result = match access {
-        OAuthCredentialAccess::Background => {
-            state
-                .secrets
-                .set_without_user_interaction(reference, &encoded)
-                .await
-        }
-        OAuthCredentialAccess::UserInitiated => state.secrets.set(reference, &encoded).await,
-    };
-    match result {
-        Ok(()) => cache_oauth_credential(state, &profile.profile.id, credential.clone(), false),
-        Err(AppError::KeychainInteractionRequired)
-            if access == OAuthCredentialAccess::Background =>
-        {
-            cache_oauth_credential(state, &profile.profile.id, credential.clone(), true)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn cached_oauth_credential(
-    state: &AppState,
-    profile_id: &str,
-) -> AppResult<Option<CachedOAuthCredential>> {
     state
         .oauth_credentials
-        .lock()
-        .map_err(|_| AppError::Internal)
-        .map(|cache| cache.get(profile_id).cloned())
+        .persist(profile, credential, access)
+        .await
 }
 
 fn cache_oauth_credential(
@@ -701,25 +1080,11 @@ fn cache_oauth_credential(
 ) -> AppResult<()> {
     state
         .oauth_credentials
-        .lock()
-        .map_err(|_| AppError::Internal)?
-        .insert(
-            profile_id.to_owned(),
-            CachedOAuthCredential {
-                credential,
-                persistence_pending,
-            },
-        );
-    Ok(())
+        .insert(profile_id, credential, persistence_pending)
 }
 
 fn remove_cached_oauth_credential(state: &AppState, profile_id: &str) -> AppResult<()> {
-    state
-        .oauth_credentials
-        .lock()
-        .map_err(|_| AppError::Internal)?
-        .remove(profile_id);
-    Ok(())
+    state.oauth_credentials.remove(profile_id)
 }
 
 fn now_ms() -> i64 {
@@ -747,20 +1112,30 @@ mod tests {
     }
 
     fn test_app_state(repository: Arc<Repository>, secrets: Arc<dyn SecretStore>) -> AppState {
+        let oauth_credentials = Arc::new(OAuthCredentialStore::new(secrets.clone()));
         AppState {
             gateway: Arc::new(GatewayManager::new(
                 repository.clone(),
                 secrets.clone(),
+                oauth_credentials.clone(),
                 PathBuf::from("/tmp/codex-relay-test-certs"),
             )),
             runtime: Arc::new(CodexRuntime::new(
                 PathBuf::from("/tmp/codex-relay-test-runtime"),
                 secrets.clone(),
             )),
+            collaboration: Arc::new(CollaborationManager::new(
+                repository.clone(),
+                secrets.clone(),
+                oauth_credentials.clone(),
+                PathBuf::from("/tmp/codex-relay-test-data"),
+            )),
             repository,
-            secrets,
+            data_dir: PathBuf::from("/tmp/codex-relay-test-data"),
+            secrets: secrets.clone(),
             quota_refresh_lock: tokio::sync::Mutex::new(()),
-            oauth_credentials: std::sync::Mutex::new(HashMap::new()),
+            oauth_credentials,
+            json_imports: crate::profile_import::JsonProfileImportStore::default(),
         }
     }
 
@@ -1026,8 +1401,14 @@ mod tests {
         .is_ok());
 
         assert_eq!(secrets.interactive_sets.load(Ordering::Relaxed), 1);
-        assert!(cached_oauth_credential(&state, "oauth-profile")
-            .unwrap()
-            .is_some_and(|cached| !cached.persistence_pending));
+        secrets.reset_counts();
+        assert!(oauth_credential(
+            &state,
+            &repository.profile("oauth-profile").unwrap(),
+            OAuthCredentialAccess::Background,
+        )
+        .await
+        .is_ok());
+        assert_eq!(secrets.silent_gets.load(Ordering::Relaxed), 0);
     }
 }

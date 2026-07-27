@@ -6,14 +6,6 @@ import { Dashboard } from "./Dashboard";
 const dialog = vi.hoisted(() => ({ open: vi.fn() }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => dialog);
-vi.mock("recharts", () => ({
-  Bar: () => null,
-  BarChart: () => null,
-  ResponsiveContainer: () => null,
-  Tooltip: () => null,
-  XAxis: () => null,
-}));
-
 class ResizeObserver {
   observe() {}
   unobserve() {}
@@ -25,16 +17,27 @@ vi.stubGlobal("ResizeObserver", ResizeObserver);
 afterEach(() => cleanup());
 
 const snapshot = {
+  workspace_mode: "per_profile" as const,
+  collaboration: {
+    enabled_bots: 0,
+    bound_chats: 0,
+    active_sessions: 0,
+  },
   gateway: {
     running: false,
     bind_mode: "loopback" as const,
     bind_address: "127.0.0.1",
+    available_addresses: [],
     port: 53765,
     cidrs: [],
     available_profiles: 0,
     cooling_profiles: 0,
     client_key_count: 0,
     certificate_ready: false,
+    service_url: "https://127.0.0.1:53765",
+    upstream_proxy_mode: "system" as const,
+    upstream_proxy_display: null,
+    upstream_last_error: null,
   },
   metrics: {
     total_requests: 0,
@@ -60,7 +63,6 @@ const snapshot = {
       is_current: true,
     },
   ],
-  notifications: [],
 };
 
 function renderDashboard(phase: "idle" | "running" = "idle") {

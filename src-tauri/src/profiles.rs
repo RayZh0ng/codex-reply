@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -12,13 +13,15 @@ use uuid::Uuid;
 use crate::{
     database::{Repository, StoredProfile},
     domain::{
-        CreateProfileInput, MaskedProfile, ProfileAccountSummary, ProfileKind, ProfileQuota,
-        ProfileSubscription, UpdateProfileInput,
+        CodexAuthMode, CreateProfileInput, GatewayProvider, MaskedProfile, ProfileAccountSummary,
+        ProfileKind, ProfileQuota, ProfileSubscription, UpdateProfileInput,
     },
     error::{AppError, AppResult},
+    gateway::normalize_base_url,
     secrets::SecretStore,
 };
 
+#[allow(dead_code)]
 const KEYCHAIN_SIGNING_MIGRATION_SETTING: &str = "keychain_signing_migration_v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,8 +33,28 @@ pub struct CodexOAuthCredential {
     pub last_refresh_ms: i64,
 }
 
+/// Credentials whose native Codex auth.json representation is not an OAuth
+/// token bundle. Keeping the generated auth JSON in encrypted local storage lets the runtime
+/// preserve Agent Identity and PAT modes without ever putting secrets in SQLite.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ImportedAuthFileCredential {
+    pub version: u8,
+    pub auth_mode: CodexAuthMode,
+    pub auth_json: String,
+}
+
+impl fmt::Debug for ImportedAuthFileCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ImportedAuthFileCredential")
+            .field("version", &self.version)
+            .field("auth_mode", &self.auth_mode)
+            .field("auth_json", &"<redacted>")
+            .finish()
+    }
+}
+
 impl CodexOAuthCredential {
-    #[cfg(test)]
     pub fn from_auth_json(value: &str) -> Option<Self> {
         #[derive(Deserialize)]
         struct AuthFile {
@@ -101,7 +124,10 @@ pub async fn create_profile(
         kind: input.kind,
         base_url: input
             .base_url
-            .map(|url| url.trim_end_matches('/').to_owned()),
+            .as_deref()
+            .map(|url| normalize_base_url(&input.provider, url))
+            .transpose()?,
+        provider: input.provider,
         enabled: true,
         in_pool: input.in_pool,
         priority: input.priority,
@@ -110,12 +136,14 @@ pub async fn create_profile(
         health: "unknown".to_owned(),
         cooldown_until_ms: None,
         credential_configured: secret_ref.is_some(),
+        auth_mode: CodexAuthMode::OAuth,
         is_current: false,
         account: None,
     };
     let stored = StoredProfile {
         profile: profile.clone(),
         secret_ref: secret_ref.clone(),
+        credential_fingerprint: None,
     };
     if let Err(error) = repository.insert_profile(&stored) {
         if let Some(reference) = secret_ref {
@@ -269,6 +297,57 @@ pub fn sync_oauth_account_info_with_snapshot(
     Ok(stored.profile)
 }
 
+pub fn sync_codex_account_info_with_snapshot(
+    repository: &Repository,
+    id: &str,
+    quota: ProfileQuota,
+    subscription: ProfileSubscription,
+    runtime_email: Option<String>,
+    runtime_account_id: Option<String>,
+) -> AppResult<MaskedProfile> {
+    let mut stored = repository.profile(id)?;
+    if stored.profile.kind != ProfileKind::CodexOauth {
+        return Err(AppError::ValidationFailed);
+    }
+    let previous_account = stored.profile.account.clone();
+    let now = timestamp_ms();
+    let mut account = previous_account.clone().unwrap_or(ProfileAccountSummary {
+        display_name: None,
+        email: None,
+        account_id: None,
+        updated_at_ms: now,
+        quota: unavailable_quota("额度尚未同步。"),
+        subscription: unavailable_subscription("订阅资料尚未同步。"),
+    });
+    account.updated_at_ms = now;
+    account.email = normalized_account_value(runtime_email, 320).or(account.email);
+    account.account_id = normalized_account_value(runtime_account_id, 160).or(account.account_id);
+    account.quota = quota;
+    if subscription.status == "unavailable"
+        && previous_account.as_ref().is_some_and(|previous| {
+            previous.subscription.plan_type.is_some()
+                || previous.subscription.period_ends_at_ms.is_some()
+        })
+    {
+        let last_attempt_at_ms = subscription.last_attempt_at_ms;
+        let last_error = subscription.last_error.clone();
+        account.subscription = previous_account
+            .as_ref()
+            .expect("checked above")
+            .subscription
+            .clone();
+        account.subscription.status = "stale".to_owned();
+        account.subscription.last_attempt_at_ms = last_attempt_at_ms;
+        account.subscription.last_error =
+            last_error.or_else(|| Some("订阅周期同步未完成，正在保留最近一次结果。".to_owned()));
+    } else {
+        account.subscription = subscription;
+    }
+    stored.profile.account = Some(account);
+    repository.update_profile(&stored)?;
+    Ok(stored.profile)
+}
+
 pub fn mark_quota_stale(repository: &Repository, id: &str) -> AppResult<MaskedProfile> {
     mark_quota_stale_with_message(
         repository,
@@ -351,6 +430,7 @@ pub async fn create_oauth_profile(
         alias: alias.trim().to_owned(),
         kind: ProfileKind::CodexOauth,
         base_url: None,
+        provider: GatewayProvider::OpenAi,
         enabled: true,
         in_pool: false,
         priority: 0,
@@ -359,12 +439,14 @@ pub async fn create_oauth_profile(
         health: "unknown".to_owned(),
         cooldown_until_ms: None,
         credential_configured: true,
+        auth_mode: CodexAuthMode::OAuth,
         is_current: false,
         account: account_summary(credential),
     };
     if let Err(error) = repository.insert_profile(&StoredProfile {
         profile: profile.clone(),
         secret_ref: Some(reference.clone()),
+        credential_fingerprint: None,
     }) {
         let _ = secrets.delete(&reference).await;
         return Err(error);
@@ -372,6 +454,131 @@ pub async fn create_oauth_profile(
     Ok(profile)
 }
 
+pub async fn create_imported_profile(
+    repository: &Repository,
+    secrets: Arc<dyn SecretStore>,
+    alias: String,
+    credential: &ImportedAuthFileCredential,
+    fingerprint: String,
+    account: Option<ProfileAccountSummary>,
+) -> AppResult<MaskedProfile> {
+    if alias.trim().is_empty() {
+        return Err(AppError::ValidationFailed);
+    }
+    let id = Uuid::new_v4().to_string();
+    let reference = oauth_secret_reference(&id);
+    let encoded = serde_json::to_string(credential).map_err(|_| AppError::Internal)?;
+    secrets.set(&reference, &encoded).await?;
+    let profile = MaskedProfile {
+        id: id.clone(),
+        alias: alias.trim().to_owned(),
+        kind: ProfileKind::CodexOauth,
+        base_url: None,
+        provider: GatewayProvider::OpenAi,
+        enabled: true,
+        in_pool: false,
+        priority: 0,
+        weight: 1,
+        models: Vec::new(),
+        health: "unknown".to_owned(),
+        cooldown_until_ms: None,
+        credential_configured: true,
+        auth_mode: credential.auth_mode.clone(),
+        is_current: false,
+        account,
+    };
+    if let Err(error) = repository.insert_profile(&StoredProfile {
+        profile: profile.clone(),
+        secret_ref: Some(reference.clone()),
+        credential_fingerprint: Some(fingerprint),
+    }) {
+        let _ = secrets.delete(&reference).await;
+        return Err(error);
+    }
+    Ok(profile)
+}
+
+pub async fn update_imported_profile_credential(
+    repository: &Repository,
+    secrets: Arc<dyn SecretStore>,
+    id: &str,
+    credential: &ImportedAuthFileCredential,
+    fingerprint: String,
+    account: Option<ProfileAccountSummary>,
+) -> AppResult<MaskedProfile> {
+    let mut stored = repository.profile(id)?;
+    if stored.profile.kind != ProfileKind::CodexOauth {
+        return Err(AppError::ValidationFailed);
+    }
+    let reference = stored
+        .secret_ref
+        .clone()
+        .unwrap_or_else(|| oauth_secret_reference(id));
+    let previous = if stored.secret_ref.is_some() {
+        secrets.get(&reference).await.ok()
+    } else {
+        None
+    };
+    let encoded = serde_json::to_string(credential).map_err(|_| AppError::Internal)?;
+    secrets.set(&reference, &encoded).await?;
+    stored.secret_ref = Some(reference.clone());
+    stored.credential_fingerprint = Some(fingerprint);
+    stored.profile.credential_configured = true;
+    stored.profile.auth_mode = credential.auth_mode.clone();
+    if account.is_some() {
+        stored.profile.account = account;
+    }
+    if let Err(error) = repository.update_profile(&stored) {
+        match previous {
+            Some(value) => {
+                let _ = secrets.set(&reference, &value).await;
+            }
+            None => {
+                let _ = secrets.delete(&reference).await;
+            }
+        }
+        return Err(error);
+    }
+    Ok(stored.profile)
+}
+
+pub fn imported_account_summary(
+    email: Option<String>,
+    account_id: Option<String>,
+    plan_type: Option<String>,
+) -> Option<ProfileAccountSummary> {
+    let display_name = None;
+    let email = normalized_account_value(email, 320);
+    let account_id = normalized_account_value(account_id, 160);
+    let plan_type = normalized_account_value(plan_type, 120);
+    if email.is_none() && account_id.is_none() && plan_type.is_none() {
+        return None;
+    }
+    let updated_at_ms = timestamp_ms();
+    let subscription = match plan_type {
+        Some(plan_type) => ProfileSubscription {
+            status: "available".to_owned(),
+            plan_type: Some(plan_type),
+            period_ends_at_ms: None,
+            will_renew: None,
+            source: Some("import_verification".to_owned()),
+            synced_at_ms: Some(updated_at_ms),
+            last_attempt_at_ms: updated_at_ms,
+            last_error: None,
+        },
+        None => unavailable_subscription("订阅资料尚未同步。"),
+    };
+    Some(ProfileAccountSummary {
+        display_name,
+        email,
+        account_id,
+        updated_at_ms,
+        quota: unavailable_quota("额度尚未同步。"),
+        subscription,
+    })
+}
+
+#[allow(dead_code)]
 pub async fn migrate_oauth_credentials(repository: &Repository, stable_app_signature: bool) {
     let signing_migration_pending = stable_app_signature
         && repository
@@ -534,9 +741,14 @@ pub fn candidates_for_model(
             let profile = &stored.profile;
             profile.enabled
                 && profile.in_pool
-                && profile.kind == ProfileKind::ApiKey
+                && (profile.kind == ProfileKind::ApiKey
+                    || (profile.kind == ProfileKind::CodexOauth
+                        && profile.auth_mode == CodexAuthMode::OAuth))
                 && profile.credential_configured
-                && profile.health != "unhealthy"
+                && !matches!(
+                    profile.health.as_str(),
+                    "unhealthy" | "reauthorization_required"
+                )
                 && profile.cooldown_until_ms.is_none_or(|until| until <= now)
                 && model
                     .is_none_or(|model| profile.models.iter().any(|candidate| candidate == model))
@@ -544,6 +756,15 @@ pub fn candidates_for_model(
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| candidate.profile.priority);
     Ok(candidates)
+}
+
+pub fn cool_down_profile(repository: &Repository, id: &str, duration: std::time::Duration) {
+    let Ok(mut stored) = repository.profile(id) else {
+        return;
+    };
+    stored.profile.cooldown_until_ms =
+        Some(timestamp_ms().saturating_add(duration.as_millis().try_into().unwrap_or(i64::MAX)));
+    let _ = repository.update_profile(&stored);
 }
 
 pub fn timestamp_ms() -> i64 {
@@ -554,21 +775,20 @@ pub fn timestamp_ms() -> i64 {
 }
 
 fn validate_profile_input(input: &CreateProfileInput) -> AppResult<()> {
-    if input.alias.trim().is_empty()
-        || input.weight < 1
-        || input.priority < 0
-        || input.models.is_empty()
-    {
+    if input.alias.trim().is_empty() || input.weight < 1 || input.priority < 0 {
         return Err(AppError::ValidationFailed);
     }
     match input.kind {
         ProfileKind::ApiKey => {
+            if input.in_pool && input.models.is_empty() {
+                return Err(AppError::ValidationFailed);
+            }
             let url = input
                 .base_url
                 .as_deref()
                 .ok_or(AppError::ValidationFailed)?;
             let parsed = Url::parse(url).map_err(|_| AppError::ValidationFailed)?;
-            if parsed.scheme() != "https"
+            if !valid_upstream_scheme(&input.provider, &parsed)
                 || parsed.host_str().is_none()
                 || input
                     .api_key
@@ -585,6 +805,21 @@ fn validate_profile_input(input: &CreateProfileInput) -> AppResult<()> {
     Ok(())
 }
 
+fn valid_upstream_scheme(provider: &GatewayProvider, parsed: &Url) -> bool {
+    if parsed.scheme() == "https" {
+        return true;
+    }
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    matches!(
+        provider,
+        GatewayProvider::Ollama | GatewayProvider::OpenAiCompatible
+    ) && parsed
+        .host_str()
+        .is_some_and(|host| host == "localhost" || host == "127.0.0.1" || host == "::1")
+}
+
 fn normalized_models(models: Vec<String>) -> Vec<String> {
     let mut values = models
         .into_iter()
@@ -599,13 +834,13 @@ fn normalized_models(models: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_oauth_profile, create_profile, migrate_oauth_credentials, sync_oauth_account_info,
-        sync_oauth_account_info_with_snapshot, unavailable_quota, CodexOAuthCredential,
-        KEYCHAIN_SIGNING_MIGRATION_SETTING,
+        candidates_for_model, create_oauth_profile, create_profile, imported_account_summary,
+        migrate_oauth_credentials, sync_oauth_account_info, sync_oauth_account_info_with_snapshot,
+        unavailable_quota, CodexOAuthCredential, KEYCHAIN_SIGNING_MIGRATION_SETTING,
     };
     use crate::{
         database::Repository,
-        domain::{CreateProfileInput, ProfileKind, ProfileSubscription},
+        domain::{CreateProfileInput, GatewayProvider, ProfileKind, ProfileSubscription},
         secrets::MemorySecretStore,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -616,6 +851,28 @@ mod tests {
             "header.{}.signature",
             URL_SAFE_NO_PAD.encode(claims.to_string())
         )
+    }
+
+    #[test]
+    fn imported_identity_summary_keeps_only_non_sensitive_display_fields() {
+        let summary = imported_account_summary(
+            Some("imported@example.com".into()),
+            Some("account-imported".into()),
+            Some("pro".into()),
+        )
+        .expect("identity metadata should be retained");
+
+        assert_eq!(summary.email.as_deref(), Some("imported@example.com"));
+        assert_eq!(summary.account_id.as_deref(), Some("account-imported"));
+        assert_eq!(summary.subscription.plan_type.as_deref(), Some("pro"));
+        assert_eq!(
+            summary.subscription.source.as_deref(),
+            Some("import_verification")
+        );
+        assert_eq!(summary.quota.status, "unavailable");
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("refresh_token"));
     }
 
     #[tokio::test]
@@ -641,6 +898,7 @@ mod tests {
                 alias: "Primary".into(),
                 kind: ProfileKind::ApiKey,
                 base_url: Some("https://relay.example.com/v1".into()),
+                provider: GatewayProvider::OpenAiCompatible,
                 api_key: Some("secret".into()),
                 models: vec!["gpt-5-codex".into()],
                 in_pool: true,
@@ -663,6 +921,7 @@ mod tests {
                 alias: "Primary".into(),
                 kind: ProfileKind::ApiKey,
                 base_url: Some("https://relay.example.com/v1".into()),
+                provider: GatewayProvider::OpenAiCompatible,
                 api_key: Some("super-secret".into()),
                 models: vec!["gpt-5-codex".into()],
                 in_pool: true,
@@ -705,6 +964,64 @@ mod tests {
             stored.secret_ref.as_deref(),
             Some("profile:oauth-id:oauth:v2")
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_candidates_include_only_opted_in_oauth_profiles() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let api_profile = create_profile(
+            &repository,
+            secrets.clone(),
+            CreateProfileInput {
+                alias: "Verified API".into(),
+                kind: ProfileKind::ApiKey,
+                base_url: Some("https://api.example.com/v1".into()),
+                provider: GatewayProvider::OpenAi,
+                api_key: Some("api-secret".into()),
+                models: vec!["gpt-5".into()],
+                in_pool: true,
+                priority: 0,
+                weight: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let oauth_profile = create_oauth_profile(
+            &repository,
+            secrets,
+            "oauth-id".into(),
+            "Personal OAuth".into(),
+            &CodexOAuthCredential {
+                id_token: "id".into(),
+                access_token: "access".into(),
+                refresh_token: None,
+                account_id: None,
+                last_refresh_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(candidates_for_model(&repository, Some("gpt-5"))
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.profile.id != oauth_profile.id));
+
+        let mut opted_in_oauth = repository.profile(&oauth_profile.id).unwrap();
+        opted_in_oauth.profile.in_pool = true;
+        opted_in_oauth.profile.models = vec!["gpt-5".into()];
+        opted_in_oauth.profile.health = "healthy".into();
+        repository.update_profile(&opted_in_oauth).unwrap();
+
+        let candidates = candidates_for_model(&repository, Some("gpt-5")).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.profile.id == api_profile.id));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.profile.id == oauth_profile.id));
     }
 
     #[tokio::test]
@@ -924,6 +1241,7 @@ mod tests {
                 alias: "Personal".into(),
                 kind: ProfileKind::CodexOauth,
                 base_url: None,
+                provider: GatewayProvider::OpenAiCompatible,
                 api_key: None,
                 models: vec!["unknown".into()],
                 in_pool: false,

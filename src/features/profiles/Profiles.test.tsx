@@ -1,12 +1,24 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  JsonProfileImportPreview,
   MaskedProfile,
   ProfileAccountSummary,
   ProfileQuotaWindow,
 } from "../../shared/ipc";
+import { api } from "../../shared/ipc";
 import { Profiles } from "./Profiles";
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 
 const status = {
   attempt_id: "attempt-1",
@@ -15,7 +27,11 @@ const status = {
   message: "已在默认浏览器中打开 OpenAI / ChatGPT 登录页面。",
 };
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+  vi.restoreAllMocks();
+});
 
 function renderProfiles(profiles: MaskedProfile[] = []) {
   return render(
@@ -113,11 +129,13 @@ function profileFixture({
   alias,
   account = null,
   kind = "codex_oauth",
+  authMode,
 }: {
   id: string;
   alias: string;
   account?: ProfileAccountSummary | null;
   kind?: MaskedProfile["kind"];
+  authMode?: MaskedProfile["auth_mode"];
 }): MaskedProfile {
   return {
     id,
@@ -133,6 +151,7 @@ function profileFixture({
     cooldown_until_ms: null,
     credential_configured: true,
     is_current: false,
+    auth_mode: authMode,
     account,
   };
 }
@@ -160,19 +179,144 @@ describe("Profiles OAuth import", () => {
       screen.getByText("当前档案会按所选模式启动 Codex 工作区"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/添加账号时会保存 OAuth 凭据。当前模式为/),
+      screen.getByText(/添加账号时会保存认证凭据。当前模式为/),
     ).toBeInTheDocument();
     expect(screen.getByText(/不会迁移 ChatGPT Chat\/Work/)).toBeInTheDocument();
   });
 
-  it("opens the OAuth-only import picker from the page action", () => {
-    renderProfiles();
+  it("opens distinct OAuth and JSON import cards from the page action", () => {
+    const view = renderProfiles();
 
     fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
 
     expect(screen.getByText("使用 OpenAI / ChatGPT 登录")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "继续使用 OAuth" })).toBeInTheDocument();
-    expect(screen.queryByText("API Key 上游")).not.toBeInTheDocument();
+    expect(screen.getByText("从 JSON 文件导入")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "选择 JSON 文件" })).toBeInTheDocument();
+    expect(view.container.querySelectorAll(".import-method-card")).toHaveLength(3);
+    expect(view.container.querySelector(".import-method-grid")).toBeInTheDocument();
+    expect(screen.getByText("连接 API 上游")).toBeInTheDocument();
+  });
+
+  it("previews selected JSON files, defaults to verified accounts, and commits only checked items", async () => {
+    const preview: JsonProfileImportPreview = {
+      preview_id: "json-preview",
+      expires_at_ms: 1_900_000_000_000,
+      items: [
+        {
+          id: "valid",
+          file_name: "auth.json",
+          alias: "Verified OAuth",
+          auth_mode: "oauth",
+          source: "JSON 文件",
+          status: "valid",
+          message: "已验证，可导入。",
+          email: "verified@example.com",
+          account_id: null,
+          existing_profile_alias: null,
+        },
+        {
+          id: "invalid",
+          file_name: "invalid.json",
+          alias: "Rejected token",
+          auth_mode: "oauth",
+          source: "JSON 文件",
+          status: "invalid",
+          message: "凭据已被上游拒绝。",
+          email: null,
+          account_id: null,
+          existing_profile_alias: null,
+        },
+      ],
+    };
+    vi.mocked(open).mockResolvedValue(["/tmp/auth.json", "/tmp/invalid.json"]);
+    const previewImport = vi
+      .spyOn(api, "previewJsonProfileImport")
+      .mockResolvedValue(preview);
+    const commitImport = vi.spyOn(api, "commitJsonProfileImport").mockResolvedValue({
+      created: 1,
+      updated: 0,
+      skipped: 1,
+      failed: 0,
+      items: [],
+    });
+    const onJsonImportComplete = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Profiles
+        profiles={[]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn()}
+        onJsonImportComplete={onJsonImportComplete}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "选择 JSON 文件" }));
+
+    await waitFor(() =>
+      expect(previewImport).toHaveBeenCalledWith([
+        "/tmp/auth.json",
+        "/tmp/invalid.json",
+      ]),
+    );
+    expect(
+      screen.getByRole("heading", { name: "选择要导入的账号" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /Verified OAuth/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /Rejected token/ })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "导入 1 个账号" }));
+    await waitFor(() =>
+      expect(commitImport).toHaveBeenCalledWith("json-preview", ["valid"]),
+    );
+    expect(onJsonImportComplete).toHaveBeenCalledOnce();
+    expect(
+      screen.getByText("导入完成：创建 1，更新 0，跳过 1，失败 0。"),
+    ).toBeInTheDocument();
+  });
+
+  it("retries unverified JSON preview items without reopening the file chooser", async () => {
+    const preview: JsonProfileImportPreview = {
+      preview_id: "retry-preview",
+      expires_at_ms: 1_900_000_000_000,
+      items: [
+        {
+          id: "retry",
+          file_name: "refresh.json",
+          alias: "Retry account",
+          auth_mode: "oauth",
+          source: "JSON 文件",
+          status: "unverified",
+          message: "暂时无法联网验证，请稍后重试预检。",
+          email: null,
+          account_id: null,
+          existing_profile_alias: null,
+        },
+      ],
+    };
+    vi.mocked(open).mockResolvedValue(["/tmp/refresh.json"]);
+    vi.spyOn(api, "previewJsonProfileImport").mockResolvedValue(preview);
+    const retryImport = vi.spyOn(api, "retryJsonProfileImport").mockResolvedValue({
+      ...preview,
+      items: [{ ...preview.items[0], status: "valid", message: "已验证，可导入。" }],
+    });
+    renderProfiles();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "选择 JSON 文件" }));
+    await screen.findByRole("button", { name: "重试未验证项" });
+    fireEvent.click(screen.getByRole("button", { name: "重试未验证项" }));
+
+    await waitFor(() => expect(retryImport).toHaveBeenCalledWith("retry-preview"));
+    expect(vi.mocked(open)).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("checkbox", { name: /Retry account/ })).toBeChecked();
+    expect(screen.getByRole("button", { name: "导入 1 个账号" })).toBeEnabled();
   });
 
   it("explains that OAuth opens in the default browser", () => {
@@ -180,7 +324,7 @@ describe("Profiles OAuth import", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
 
-    expect(screen.getByText(/默认浏览器中打开官方 OAuth 页面/)).toBeInTheDocument();
+    expect(screen.getByText(/默认浏览器完成官方 OAuth 授权/)).toBeInTheDocument();
   });
 
   it("opens the same picker from the empty state", () => {
@@ -225,6 +369,112 @@ describe("Profiles OAuth import", () => {
     expect(
       screen.getByRole("button", { name: "设为当前档案：Gateway only" }),
     ).toBeDisabled();
+  });
+
+  it("lets personal OAuth profiles refresh models and join the weighted gateway pool", () => {
+    const onTogglePool = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Profiles
+        profiles={[
+          {
+            ...profileFixture({ id: "oauth-profile", alias: "Personal OAuth" }),
+            models: ["gpt-5"],
+            health: "healthy",
+          },
+          {
+            ...profileFixture({
+              id: "api-profile",
+              alias: "Verified API",
+              kind: "api_key",
+            }),
+            base_url: "https://api.example.com/v1",
+            models: ["gpt-5"],
+            health: "healthy",
+          },
+        ]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onTogglePool={onTogglePool}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByText("当前没有可加入网关的 OAuth 或 API Key 档案。"),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "加入网关账号池：Personal OAuth" }),
+    );
+    expect(screen.queryByText(/本机.*运行时/)).not.toBeInTheDocument();
+    expect(onTogglePool).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "oauth-profile" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "加入网关账号池：Verified API" }),
+    ).toBeEnabled();
+  });
+
+  it("shows a bottom gateway join button even before OAuth models are refreshed", () => {
+    const onTogglePool = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Profiles
+        profiles={[profileFixture({ id: "oauth-profile", alias: "Personal OAuth" })]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onTogglePool={onTogglePool}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    const join = screen.getByRole("button", {
+      name: "加入网关账号池：Personal OAuth",
+    });
+    expect(join).toBeEnabled();
+    fireEvent.click(join);
+    expect(onTogglePool).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "oauth-profile" }),
+    );
+  });
+
+  it("shows a visible remove action for profiles already in the gateway pool", () => {
+    const onTogglePool = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Profiles
+        profiles={[
+          {
+            ...profileFixture({ id: "oauth-profile", alias: "Personal OAuth" }),
+            in_pool: true,
+            models: ["gpt-5"],
+          },
+        ]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onTogglePool={onTogglePool}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "移出网关账号池：Personal OAuth" }),
+    );
+    expect(onTogglePool).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "oauth-profile" }),
+    );
   });
 
   it("allows the current OAuth profile to be reapplied after a desktop restart failure", () => {
@@ -360,16 +610,16 @@ describe("Profiles OAuth import", () => {
       />,
     );
 
-    expect(screen.getByText("Personal OAuth")).toBeInTheDocument();
+    expect(screen.getAllByText("Personal OAuth").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("ada@example.com")).toBeInTheDocument();
     expect(screen.queryByText("Ada Lovelace")).not.toBeInTheDocument();
     expect(screen.queryByText("account_123")).not.toBeInTheDocument();
-    expect(screen.queryByText("资料更新时间")).not.toBeInTheDocument();
+    expect(
+      view.container.querySelector(".profile-account-summary"),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText("受管 OAuth")).not.toBeInTheDocument();
     expect(screen.queryByText("未加入账号池")).not.toBeInTheDocument();
     expect(screen.getByText("ChatGPT Pro")).toBeInTheDocument();
-    expect(screen.getByText("自动续费")).toBeInTheDocument();
-    expect(screen.getByText("距下次续费")).toBeInTheDocument();
     expect(screen.getByText("短期")).toBeInTheDocument();
     expect(screen.getByText("长期")).toBeInTheDocument();
     expect(
@@ -384,19 +634,42 @@ describe("Profiles OAuth import", () => {
     ).not.toBeInTheDocument();
     expect(screen.queryByText("状态")).not.toBeInTheDocument();
     expect(screen.queryByText("模型")).not.toBeInTheDocument();
-    expect(screen.queryByText("优先级 / 权重")).not.toBeInTheDocument();
+    expect(screen.getByText("优先级 / 权重")).toBeInTheDocument();
     expect(
       screen.queryByText(/优先通过本机 Codex 运行时读取套餐和额度/),
     ).not.toBeInTheDocument();
     expect(screen.queryByText("Codex 运行时")).not.toBeInTheDocument();
     expect(onSyncAccount).not.toHaveBeenCalled();
 
-    fireEvent.click(within(view.container).getByRole("button", { name: "同步资料" }));
+    fireEvent.click(within(view.container).getByRole("button", { name: "刷新资料" }));
     expect(onSyncAccount).toHaveBeenCalledWith("oauth-profile");
     fireEvent.click(
       within(view.container).getByRole("button", { name: "更新凭据：Personal OAuth" }),
     );
     expect(onStartOAuth).toHaveBeenCalledWith("oauth-profile");
+  });
+
+  it("shows refreshable quota cards for PAT and Agent Identity", () => {
+    const view = renderProfiles([
+      profileFixture({
+        id: "pat-profile",
+        alias: "Personal PAT",
+        authMode: "personal_access_token",
+        account: accountSummary({ email: "pat@example.com", planType: "pro" }),
+      }),
+      profileFixture({
+        id: "agent-profile",
+        alias: "Build Agent",
+        authMode: "agent_identity",
+      }),
+    ]);
+
+    expect(screen.getByText("pat@example.com")).toBeInTheDocument();
+    expect(screen.getAllByText("个人访问令牌")).not.toHaveLength(0);
+    expect(screen.getAllByText("Agent Identity")).not.toHaveLength(0);
+    expect(screen.getByText("ChatGPT Pro")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "刷新资料" })).toHaveLength(2);
+    expect(view.container.querySelectorAll(".profile-card")).toHaveLength(2);
   });
 
   it("keeps unavailable dates and stale quota as compact statuses", () => {
@@ -464,8 +737,7 @@ describe("Profiles OAuth import", () => {
     );
 
     const card = within(view.container);
-    expect(card.getAllByText("缓存已过期")).toHaveLength(2);
-    expect(card.getByText("上游未提供续费日期")).toBeInTheDocument();
+    expect(card.getAllByText("缓存已过期")).not.toHaveLength(0);
     expect(card.getByText("重置时间未提供")).toBeInTheDocument();
     expect(
       view.container.querySelector(".quota-meter-grid.is-single"),
@@ -535,12 +807,12 @@ describe("Profiles OAuth import", () => {
       />,
     );
 
-    expect(screen.getByText("需要授权")).toBeInTheDocument();
-    expect(screen.getByText("需要系统授权后同步")).toBeInTheDocument();
+    expect(screen.getAllByText("需要授权")).not.toHaveLength(0);
+    expect(screen.getByText("需要系统授权后刷新")).toBeInTheDocument();
     expect(
       screen.queryByText("后台同步未读取钥匙串；点击“同步资料”后可在系统弹窗中授权。"),
     ).not.toBeInTheDocument();
-    fireEvent.click(within(view.container).getByRole("button", { name: "解锁并同步" }));
+    fireEvent.click(within(view.container).getByRole("button", { name: "刷新资料" }));
     expect(onSyncAccount).toHaveBeenCalledWith("locked-oauth");
   });
 

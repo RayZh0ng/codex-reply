@@ -1,20 +1,21 @@
-import {
-  Key,
-  LockKey,
-  Play,
-  Plus,
-  Power,
-  ShieldCheck,
-  Trash,
-} from "@phosphor-icons/react";
-import { FormEvent, useEffect, useState } from "react";
+import { Key } from "@phosphor-icons/react/Key";
+import { LockKey } from "@phosphor-icons/react/LockKey";
+import { Play } from "@phosphor-icons/react/Play";
+import { Plus } from "@phosphor-icons/react/Plus";
+import { Power } from "@phosphor-icons/react/Power";
+import { ShieldCheck } from "@phosphor-icons/react/ShieldCheck";
+import { Trash } from "@phosphor-icons/react/Trash";
+import { FormEvent, useCallback, useEffect, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 
 import {
   api,
   type CreatedClientKey,
+  type GatewayCodexConfigStatus,
   type GatewayStatus,
   type MaskedClientKey,
 } from "../../shared/ipc";
+import { Select } from "../../shared/ui/Select";
 
 interface GatewayProps {
   gateway: GatewayStatus;
@@ -23,6 +24,8 @@ interface GatewayProps {
   onStart: () => Promise<void>;
   onStop: () => Promise<void>;
   onNotice: (message: string) => void;
+  onNavigateProfiles: () => void;
+  onRefresh: () => Promise<void>;
 }
 
 export function Gateway({
@@ -32,12 +35,15 @@ export function Gateway({
   onStart,
   onStop,
   onNotice,
+  onNavigateProfiles,
+  onRefresh,
 }: GatewayProps) {
   const [keys, setKeys] = useState<MaskedClientKey[]>([]);
   const [newKey, setNewKey] = useState<CreatedClientKey | null>(null);
   const [keyName, setKeyName] = useState("");
   const [loadingKeys, setLoadingKeys] = useState(true);
-  const reloadKeys = async () => {
+  const [codexConfig, setCodexConfig] = useState<GatewayCodexConfigStatus | null>(null);
+  const reloadKeys = useCallback(async () => {
     setLoadingKeys(true);
     try {
       setKeys(await api.listClientKeys());
@@ -46,30 +52,88 @@ export function Gateway({
     } finally {
       setLoadingKeys(false);
     }
-  };
+  }, []);
+  const reloadCodexConfig = useCallback(async () => {
+    try {
+      setCodexConfig(await api.codexGatewayConfigStatus());
+    } catch {
+      setCodexConfig(null);
+    }
+  }, []);
+  const reloadGatewayState = useCallback(async () => {
+    await Promise.all([reloadKeys(), reloadCodexConfig(), onRefresh()]);
+  }, [onRefresh, reloadCodexConfig, reloadKeys]);
   useEffect(() => {
     void reloadKeys();
-  }, []);
+  }, [reloadKeys]);
+  useEffect(() => {
+    void reloadCodexConfig();
+  }, [reloadCodexConfig]);
   const createKey = async () => {
     const created = await api.createClientKey(keyName);
     setNewKey(created);
     setKeyName("");
-    await reloadKeys();
+    await reloadGatewayState();
   };
   const revoke = async (id: string) => {
     await api.revokeClientKey(id);
-    await reloadKeys();
+    await reloadGatewayState();
     onNotice("客户端 Key 已撤销，受影响客户端需要使用新 Key。");
+  };
+  const toggleCodexGateway = async () => {
+    try {
+      const shouldDisable = codexConfig?.enabled && !codexConfig.needs_repair;
+      const next = shouldDisable
+        ? await api.disableCodexGateway()
+        : await api.enableCodexGateway();
+      setCodexConfig(next);
+      await Promise.all([reloadKeys(), onRefresh()]);
+      onNotice(next.message);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "Codex 网关切换未完成。");
+    }
+  };
+  const codexActionRequiresRunning = !codexConfig?.enabled || codexConfig.needs_repair;
+  const codexButtonLabel = codexConfig?.needs_repair
+    ? "修复 Codex Key"
+    : codexConfig?.enabled
+      ? "恢复原 Codex 配置"
+      : "设为 Codex 网关";
+  const exportCa = async () => {
+    try {
+      const destination = await save({
+        title: "导出 Relay 局域网 CA",
+        defaultPath: "codex-relay-gateway-ca.pem",
+        filters: [{ name: "PEM certificate", extensions: ["pem"] }],
+      });
+      if (!destination) return;
+      await api.exportGatewayCa(destination);
+      onNotice("CA 证书已导出。请在需要访问局域网网关的客户端上信任该证书。");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "CA 导出未完成。");
+    }
+  };
+  const trustCa = async () => {
+    try {
+      await api.trustGatewayCa();
+      onNotice("Relay CA 已加入 macOS 登录钥匙串。请重新启动 Codex 会话后重试。");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "无法安装 Relay CA。");
+    }
   };
   return (
     <div className="page gateway-page">
       <header className="page-heading" data-animate="heading">
         <div>
           <p className="section-kicker">Gateway</p>
-          <h1>安全的本机服务网关</h1>
+          <h1>局域网 API 网关</h1>
           <p className="page-subtitle">
-            所有入口均使用 HTTPS。默认只监听回环地址，绝不开放公网。
+            所有入口均使用 HTTPS。服务只绑定已检测的私有网络地址，始终需要客户端 Key。
           </p>
+          <div className="gateway-heading-meta">
+            <code>{gateway.service_url}</code>
+            <span>{gateway.available_profiles} 个可用 API 成员</span>
+          </div>
         </div>
         <button
           className={gateway.running ? "danger-button" : "primary-button"}
@@ -85,6 +149,27 @@ export function Gateway({
           {gateway.running ? "停止服务" : "启动 API 服务"}
         </button>
       </header>
+      {gateway.available_profiles === 0 && (
+        <section className="gateway-warning" aria-label="网关账号成员提示">
+          <div className="gateway-warning-row">
+            <div>
+              <strong>当前没有网关账号成员</strong>
+              <p>
+                {gateway.running
+                  ? "服务已启动，但还没有可用账号成员。请到档案页刷新模型并把账号加入网关。"
+                  : "启动前请先到档案页刷新模型并把账号加入网关；也可先完成监听与证书配置。"}
+              </p>
+            </div>
+            <button
+              className="primary-button compact-action"
+              type="button"
+              onClick={onNavigateProfiles}
+            >
+              去档案加入网关
+            </button>
+          </div>
+        </section>
+      )}
       {newKey && (
         <SecretOnce
           value={newKey.plaintext_once}
@@ -95,7 +180,7 @@ export function Gateway({
       <section className="gateway-layout" data-animate="gateway">
         <GatewayForm gateway={gateway} busy={busy} onSave={onSave} />
         <aside className="gateway-side">
-          <article className="surface-card security-card">
+          <article className="surface-card security-card gateway-card">
             <div className="card-heading">
               <div>
                 <p className="section-kicker">Protection</p>
@@ -112,15 +197,70 @@ export function Gateway({
               </li>
               <li>
                 <span>监听范围</span>
-                <strong>{gateway.bind_mode === "lan" ? "受控局域网" : "仅本机"}</strong>
+                <strong>局域网 · {gateway.bind_address}</strong>
               </li>
               <li>
                 <span>客户端鉴权</span>
                 <strong>{gateway.client_key_count} 个有效 Key</strong>
               </li>
             </ul>
+            <div className="gateway-inline-actions">
+              <button
+                className="quiet-button"
+                disabled={busy || !gateway.certificate_ready}
+                type="button"
+                onClick={() => void exportCa()}
+              >
+                导出 CA
+              </button>
+              <button
+                className="quiet-button"
+                disabled={busy || !gateway.certificate_ready}
+                type="button"
+                onClick={() => void trustCa()}
+              >
+                信任此 Mac
+              </button>
+            </div>
           </article>
-          <article className="surface-card key-card">
+          <article className="surface-card security-card gateway-card">
+            <div className="card-heading">
+              <div>
+                <p className="section-kicker">Codex</p>
+                <h2>Codex 网关切换</h2>
+              </div>
+              <LockKey size={23} weight="duotone" />
+            </div>
+            <span
+              className={`codex-config-status ${
+                codexConfig?.enabled && !codexConfig.needs_repair ? "" : "is-disabled"
+              }`}
+            >
+              {codexConfig?.needs_repair
+                ? "需要修复 Codex Key"
+                : codexConfig?.enabled
+                  ? "已接入 Relay 网关"
+                  : "未接入 Relay 网关"}
+            </span>
+            <p className="muted-copy codex-config-copy">
+              {codexConfig?.message ?? "正在读取 Codex 配置状态…"}
+            </p>
+            <button
+              className={
+                codexConfig?.enabled && !codexConfig.needs_repair
+                  ? "quiet-button"
+                  : "primary-button"
+              }
+              disabled={
+                busy || !codexConfig || (codexActionRequiresRunning && !gateway.running)
+              }
+              type="button"
+              onClick={() => void toggleCodexGateway()}
+            >
+              {codexButtonLabel}
+            </button>
+          </article>
+          <article className="surface-card key-card gateway-card">
             <div className="card-heading">
               <div>
                 <p className="section-kicker">Client access</p>
@@ -152,16 +292,21 @@ export function Gateway({
                   <li key={key.id}>
                     <div>
                       <strong>{key.name}</strong>
+                      {key.managed_by === "codex_gateway" && (
+                        <span className="managed-key-badge">Codex 自动管理</span>
+                      )}
                       <span>{key.masked_value}</span>
                     </div>
-                    <button
-                      className="icon-button danger"
-                      type="button"
-                      aria-label={`撤销 ${key.name}`}
-                      onClick={() => void revoke(key.id)}
-                    >
-                      <Trash size={17} />
-                    </button>
+                    {key.can_revoke && (
+                      <button
+                        className="icon-button danger"
+                        type="button"
+                        aria-label={`撤销 ${key.name}`}
+                        onClick={() => void revoke(key.id)}
+                      >
+                        <Trash size={17} />
+                      </button>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -184,32 +329,50 @@ function GatewayForm({
   busy: boolean;
   onSave: (input: Record<string, unknown>) => Promise<void>;
 }) {
-  const [mode, setMode] = useState(gateway.bind_mode);
   const [address, setAddress] = useState(gateway.bind_address);
   const [port, setPort] = useState(String(gateway.port));
   const [cidrs, setCidrs] = useState(gateway.cidrs.join(", "));
+  const [proxyMode, setProxyMode] = useState(gateway.upstream_proxy_mode);
+  const [proxyUrl, setProxyUrl] = useState("");
   useEffect(() => {
-    setMode(gateway.bind_mode);
-    setAddress(gateway.bind_address);
+    const selected = gateway.available_addresses.some(
+      (candidate) => candidate.address === gateway.bind_address,
+    )
+      ? gateway.bind_address
+      : (gateway.available_addresses.find((candidate) => candidate.is_default)
+          ?.address ?? gateway.bind_address);
+    setAddress(selected);
     setPort(String(gateway.port));
     setCidrs(gateway.cidrs.join(", "));
+    setProxyMode(gateway.upstream_proxy_mode);
+    setProxyUrl("");
   }, [gateway]);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     await onSave({
-      bind_mode: mode,
+      bind_mode: "lan",
       bind_address: address,
       port: Number(port),
-      cidrs:
-        mode === "lan"
-          ? cidrs
-              .split(",")
-              .map((item) => item.trim())
-              .filter(Boolean)
-          : [],
-      confirmed_lan: mode === "lan",
+      cidrs: cidrs
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+      confirmed_lan: true,
+      upstream_proxy_mode: proxyMode,
+      upstream_proxy_url:
+        proxyMode === "manual" && proxyUrl.trim() ? proxyUrl.trim() : null,
     });
   };
+  const addressOptions = gateway.available_addresses.map((candidate) => ({
+    value: candidate.address,
+    label: `${candidate.name} · ${candidate.address}${candidate.is_default ? "（默认）" : ""}`,
+  }));
+  if (address && !addressOptions.some((option) => option.value === address)) {
+    addressOptions.unshift({
+      value: address,
+      label: `当前地址 · ${address}`,
+    });
+  }
   return (
     <form
       className="surface-card gateway-form"
@@ -222,34 +385,14 @@ function GatewayForm({
         </div>
         <LockKey size={23} weight="duotone" />
       </div>
-      <fieldset>
-        <legend>监听模式</legend>
-        <div className="segmented">
-          <button
-            className={mode === "loopback" ? "selected" : ""}
-            type="button"
-            onClick={() => {
-              setMode("loopback");
-              setAddress("127.0.0.1");
-            }}
-          >
-            仅本机
-          </button>
-          <button
-            className={mode === "lan" ? "selected" : ""}
-            type="button"
-            onClick={() => setMode("lan")}
-          >
-            局域网
-          </button>
-        </div>
-      </fieldset>
       <label>
-        监听地址
-        <input
+        检测到的局域网地址
+        <Select
+          ariaLabel="检测到的局域网地址"
+          onValueChange={setAddress}
+          options={addressOptions}
+          placeholder="等待检测局域网地址"
           value={address}
-          onChange={(event) => setAddress(event.target.value)}
-          inputMode="url"
         />
       </label>
       <label>
@@ -260,27 +403,58 @@ function GatewayForm({
           inputMode="numeric"
         />
       </label>
-      {mode === "lan" && (
+      <label>
+        允许的 CIDR（可选）
+        <input
+          value={cidrs}
+          onChange={(event) => setCidrs(event.target.value)}
+          placeholder="留空允许局域网设备；例如：192.168.1.0/24"
+        />
+      </label>
+      <label>
+        上游代理
+        <Select
+          ariaLabel="上游代理"
+          onValueChange={(value) =>
+            setProxyMode(value as GatewayStatus["upstream_proxy_mode"])
+          }
+          options={[
+            { value: "system", label: "系统/环境代理（推荐）" },
+            { value: "manual", label: "手动代理" },
+            { value: "disabled", label: "直连" },
+          ]}
+          value={proxyMode}
+        />
+      </label>
+      {proxyMode === "manual" && (
         <label>
-          允许的 CIDR
+          手动代理 URL
           <input
-            required
-            value={cidrs}
-            onChange={(event) => setCidrs(event.target.value)}
-            placeholder="例如：192.168.1.0/24"
+            value={proxyUrl}
+            onChange={(event) => setProxyUrl(event.target.value)}
+            placeholder={
+              gateway.upstream_proxy_display
+                ? `已保存：${gateway.upstream_proxy_display}；留空则保留`
+                : "例如 http://127.0.0.1:7890 或 socks5h://127.0.0.1:7890"
+            }
           />
         </label>
+      )}
+      {gateway.upstream_last_error && (
+        <div className="config-note warning">
+          <ShieldCheck size={19} weight="fill" />
+          <p>最近上游失败：{gateway.upstream_last_error}</p>
+        </div>
       )}
       <div className="config-note">
         <ShieldCheck size={19} weight="fill" />
         <p>
-          {mode === "lan"
-            ? "局域网模式仅允许私有地址和至少一条 CIDR 白名单；客户端必须使用 Bearer Key。"
-            : "回环模式拒绝非本机访问，也不会读取代理转发头。"}
+          留空 CIDR 时，监听网段内任意设备都可连接；每个请求仍必须携带 Relay Client
+          Key。
         </p>
       </div>
       <div className="form-actions">
-        <span className="muted-copy">Base URL：HTTPS 本地证书</span>
+        <span className="muted-copy">服务地址：{gateway.service_url}</span>
         <button
           className="primary-button"
           disabled={busy || gateway.running}

@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type ProfileKind = "api_key" | "codex_oauth";
-export type ChannelKind = "feishu" | "wecom" | "custom";
+export type GatewayProvider =
+  "openai" | "openai_compatible" | "anthropic" | "gemini" | "ollama";
+export type CodexAuthMode = "oauth" | "agent_identity" | "personal_access_token";
 export type DesktopWorkspaceMode = "fresh" | "per_profile" | "shared";
 
 export interface MaskedProfile {
@@ -9,6 +11,7 @@ export interface MaskedProfile {
   alias: string;
   kind: ProfileKind;
   base_url: string | null;
+  provider?: GatewayProvider;
   enabled: boolean;
   in_pool: boolean;
   priority: number;
@@ -17,8 +20,43 @@ export interface MaskedProfile {
   health: string;
   cooldown_until_ms: number | null;
   credential_configured: boolean;
+  auth_mode?: CodexAuthMode;
   is_current: boolean;
   account?: ProfileAccountSummary | null;
+}
+
+export interface JsonProfileImportPreviewItem {
+  id: string;
+  file_name: string;
+  alias: string;
+  auth_mode: CodexAuthMode;
+  source: string;
+  status: "valid" | "invalid" | "unverified";
+  message: string;
+  email: string | null;
+  account_id: string | null;
+  existing_profile_alias: string | null;
+}
+
+export interface JsonProfileImportPreview {
+  preview_id: string;
+  expires_at_ms: number;
+  items: JsonProfileImportPreviewItem[];
+}
+
+export interface JsonProfileImportResultItem {
+  id: string;
+  alias: string;
+  action: "created" | "updated" | "skipped" | "failed";
+  message: string;
+}
+
+export interface JsonProfileImportResult {
+  created: number;
+  updated: number;
+  skipped: number;
+  failed: number;
+  items: JsonProfileImportResultItem[];
 }
 
 export interface ProfileAccountSummary {
@@ -63,7 +101,12 @@ export interface ProfileSubscription {
   plan_type: string | null;
   period_ends_at_ms: number | null;
   will_renew: boolean | null;
-  source: "app_server" | "account_check" | "app_server+account_check" | null;
+  source:
+    | "app_server"
+    | "account_check"
+    | "app_server+account_check"
+    | "import_verification"
+    | null;
   synced_at_ms: number | null;
   last_attempt_at_ms: number;
   last_error: string | null;
@@ -76,14 +119,45 @@ export interface ProfileQuotaRefreshReport {
 
 export interface GatewayStatus {
   running: boolean;
-  bind_mode: "loopback" | "lan";
+  bind_mode: "lan" | "loopback";
   bind_address: string;
+  available_addresses: GatewayNetworkAddress[];
   port: number;
   cidrs: string[];
   available_profiles: number;
   cooling_profiles: number;
   client_key_count: number;
   certificate_ready: boolean;
+  service_url: string;
+  upstream_proxy_mode: "system" | "manual" | "disabled";
+  upstream_proxy_display: string | null;
+  upstream_last_error: string | null;
+}
+
+export interface GatewayNetworkAddress {
+  name: string;
+  address: string;
+  is_default: boolean;
+}
+
+export interface GatewayCodexConfigStatus {
+  enabled: boolean;
+  config_path: string;
+  service_url: string | null;
+  message: string;
+  auth_status: "ok" | "missing" | "legacy" | "invalid";
+  needs_repair: boolean;
+}
+
+export interface ApiServiceTestReport {
+  status: "verified" | "failed";
+  category: string;
+  endpoint: string;
+  message: string;
+  http_status: number | null;
+  latency_ms: number;
+  model_count: number;
+  models: string[];
 }
 
 export interface MetricsSnapshot {
@@ -94,15 +168,6 @@ export interface MetricsSnapshot {
   estimated_tokens: number;
 }
 
-export interface MaskedChannel {
-  id: string;
-  name: string;
-  kind: ChannelKind;
-  enabled: boolean;
-  endpoint_mask: string;
-  last_status: string;
-}
-
 export interface MaskedClientKey {
   id: string;
   name: string;
@@ -110,13 +175,123 @@ export interface MaskedClientKey {
   created_at_ms: number;
   last_used_at_ms: number | null;
   revoked: boolean;
+  managed_by: "user" | "codex_gateway";
+  can_revoke: boolean;
+}
+
+export type CollaborationProvider = "feishu" | "qq" | "wecom" | "discord" | "telegram";
+export type CollaborationBotStatus =
+  | "disabled"
+  | "configured"
+  | "connecting"
+  | "connected"
+  | "callback_required"
+  | "failed"
+  | string;
+
+export interface MaskedCollaborationBot {
+  id: string;
+  provider: CollaborationProvider;
+  name: string;
+  enabled: boolean;
+  connection_status: CollaborationBotStatus;
+  credential_mask: string;
+  config_summary: string;
+  callback_public_url: string | null;
+  last_error: string | null;
+  updated_at_ms: number;
+}
+
+export interface CollaborationProjectBinding {
+  id: string;
+  provider: CollaborationProvider;
+  bot_id: string;
+  bot_name: string;
+  project_name: string;
+  project_slug: string;
+  working_directory: string;
+  profile_id: string;
+  profile_alias: string;
+  chat_id: string | null;
+  bind_code: string;
+  enabled: boolean;
+  concurrency_limit: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface CollaborationCallbackStatus {
+  local_url: string;
+  public_urls: string[];
+  running: boolean;
+}
+
+export interface MaskedFeishuBot {
+  id: string;
+  name: string;
+  app_id: string;
+  app_id_mask: string;
+  enabled: boolean;
+  connection_status: string;
+  last_error: string | null;
+  updated_at_ms: number;
+}
+
+export interface FeishuProjectBinding {
+  id: string;
+  bot_id: string;
+  bot_name: string;
+  project_name: string;
+  project_slug: string;
+  working_directory: string;
+  profile_id: string;
+  profile_alias: string;
+  chat_id: string | null;
+  bind_code: string;
+  enabled: boolean;
+  concurrency_limit: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export type CodexSessionStatus =
+  "running" | "completed" | "failed" | "cancelled" | string;
+
+export interface CodexSessionSummary {
+  id: string;
+  binding_id: string;
+  provider: CollaborationProvider;
+  provider_bot_id: string | null;
+  provider_chat_id: string | null;
+  provider_message_id: string | null;
+  project_name: string;
+  project_slug: string;
+  profile_id: string;
+  profile_alias: string;
+  relay_status: CodexSessionStatus;
+  codex_session_id: string | null;
+  feishu_message_id: string | null;
+  feishu_chat_id: string | null;
+  started_by: string | null;
+  started_at_ms: number;
+  updated_at_ms: number;
+  finished_at_ms: number | null;
+  summary: string | null;
+  last_error: string | null;
 }
 
 export interface DashboardSnapshot {
   gateway: GatewayStatus;
   profiles: MaskedProfile[];
   metrics: MetricsSnapshot;
-  notifications: MaskedChannel[];
+  workspace_mode: DesktopWorkspaceMode;
+  collaboration: CollaborationSummary;
+}
+
+export interface CollaborationSummary {
+  enabled_bots: number;
+  bound_chats: number;
+  active_sessions: number;
 }
 
 export interface CreatedClientKey {
@@ -279,6 +454,21 @@ export const api = {
     relayInvoke<GatewayStatus>("update_gateway", { input }),
   startGateway: () => relayInvoke<GatewayStatus>("start_gateway"),
   stopGateway: () => relayInvoke<GatewayStatus>("stop_gateway"),
+  exportGatewayCa: (destination: string) =>
+    relayInvoke<void>("export_gateway_ca", { destination }),
+  trustGatewayCa: () => relayInvoke<void>("trust_gateway_ca"),
+  refreshProfileModels: (id: string) =>
+    relayInvoke<MaskedProfile>("refresh_profile_models", { id }),
+  testApiServiceProfile: (input: Record<string, unknown>) =>
+    relayInvoke<ApiServiceTestReport>("test_api_service_profile", { input }),
+  codexGatewayConfigStatus: () =>
+    relayInvoke<GatewayCodexConfigStatus>("codex_gateway_config_status"),
+  enableCodexGateway: () =>
+    relayInvoke<GatewayCodexConfigStatus>("enable_codex_gateway"),
+  disableCodexGateway: () =>
+    relayInvoke<GatewayCodexConfigStatus>("disable_codex_gateway"),
+  activateApiServiceProfile: (id: string) =>
+    relayInvoke<GatewayCodexConfigStatus>("activate_api_service_profile", { id }),
   listClientKeys: () => relayInvoke<MaskedClientKey[]>("list_client_keys"),
   createClientKey: (name: string) =>
     relayInvoke<CreatedClientKey>("create_client_key", {
@@ -286,12 +476,57 @@ export const api = {
     }),
   revokeClientKey: (id: string) =>
     relayInvoke<void>("revoke_client_key", { id, confirmed: true }),
-  upsertChannel: (input: Record<string, unknown>) =>
-    relayInvoke<MaskedChannel>("upsert_channel", { input }),
-  testChannel: (id: string) =>
-    relayInvoke<MaskedChannel>("test_channel", { input: { id, confirmed: true } }),
-  deleteChannel: (id: string) =>
-    relayInvoke<void>("delete_channel", { id, confirmed: true }),
+  listCollaborationBots: () =>
+    relayInvoke<MaskedCollaborationBot[]>("list_collaboration_bots"),
+  upsertCollaborationBot: (input: Record<string, unknown>) =>
+    relayInvoke<MaskedCollaborationBot>("upsert_collaboration_bot", { input }),
+  testCollaborationBot: (id: string) =>
+    relayInvoke<MaskedCollaborationBot>("test_collaboration_bot", { id }),
+  deleteCollaborationBot: (id: string) =>
+    relayInvoke<void>("delete_collaboration_bot", {
+      input: { id, confirmed: true },
+    }),
+  listCollaborationProjectBindings: () =>
+    relayInvoke<CollaborationProjectBinding[]>("list_collaboration_project_bindings"),
+  upsertCollaborationProjectBinding: (input: Record<string, unknown>) =>
+    relayInvoke<CollaborationProjectBinding>("upsert_collaboration_project_binding", {
+      input,
+    }),
+  deleteCollaborationProjectBinding: (id: string) =>
+    relayInvoke<void>("delete_collaboration_project_binding", {
+      input: { id, confirmed: true },
+    }),
+  registerDiscordCommands: (id: string) =>
+    relayInvoke<MaskedCollaborationBot>("register_discord_commands", { id }),
+  collaborationCallbackStatus: () =>
+    relayInvoke<CollaborationCallbackStatus>("collaboration_callback_status"),
+  listFeishuBots: () => relayInvoke<MaskedFeishuBot[]>("list_feishu_bots"),
+  upsertFeishuBot: (input: Record<string, unknown>) =>
+    relayInvoke<MaskedFeishuBot>("upsert_feishu_bot", { input }),
+  testFeishuBot: (id: string) =>
+    relayInvoke<MaskedFeishuBot>("test_feishu_bot", { id }),
+  deleteFeishuBot: (id: string) =>
+    relayInvoke<void>("delete_feishu_bot", { input: { id, confirmed: true } }),
+  listFeishuProjectBindings: () =>
+    relayInvoke<FeishuProjectBinding[]>("list_feishu_project_bindings"),
+  upsertFeishuProjectBinding: (input: Record<string, unknown>) =>
+    relayInvoke<FeishuProjectBinding>("upsert_feishu_project_binding", { input }),
+  deleteFeishuProjectBinding: (id: string) =>
+    relayInvoke<void>("delete_feishu_project_binding", {
+      input: { id, confirmed: true },
+    }),
+  listCodexSessions: (bindingId?: string) =>
+    relayInvoke<CodexSessionSummary[]>("list_codex_sessions", {
+      input: { binding_id: bindingId ?? null },
+    }),
+  cancelCodexSession: (sessionId: string) =>
+    relayInvoke<CodexSessionSummary>("cancel_codex_session", {
+      input: { session_id: sessionId, confirmed: true },
+    }),
+  continueCodexSession: (sessionId: string, instruction: string) =>
+    relayInvoke<CodexSessionSummary>("continue_codex_session", {
+      input: { session_id: sessionId, instruction, confirmed: true },
+    }),
   startOAuthImport: (profileId?: string) =>
     relayInvoke<OAuthImportStatus>("start_oauth_import", {
       input: { profile_id: profileId ?? null },
@@ -303,5 +538,21 @@ export const api = {
   completeOAuthImport: (attemptId: string, alias?: string) =>
     relayInvoke<MaskedProfile>("complete_oauth_import", {
       input: { attempt_id: attemptId, alias: alias ?? null },
+    }),
+  previewJsonProfileImport: (paths: string[]) =>
+    relayInvoke<JsonProfileImportPreview>("preview_json_profile_import", {
+      input: { paths },
+    }),
+  commitJsonProfileImport: (previewId: string, itemIds: string[]) =>
+    relayInvoke<JsonProfileImportResult>("commit_json_profile_import", {
+      input: { preview_id: previewId, item_ids: itemIds },
+    }),
+  retryJsonProfileImport: (previewId: string) =>
+    relayInvoke<JsonProfileImportPreview>("retry_json_profile_import", {
+      input: { preview_id: previewId },
+    }),
+  discardJsonProfileImport: (previewId: string) =>
+    relayInvoke<void>("discard_json_profile_import", {
+      input: { preview_id: previewId },
     }),
 };

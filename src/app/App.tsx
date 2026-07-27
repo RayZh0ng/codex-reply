@@ -1,42 +1,69 @@
-import { useGSAP } from "@gsap/react";
+import { ArrowsClockwise } from "@phosphor-icons/react/ArrowsClockwise";
+import { ChartPieSlice } from "@phosphor-icons/react/ChartPieSlice";
+import { ChatCircleDots } from "@phosphor-icons/react/ChatCircleDots";
+import { GearSix } from "@phosphor-icons/react/GearSix";
+import { Lightning } from "@phosphor-icons/react/Lightning";
+import { List } from "@phosphor-icons/react/List";
+import { ShieldWarning } from "@phosphor-icons/react/ShieldWarning";
+import { UsersThree } from "@phosphor-icons/react/UsersThree";
 import {
-  Bell,
-  ChartPieSlice,
-  GearSix,
-  Lightning,
-  List,
-  ShieldWarning,
-  UsersThree,
-} from "@phosphor-icons/react";
-import gsap from "gsap";
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+  lazy,
+  Suspense,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { flushSync } from "react-dom";
 
 import { Dashboard } from "../features/dashboard/Dashboard";
-import { Gateway } from "../features/gateway/Gateway";
-import { Notifications } from "../features/notifications/Notifications";
-import { Profiles } from "../features/profiles/Profiles";
-import { Settings } from "../features/settings/Settings";
 import {
   api,
   type CurrentProfileActivation,
   type DesktopWorkspaceHistoryItem,
   type DesktopWorkspaceMode,
   type DesktopWorkspaceSettings,
+  type CodexSessionSummary,
+  type CollaborationProjectBinding,
   type DashboardSnapshot,
   type ManagedTaskStatus,
+  type MaskedCollaborationBot,
+  type MaskedProfile,
   type StartManagedTaskInput,
   RelayError,
 } from "../shared/ipc";
-import logo from "../../assets/codex-relay-icon-modern.png";
-import "./App.css";
+import { Button, Dialog, StatusPill } from "../shared/ui";
+import { useTheme } from "../shared/theme";
+import type { ThemePreference } from "../shared/theme";
+import logo from "../../assets/codex-relay-mark.png";
 
-type Page = "dashboard" | "profiles" | "gateway" | "notifications" | "settings";
+const loadProfilesPage = () => import("../features/profiles/Profiles");
+const loadGatewayPage = () => import("../features/gateway/Gateway");
+const loadCollaborationPage = () => import("../features/collaboration/Collaboration");
+const loadSettingsPage = () => import("../features/settings/Settings");
+
+const Profiles = lazy(() =>
+  loadProfilesPage().then((module) => ({ default: module.Profiles })),
+);
+const Gateway = lazy(() =>
+  loadGatewayPage().then((module) => ({ default: module.Gateway })),
+);
+const Collaboration = lazy(() =>
+  loadCollaborationPage().then((module) => ({ default: module.Collaboration })),
+);
+const Settings = lazy(() =>
+  loadSettingsPage().then((module) => ({ default: module.Settings })),
+);
+
+type Page = "dashboard" | "profiles" | "gateway" | "collaboration" | "settings";
 type Confirmation = {
   title: string;
   detail: string;
   confirmLabel: string;
   successMessage?: string;
   action: () => Promise<void>;
+  refresh?: () => Promise<void>;
 } | null;
 
 const idleTaskStatus: ManagedTaskStatus = {
@@ -46,16 +73,32 @@ const idleTaskStatus: ManagedTaskStatus = {
 };
 const PROFILE_ACTIVATION_TIMEOUT_MS = 20_000;
 const defaultWorkspaceSettings: DesktopWorkspaceSettings = { mode: "per_profile" };
+const COMPACT_SIDEBAR_QUERY = "(max-width: 1179px)";
+const SIDEBAR_STORAGE_KEY = "codex-relay.sidebar.v1";
 
-gsap.registerPlugin(useGSAP);
+function readSidebarCollapsed() {
+  try {
+    return window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === "collapsed";
+  } catch {
+    return false;
+  }
+}
 
 function App() {
-  const root = useRef<HTMLElement>(null);
+  const contentScroll = useRef<HTMLDivElement>(null);
+  const sidebarToggle = useRef<HTMLButtonElement>(null);
   const quotaRefreshInFlight = useRef(false);
-  const initialQuotaRefreshStarted = useRef(false);
-  const hasAuthorizedOAuthProfiles = useRef(false);
+  const hasRefreshableCodexProfiles = useRef(false);
+  const previousTaskPhase = useRef<ManagedTaskStatus["phase"]>(idleTaskStatus.phase);
   const [page, setPage] = useState<Page>("dashboard");
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
+  const [collaborationBots, setCollaborationBots] = useState<MaskedCollaborationBot[]>(
+    [],
+  );
+  const [collaborationBindings, setCollaborationBindings] = useState<
+    CollaborationProjectBinding[]
+  >([]);
+  const [codexSessions, setCodexSessions] = useState<CodexSessionSummary[]>([]);
   const [taskStatus, setTaskStatus] = useState<ManagedTaskStatus>(idleTaskStatus);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -69,63 +112,116 @@ function App() {
   const [workspaceHistory, setWorkspaceHistory] = useState<
     DesktopWorkspaceHistoryItem[]
   >([]);
+  const [topbarScrolled, setTopbarScrolled] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
+  const [compactSidebar, setCompactSidebar] = useState(
+    () => window.matchMedia(COMPACT_SIDEBAR_QUERY).matches,
+  );
+  const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
+  const { preference: themePreference, setPreference: setThemePreference } = useTheme();
 
   const busy = actionBusy || profileActivation?.status === "switching";
   const refresh = useCallback(async () => {
     try {
-      const [
-        nextSnapshot,
-        nextTaskStatus,
-        nextWorkspaceSettings,
-        nextWorkspaceHistory,
-      ] = await Promise.all([
+      const [nextSnapshot, nextTaskStatus] = await Promise.all([
         api.dashboard(),
         api.managedTaskStatus(),
-        api.desktopWorkspaceSettings().catch(() => defaultWorkspaceSettings),
-        api.listDesktopWorkspaces().catch(() => []),
       ]);
       setSnapshot(nextSnapshot);
       setTaskStatus(nextTaskStatus);
-      setWorkspaceSettings(nextWorkspaceSettings);
-      setWorkspaceHistory(nextWorkspaceHistory);
+      setWorkspaceSettings({ mode: nextSnapshot.workspace_mode });
       setError(null);
     } catch (reason) {
       setError(errorMessage(reason));
     }
   }, []);
-  hasAuthorizedOAuthProfiles.current =
+  const refreshCollaboration = useCallback(async () => {
+    try {
+      const [bots, bindings, sessions] = await Promise.all([
+        api.listCollaborationBots(),
+        api.listCollaborationProjectBindings(),
+        api.listCodexSessions(),
+      ]);
+      setCollaborationBots(bots);
+      setCollaborationBindings(bindings);
+      setCodexSessions(sessions);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }, []);
+  const refreshWorkspaceHistory = useCallback(async () => {
+    try {
+      setWorkspaceHistory(await api.listDesktopWorkspaces());
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }, []);
+  hasRefreshableCodexProfiles.current =
     snapshot?.profiles.some(
       (profile) => profile.kind === "codex_oauth" && profile.credential_configured,
     ) ?? false;
-  const refreshQuotaSummaries = useCallback(async () => {
-    if (quotaRefreshInFlight.current || !hasAuthorizedOAuthProfiles.current) return;
-    quotaRefreshInFlight.current = true;
-    try {
-      await api.refreshProfileQuotas();
-      await refresh();
-    } catch {
-      // Per-profile cached states carry refresh failures; do not replace the whole app with an error.
-    } finally {
-      quotaRefreshInFlight.current = false;
-    }
-  }, [refresh]);
+  const refreshQuotaSummaries = useCallback(
+    async (force = false) => {
+      if (
+        quotaRefreshInFlight.current ||
+        !hasRefreshableCodexProfiles.current ||
+        (!force && (page !== "profiles" || document.visibilityState !== "visible")) ||
+        navigator.onLine === false
+      )
+        return;
+      quotaRefreshInFlight.current = true;
+      try {
+        await api.refreshProfileQuotas();
+        await refresh();
+      } catch {
+        // Per-profile cached states carry refresh failures; do not replace the whole app with an error.
+      } finally {
+        quotaRefreshInFlight.current = false;
+      }
+    },
+    [page, refresh],
+  );
   useEffect(() => {
     void refresh();
   }, [refresh]);
   useEffect(() => {
-    if (!snapshot || initialQuotaRefreshStarted.current) return;
-    initialQuotaRefreshStarted.current = true;
-    void refreshQuotaSummaries();
-  }, [snapshot, refreshQuotaSummaries]);
+    const media = window.matchMedia(COMPACT_SIDEBAR_QUERY);
+    const update = (event: MediaQueryListEvent | MediaQueryList) => {
+      setCompactSidebar(event.matches);
+      if (!event.matches) setSidebarDrawerOpen(false);
+    };
+    update(media);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   useEffect(() => {
+    if (!sidebarDrawerOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setSidebarDrawerOpen(false);
+      sidebarToggle.current?.focus();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [sidebarDrawerOpen]);
+  useEffect(() => {
+    if (page === "collaboration") void refreshCollaboration();
+    if (page === "settings") void refreshWorkspaceHistory();
+  }, [page, refreshCollaboration, refreshWorkspaceHistory]);
+  useEffect(() => {
+    if (page === "profiles") void refreshQuotaSummaries();
+  }, [page, refreshQuotaSummaries]);
+  useEffect(() => {
+    const refreshOnFocus = () => void refreshQuotaSummaries();
     const refreshWhenVisible = () => {
       if (document.visibilityState === "visible") void refreshQuotaSummaries();
     };
-    window.addEventListener("focus", refreshQuotaSummaries);
+    window.addEventListener("focus", refreshOnFocus);
     document.addEventListener("visibilitychange", refreshWhenVisible);
-    const timer = window.setInterval(() => void refreshQuotaSummaries(), 60_000);
+    const timer = window.setInterval(() => void refreshQuotaSummaries(), 30_000);
     return () => {
-      window.removeEventListener("focus", refreshQuotaSummaries);
+      window.removeEventListener("focus", refreshOnFocus);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
       window.clearInterval(timer);
     };
@@ -141,45 +237,47 @@ function App() {
     return () => window.clearInterval(timer);
   }, [taskStatus.phase]);
   useEffect(() => {
+    const previousPhase = previousTaskPhase.current;
+    previousTaskPhase.current = taskStatus.phase;
+    if (previousPhase === "running" && taskStatus.phase !== "running") {
+      void refreshQuotaSummaries(true);
+    }
+  }, [refreshQuotaSummaries, taskStatus.phase]);
+  useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(null), 4000);
     return () => window.clearTimeout(timer);
   }, [notice]);
-  useGSAP(
-    () => {
-      const motion = gsap.matchMedia();
-      motion.add({ reduce: "(prefers-reduced-motion: reduce)" }, (context) => {
-        if (context.conditions?.reduce) return undefined;
-        const timeline = gsap.timeline({ defaults: { ease: "power3.out" } });
-        timeline
-          .from("[data-animate='heading']", { autoAlpha: 0, y: 14, duration: 0.34 })
-          .from(
-            "[data-animate='hero'], [data-animate='toolbar'], [data-animate='gateway'], [data-animate='notice']",
-            { autoAlpha: 0, y: 14, duration: 0.32 },
-            "-=0.14",
-          )
-          .from(
-            "[data-animate='metrics'] > *, [data-animate='cards'] > *, [data-animate='lower'] > *",
-            { autoAlpha: 0, y: 12, duration: 0.28, stagger: 0.055 },
-            "-=0.1",
-          );
-        return () => timeline.kill();
-      });
-      return () => motion.revert();
-    },
-    { scope: root, dependencies: [page, snapshot], revertOnUpdate: true },
-  );
-
-  const execute = async (action: () => Promise<unknown>, message?: string) => {
+  const execute = async (
+    action: () => Promise<unknown>,
+    message?: string,
+    refreshAction: () => Promise<void> = refresh,
+  ) => {
     setActionBusy(true);
     try {
       await action();
-      await refresh();
+      await refreshAction();
       if (message) setNotice(message);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setActionBusy(false);
+    }
+  };
+  const syncProfileAccount = async (id: string) => {
+    try {
+      const profile = await api.syncProfileAccountInfo(id);
+      await refresh();
+      const quota = profile.account?.quota;
+      setNotice(
+        quota?.status === "available"
+          ? "账号资料与额度已刷新。"
+          : quota?.message || "账号资料已刷新，但上游暂未返回额度。",
+      );
+      return profile;
+    } catch (reason) {
+      setError(errorMessage(reason));
+      throw reason;
     }
   };
   const selectProfileDirect = async (id: string, confirmedDesktopRestart = false) => {
@@ -274,34 +372,99 @@ function App() {
         setNotice(status.message);
       },
     });
-  const requestDelete = (title: string, detail: string, action: () => Promise<void>) =>
+  const requestDelete = (
+    title: string,
+    detail: string,
+    action: () => Promise<void>,
+    refreshAction?: () => Promise<void>,
+  ) =>
     setConfirmation({
       title,
       detail,
       confirmLabel: "确认删除",
       successMessage: "操作已完成。",
       action,
+      refresh: refreshAction,
     });
+  const navigate = useCallback(
+    (nextPage: Page) => {
+      const updatePage = () => {
+        flushSync(() => setPage(nextPage));
+        setTopbarScrolled(false);
+        const scrollContainer = contentScroll.current;
+        if (typeof scrollContainer?.scrollTo === "function") {
+          scrollContainer.scrollTo({ top: 0 });
+        } else if (scrollContainer) {
+          scrollContainer.scrollTop = 0;
+        }
+      };
+      const reduceMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+      ).matches;
+      if (!reduceMotion && typeof document.startViewTransition === "function") {
+        document.startViewTransition(updatePage);
+      } else {
+        updatePage();
+      }
+      if (compactSidebar) setSidebarDrawerOpen(false);
+    },
+    [compactSidebar],
+  );
+  const refreshCurrentPage = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await refresh();
+      if (page === "collaboration") await refreshCollaboration();
+      if (page === "settings") await refreshWorkspaceHistory();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [page, refresh, refreshCollaboration, refreshWorkspaceHistory]);
+  const sidebarExpanded = compactSidebar ? sidebarDrawerOpen : !sidebarCollapsed;
+  const toggleSidebar = () => {
+    if (compactSidebar) {
+      setSidebarDrawerOpen((open) => !open);
+      return;
+    }
+    setSidebarCollapsed((collapsed) => {
+      const next = !collapsed;
+      try {
+        window.localStorage.setItem(
+          SIDEBAR_STORAGE_KEY,
+          next ? "collapsed" : "expanded",
+        );
+      } catch {
+        // The current window can still use the selected layout.
+      }
+      return next;
+    });
+  };
   const content = snapshot ? (
     <PageContent
       page={page}
       snapshot={snapshot}
       taskStatus={taskStatus}
       busy={busy}
-      navigate={setPage}
+      navigate={navigate}
       execute={execute}
       selectProfile={selectProfile}
+      syncProfileAccount={syncProfileAccount}
       startManagedTask={startManagedTask}
       requestCancelManagedTask={requestCancelManagedTask}
       requestDelete={requestDelete}
       notify={setNotice}
       workspaceSettings={workspaceSettings}
       workspaceHistory={workspaceHistory}
+      themePreference={themePreference}
+      collaborationBots={collaborationBots}
+      collaborationBindings={collaborationBindings}
+      codexSessions={codexSessions}
       onChangeWorkspaceMode={async (mode) => {
         await execute(
           () => api.updateDesktopWorkspaceSettings(mode),
           "客户端工作区模式已保存。",
         );
+        await refreshWorkspaceHistory();
       }}
       onRestoreWorkspace={async (id) => {
         const activation = await api.restoreDesktopWorkspace(id);
@@ -310,17 +473,41 @@ function App() {
           return;
         }
         await refresh();
+        await refreshWorkspaceHistory();
         setNotice(activation.message);
       }}
+      onThemePreferenceChange={setThemePreference}
+      onRefresh={refreshCurrentPage}
+      onJsonImportComplete={refresh}
     />
   ) : (
     <LoadingState error={error} retry={refresh} />
   );
 
   return (
-    <main ref={root} className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
+    <main
+      className={`app-shell ${sidebarCollapsed ? "is-sidebar-collapsed" : ""} ${sidebarDrawerOpen ? "is-sidebar-drawer-open" : ""}`}
+      data-page={page}
+    >
+      <button
+        aria-hidden={!sidebarDrawerOpen}
+        aria-label="关闭侧边栏"
+        className="sidebar-scrim"
+        onClick={() => {
+          setSidebarDrawerOpen(false);
+          sidebarToggle.current?.focus();
+        }}
+        tabIndex={sidebarDrawerOpen ? 0 : -1}
+        type="button"
+      />
+      <aside
+        aria-label="应用侧边栏"
+        className="sidebar"
+        data-expanded={sidebarExpanded}
+        data-tauri-drag-region
+        id="app-sidebar"
+      >
+        <div className="brand" data-tauri-drag-region>
           <img src={logo} alt="" />
           <span>Codex Relay</span>
         </div>
@@ -329,101 +516,124 @@ function App() {
             active={page === "dashboard"}
             icon={<ChartPieSlice size={20} />}
             label="总览"
-            onClick={() => setPage("dashboard")}
+            onClick={() => navigate("dashboard")}
           />
           <NavItem
             active={page === "profiles"}
             icon={<UsersThree size={20} />}
             label="档案"
-            onClick={() => setPage("profiles")}
+            onClick={() => navigate("profiles")}
+            prefetch={loadProfilesPage}
           />
           <NavItem
             active={page === "gateway"}
             icon={<Lightning size={20} />}
             label="网关"
-            onClick={() => setPage("gateway")}
+            onClick={() => navigate("gateway")}
+            prefetch={loadGatewayPage}
           />
           <NavItem
-            active={page === "notifications"}
-            icon={<Bell size={20} />}
-            label="通知"
-            onClick={() => setPage("notifications")}
+            active={page === "collaboration"}
+            icon={<ChatCircleDots size={20} />}
+            label="协作"
+            onClick={() => navigate("collaboration")}
+            prefetch={loadCollaborationPage}
           />
         </nav>
         <div className="sidebar-bottom">
           <span className="desktop-status">
             <i /> 本机优先
           </span>
-          <button
-            className={`nav-item ${page === "settings" ? "active" : ""}`}
-            type="button"
-            onClick={() => setPage("settings")}
-          >
-            <GearSix size={20} /> 设置
-          </button>
+          <NavItem
+            active={page === "settings"}
+            icon={<GearSix size={20} />}
+            label="设置"
+            onClick={() => navigate("settings")}
+            prefetch={loadSettingsPage}
+          />
         </div>
       </aside>
       <section className="app-main">
-        <header className="topbar">
+        <header className={`topbar ${topbarScrolled ? "is-scrolled" : ""}`}>
+          <div
+            aria-hidden="true"
+            className="topbar-drag-region"
+            data-tauri-drag-region
+          />
           <div className="crumb">
-            <List size={19} />
-            <span>
-              {page === "dashboard"
-                ? "总览"
-                : page === "profiles"
-                  ? "档案"
-                  : page === "gateway"
-                    ? "网关"
-                    : page === "notifications"
-                      ? "通知"
-                      : "设置"}
-            </span>
+            <button
+              aria-controls="app-sidebar"
+              aria-expanded={sidebarExpanded}
+              aria-label={sidebarExpanded ? "收起侧边栏" : "展开侧边栏"}
+              className="sidebar-toggle"
+              onClick={toggleSidebar}
+              ref={sidebarToggle}
+              title={sidebarExpanded ? "收起侧边栏" : "展开侧边栏"}
+              type="button"
+            >
+              <List size={19} />
+            </button>
+            <span>{pageLabel(page)}</span>
           </div>
           <div className="topbar-status">
             {snapshot && (
               <>
-                <span
-                  className={`status-pill compact ${snapshot.gateway.running ? "success" : "neutral"}`}
+                <StatusPill
+                  compact
+                  tone={snapshot.gateway.running ? "running" : "disabled"}
                 >
-                  <i /> {snapshot.gateway.running ? "服务运行中" : "服务未启动"}
-                </span>
-                <button
-                  className="refresh-button"
-                  type="button"
-                  onClick={() => void refresh()}
+                  {snapshot.gateway.running ? "服务运行中" : "服务未启动"}
+                </StatusPill>
+                <Button
                   aria-label="刷新状态"
+                  className={`topbar-refresh ${refreshing ? "is-refreshing" : ""}`}
+                  disabled={refreshing}
+                  onClick={() => void refreshCurrentPage()}
+                  size="sm"
+                  title="刷新状态"
+                  variant="icon"
                 >
-                  刷新
-                </button>
+                  <ArrowsClockwise size={17} />
+                </Button>
               </>
             )}
           </div>
         </header>
-        {error && (
-          <div className="error-banner" role="alert">
-            <ShieldWarning size={20} weight="fill" />
-            <div>
-              <strong>无法读取本机状态</strong>
-              <p>{error}</p>
+        <div
+          className="content-scroll"
+          onScroll={(event) => setTopbarScrolled(event.currentTarget.scrollTop > 6)}
+          ref={contentScroll}
+        >
+          {error && (
+            <div className="error-banner" role="alert">
+              <ShieldWarning size={20} weight="fill" />
+              <div>
+                <strong>无法读取本机状态</strong>
+                <p>{error}</p>
+              </div>
+              <button
+                className="text-button"
+                type="button"
+                onClick={() => {
+                  setError(null);
+                  void refresh();
+                }}
+              >
+                重试
+              </button>
             </div>
-            <button
-              className="text-button"
-              type="button"
-              onClick={() => {
-                setError(null);
-                void refresh();
-              }}
-            >
-              重试
-            </button>
-          </div>
-        )}
+          )}
+          <Suspense fallback={<PageSkeleton />}>
+            <div className="page-stage" key={page}>
+              {content}
+            </div>
+          </Suspense>
+        </div>
         {notice && (
           <div className="toast" role="status">
             {notice}
           </div>
         )}
-        <div className="content-scroll">{content}</div>
       </section>
       {confirmation && (
         <ConfirmDialog
@@ -448,30 +658,55 @@ function PageContent({
   navigate,
   execute,
   selectProfile,
+  syncProfileAccount,
   startManagedTask,
   requestCancelManagedTask,
   requestDelete,
   notify,
   workspaceSettings,
   workspaceHistory,
+  themePreference,
+  collaborationBots,
+  collaborationBindings,
+  codexSessions,
   onChangeWorkspaceMode,
   onRestoreWorkspace,
+  onThemePreferenceChange,
+  onRefresh,
+  onJsonImportComplete,
 }: {
   page: Page;
   snapshot: DashboardSnapshot;
   taskStatus: ManagedTaskStatus;
   busy: boolean;
   navigate: (page: Page) => void;
-  execute: (action: () => Promise<unknown>, message?: string) => Promise<void>;
+  execute: (
+    action: () => Promise<unknown>,
+    message?: string,
+    refreshAction?: () => Promise<void>,
+  ) => Promise<void>;
   selectProfile: (id: string) => Promise<void>;
+  syncProfileAccount: (id: string) => Promise<MaskedProfile>;
   startManagedTask: (input: StartManagedTaskInput) => Promise<void>;
   requestCancelManagedTask: () => void;
-  requestDelete: (title: string, detail: string, action: () => Promise<void>) => void;
+  requestDelete: (
+    title: string,
+    detail: string,
+    action: () => Promise<void>,
+    refreshAction?: () => Promise<void>,
+  ) => void;
   notify: (message: string) => void;
   workspaceSettings: DesktopWorkspaceSettings;
   workspaceHistory: DesktopWorkspaceHistoryItem[];
+  themePreference: ThemePreference;
+  collaborationBots: MaskedCollaborationBot[];
+  collaborationBindings: CollaborationProjectBinding[];
+  codexSessions: CodexSessionSummary[];
   onChangeWorkspaceMode: (mode: DesktopWorkspaceMode) => Promise<void>;
   onRestoreWorkspace: (id: string) => Promise<void>;
+  onThemePreferenceChange: (preference: ThemePreference) => void;
+  onRefresh: () => Promise<void>;
+  onJsonImportComplete: () => Promise<void>;
 }) {
   if (page === "dashboard")
     return (
@@ -482,7 +717,6 @@ function PageContent({
         onNavigate={navigate}
         onStartTask={startManagedTask}
         onRequestCancelTask={requestCancelManagedTask}
-        workspaceMode={workspaceSettings.mode}
       />
     );
   if (page === "profiles")
@@ -500,9 +734,59 @@ function PageContent({
             alias ? "档案已创建，OAuth 凭据已保存。" : "档案凭据已更新。",
           )
         }
-        onSyncAccount={async (id) => {
-          await execute(() => api.syncProfileAccountInfo(id), "账号资料已同步。");
-        }}
+        onSyncAccount={syncProfileAccount}
+        onRefreshModels={(id) =>
+          execute(() => api.refreshProfileModels(id), "可用模型已从上游刷新。")
+        }
+        onCreateApiProfile={(input) =>
+          execute(async () => {
+            const profile = await api.createProfile(input);
+            await api.refreshProfileModels(profile.id);
+          }, "上游已保存，模型目录已刷新。")
+        }
+        onTogglePool={(profile) =>
+          execute(
+            async () => {
+              const models =
+                !profile.in_pool && !profile.models.length
+                  ? (await api.refreshProfileModels(profile.id)).models
+                  : profile.models;
+              await api.updateProfile({
+                id: profile.id,
+                alias: profile.alias,
+                enabled: profile.enabled,
+                in_pool: !profile.in_pool,
+                priority: profile.priority,
+                weight: profile.weight,
+                models,
+                api_key: null,
+              });
+            },
+            profile.in_pool ? "已移出网关账号池。" : "已加入网关账号池。",
+          )
+        }
+        onConfigurePool={(profile, priority, weight, models) =>
+          execute(
+            () =>
+              api.updateProfile({
+                id: profile.id,
+                alias: profile.alias,
+                enabled: profile.enabled,
+                in_pool: profile.in_pool,
+                priority,
+                weight,
+                models,
+                api_key: null,
+              }),
+            "账号池优先级、权重与模型范围已更新。",
+          )
+        }
+        onActivateApiProfile={(profile) =>
+          execute(
+            () => api.activateApiServiceProfile(profile.id),
+            "Codex 已切换到 API 服务档案。请启动新会话后使用。",
+          )
+        }
         onDelete={(id, alias) =>
           requestDelete(
             `删除“${alias}”？`,
@@ -510,6 +794,7 @@ function PageContent({
             () => api.deleteProfile(id),
           )
         }
+        onJsonImportComplete={onJsonImportComplete}
         workspaceMode={workspaceSettings.mode}
       />
     );
@@ -524,6 +809,73 @@ function PageContent({
         onStart={async () => execute(api.startGateway, "网关已启动并使用 HTTPS 保护。")}
         onStop={async () => execute(api.stopGateway, "网关已停止。")}
         onNotice={notify}
+        onNavigateProfiles={() => navigate("profiles")}
+        onRefresh={onRefresh}
+      />
+    );
+  if (page === "collaboration")
+    return (
+      <Collaboration
+        bots={collaborationBots}
+        bindings={collaborationBindings}
+        sessions={codexSessions}
+        profiles={snapshot.profiles}
+        busy={busy}
+        onSaveBot={async (input) =>
+          execute(
+            () => api.upsertCollaborationBot(input),
+            "协作机器人已保存。",
+            onRefresh,
+          )
+        }
+        onTestBot={async (id) =>
+          execute(
+            () => api.testCollaborationBot(id),
+            "协作机器人配置已验证。",
+            onRefresh,
+          )
+        }
+        onDeleteBot={(id, name) =>
+          requestDelete(
+            `删除协作机器人“${name}”？`,
+            "App Secret 引用、项目绑定和会话记录会从本机删除。",
+            () => api.deleteCollaborationBot(id),
+            onRefresh,
+          )
+        }
+        onSaveBinding={async (input) =>
+          execute(
+            () => api.upsertCollaborationProjectBinding(input),
+            "项目绑定已创建。",
+            onRefresh,
+          )
+        }
+        onRegisterDiscordCommands={async (id) =>
+          execute(
+            () => api.registerDiscordCommands(id),
+            "Discord slash command 已注册。",
+            onRefresh,
+          )
+        }
+        onLoadCallbackStatus={api.collaborationCallbackStatus}
+        onDeleteBinding={(id, name) =>
+          requestDelete(
+            `删除项目绑定“${name}”？`,
+            "该项目的群绑定和会话记录会从本机删除。",
+            () => api.deleteCollaborationProjectBinding(id),
+            onRefresh,
+          )
+        }
+        onCancelSession={async (id) =>
+          execute(() => api.cancelCodexSession(id), "Codex 会话已取消。", onRefresh)
+        }
+        onContinueSession={async (id, instruction) =>
+          execute(
+            () => api.continueCodexSession(id, instruction),
+            "Codex 会话已继续。",
+            onRefresh,
+          )
+        }
       />
     );
   if (page === "settings")
@@ -532,34 +884,21 @@ function PageContent({
         settings={workspaceSettings}
         workspaces={workspaceHistory}
         busy={busy}
+        themePreference={themePreference}
         onChangeMode={onChangeWorkspaceMode}
+        onThemePreferenceChange={onThemePreferenceChange}
         onRestore={onRestoreWorkspace}
         onDelete={(id, alias) =>
           requestDelete(
             `删除“${alias}”的全新工作区？`,
             "该工作区的本地客户端数据会被永久删除，无法恢复。",
             () => api.deleteDesktopWorkspace(id),
+            onRefresh,
           )
         }
       />
     );
-  return (
-    <Notifications
-      channels={snapshot.notifications}
-      busy={busy}
-      onSave={async (input) =>
-        execute(() => api.upsertChannel(input), "通知频道已安全保存。")
-      }
-      onTest={async (id) => execute(() => api.testChannel(id), "测试投递已完成。")}
-      onDelete={(id, name) =>
-        requestDelete(
-          `删除“${name}”？`,
-          "频道 URL 与签名密钥会从系统安全存储中删除。",
-          () => api.deleteChannel(id),
-        )
-      }
-    />
-  );
+  return null;
 }
 
 function NavItem({
@@ -567,23 +906,56 @@ function NavItem({
   icon,
   label,
   onClick,
+  prefetch,
 }: {
   active: boolean;
   icon: ReactNode;
   label: string;
   onClick: () => void;
+  prefetch?: () => Promise<unknown>;
 }) {
   return (
     <button
+      aria-current={active ? "page" : undefined}
       className={`nav-item ${active ? "active" : ""}`}
       type="button"
       onClick={onClick}
+      onFocus={() => void prefetch?.()}
+      onMouseEnter={() => void prefetch?.()}
+      title={label}
     >
-      {icon}
+      <span className="nav-icon" aria-hidden="true">
+        {icon}
+      </span>
       <span>{label}</span>
     </button>
   );
 }
+
+function PageSkeleton() {
+  return (
+    <div className="page page-skeleton" aria-label="正在加载页面" role="status">
+      <div className="skeleton skeleton-heading" />
+      <div className="skeleton skeleton-subtitle" />
+      <div className="skeleton-grid">
+        <div className="skeleton skeleton-card" />
+        <div className="skeleton skeleton-card" />
+        <div className="skeleton skeleton-card" />
+      </div>
+    </div>
+  );
+}
+
+function pageLabel(page: Page) {
+  return {
+    dashboard: "总览",
+    profiles: "档案",
+    gateway: "网关",
+    collaboration: "协作",
+    settings: "设置",
+  }[page];
+}
+
 function LoadingState({
   error,
   retry,
@@ -615,37 +987,40 @@ function ConfirmDialog({
   confirmation: Exclude<Confirmation, null>;
   busy: boolean;
   close: () => void;
-  execute: (action: () => Promise<unknown>, message?: string) => Promise<void>;
+  execute: (
+    action: () => Promise<unknown>,
+    message?: string,
+    refreshAction?: () => Promise<void>,
+  ) => Promise<void>;
 }) {
   return (
-    <div className="dialog-backdrop" role="presentation">
-      <section
-        className="confirm-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="confirm-title"
-      >
-        <p className="section-kicker">Confirmation required</p>
-        <h2 id="confirm-title">{confirmation.title}</h2>
-        <p>{confirmation.detail}</p>
-        <div>
-          <button className="quiet-button" type="button" onClick={close}>
+    <Dialog
+      description={confirmation.detail}
+      footer={
+        <>
+          <Button onClick={close} variant="quiet">
             取消
-          </button>
-          <button
-            className="danger-button"
+          </Button>
+          <Button
             disabled={busy}
-            type="button"
             onClick={() => {
-              void execute(confirmation.action, confirmation.successMessage);
+              void execute(
+                confirmation.action,
+                confirmation.successMessage,
+                confirmation.refresh,
+              );
               close();
             }}
+            variant="danger"
           >
             {confirmation.confirmLabel}
-          </button>
-        </div>
-      </section>
-    </div>
+          </Button>
+        </>
+      }
+      onClose={busy ? undefined : close}
+      open
+      title={confirmation.title}
+    />
   );
 }
 
@@ -655,19 +1030,9 @@ function ProfileActivationDialog({
   activation: CurrentProfileActivation;
 }) {
   return (
-    <div className="dialog-backdrop" role="presentation">
-      <section
-        className="confirm-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="profile-activation-title"
-      >
-        <p className="section-kicker">Switching account</p>
-        <h2 id="profile-activation-title">正在切换已保存的账号</h2>
-        <p>{activation.message}</p>
-        <p>无需重新 OAuth。ChatGPT Chat/Work 的独立登录会话不会被读取、写入或切换。</p>
-      </section>
-    </div>
+    <Dialog description={activation.message} open title="正在切换已保存的账号">
+      <p>无需重新 OAuth。ChatGPT Chat/Work 的独立登录会话不会被读取、写入或切换。</p>
+    </Dialog>
   );
 }
 

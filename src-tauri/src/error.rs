@@ -9,6 +9,7 @@ pub enum AppError {
     SecretStoreUnavailable,
     #[error("系统钥匙串需要用户授权")]
     KeychainInteractionRequired,
+    #[allow(dead_code)]
     #[error("已保存的账号凭据无法被当前版本读取；请重新授权该账号")]
     ProfileCredentialMigrationRequired,
     #[error("未找到请求的资源")]

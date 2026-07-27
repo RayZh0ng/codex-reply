@@ -8,6 +8,7 @@ describe("Settings", () => {
     const changeMode = vi.fn().mockResolvedValue(undefined);
     const restore = vi.fn().mockResolvedValue(undefined);
     const remove = vi.fn();
+    const changeTheme = vi.fn();
     render(
       <Settings
         settings={{ mode: "per_profile" }}
@@ -21,7 +22,9 @@ describe("Settings", () => {
           },
         ]}
         busy={false}
+        themePreference="system"
         onChangeMode={changeMode}
+        onThemePreferenceChange={changeTheme}
         onRestore={restore}
         onDelete={remove}
       />,
@@ -29,6 +32,8 @@ describe("Settings", () => {
 
     fireEvent.click(screen.getByRole("radio", { name: /共享原客户端状态/ }));
     expect(changeMode).toHaveBeenCalledWith("shared");
+    fireEvent.click(screen.getByRole("radio", { name: "深色" }));
+    expect(changeTheme).toHaveBeenCalledWith("dark");
     fireEvent.click(screen.getByRole("button", { name: "恢复" }));
     expect(restore).toHaveBeenCalledWith("workspace-1");
     fireEvent.click(screen.getByRole("button", { name: "删除 个人账号 的工作区" }));

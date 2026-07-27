@@ -1,13 +1,76 @@
+@import "./components.css";
+
 :root {
-  color: #182235;
-  background: #f5f7fb;
-  font-family:
-    "SF Pro Display",
-    "SF Pro Text",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
+  color-scheme: light dark;
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Inter, system-ui,
     sans-serif;
+  --font-display:
+    -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Inter, system-ui,
+    sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-xl: 24px;
+  --radius-full: 999px;
+
+  --color-background: #f4f6f9;
+  --color-surface: #fff;
+  --color-surface-translucent: rgb(255 255 255 / 78%);
+  --color-surface-elevated: #fff;
+  --color-surface-soft: #f7f9fc;
+  --color-sidebar: rgb(246 248 251 / 88%);
+  --color-topbar: rgb(244 246 249 / 88%);
+  --color-input: rgb(255 255 255 / 88%);
+  --color-input-hover: #fff;
+  --color-popover: rgb(255 255 255 / 96%);
+  --color-overlay: rgb(20 28 42 / 30%);
+  --color-border: rgb(15 23 42 / 9%);
+  --color-border-strong: rgb(15 23 42 / 14%);
+  --color-text-primary: #172033;
+  --color-text-secondary: #5f6b7a;
+  --color-text-muted: #8b95a5;
+  --color-accent: #007aff;
+  --color-accent-hover: #0067d8;
+  --color-accent-soft: rgb(0 122 255 / 10%);
+  --color-success: #21875b;
+  --color-success-soft: #eaf7f0;
+  --color-warning: #ad6500;
+  --color-warning-soft: #fff5e4;
+  --color-danger: #c63f46;
+  --color-danger-soft: #fff0f1;
+  --color-focus-ring: rgb(0 122 255 / 16%);
+  --color-scrollbar: rgb(95 107 122 / 28%);
+  --color-scrollbar-hover: rgb(95 107 122 / 44%);
+
+  --shadow-subtle: 0 1px 2px rgb(15 23 42 / 4%);
+  --shadow-card: 0 10px 30px rgb(24 39 63 / 6%);
+  --shadow-floating: 0 18px 48px rgb(24 39 63 / 12%);
+  --shadow-popover: 0 24px 70px rgb(18 33 54 / 22%);
+
+  --motion-fast: 120ms;
+  --motion-normal: 200ms;
+  --motion-slow: 320ms;
+  --ease-standard: cubic-bezier(0.2, 0.72, 0.2, 1);
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.22, 1.08);
+
+  --sidebar-width: 248px;
+  --topbar-height: 64px;
+  --window-safe-top: 0px;
+  color: var(--color-text-primary);
+  background: var(--color-background);
+  font-family: var(--font-sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -15,29 +78,128 @@
   -webkit-text-size-adjust: 100%;
 }
 
+:root[data-theme="dark"] {
+  --color-background: #0e1117;
+  --color-surface: #161b23;
+  --color-surface-translucent: rgb(23 28 37 / 88%);
+  --color-surface-elevated: #1b212b;
+  --color-surface-soft: #121720;
+  --color-sidebar: rgb(18 22 29 / 90%);
+  --color-topbar: rgb(14 17 23 / 88%);
+  --color-input: rgb(26 32 42 / 92%);
+  --color-input-hover: #202733;
+  --color-popover: rgb(27 33 43 / 97%);
+  --color-overlay: rgb(0 0 0 / 52%);
+  --color-border: rgb(255 255 255 / 8%);
+  --color-border-strong: rgb(255 255 255 / 14%);
+  --color-text-primary: #f4f7fb;
+  --color-text-secondary: #a9b3c2;
+  --color-text-muted: #737f91;
+  --color-accent: #0a84ff;
+  --color-accent-hover: #3399ff;
+  --color-accent-soft: rgb(10 132 255 / 15%);
+  --color-success: #32d583;
+  --color-success-soft: rgb(50 213 131 / 13%);
+  --color-warning: #ffad33;
+  --color-warning-soft: rgb(255 173 51 / 13%);
+  --color-danger: #ff6961;
+  --color-danger-soft: rgb(255 105 97 / 13%);
+  --color-focus-ring: rgb(10 132 255 / 22%);
+  --color-scrollbar: rgb(169 179 194 / 25%);
+  --color-scrollbar-hover: rgb(169 179 194 / 42%);
+  --shadow-subtle: 0 1px 2px rgb(0 0 0 / 18%);
+  --shadow-card: 0 12px 34px rgb(0 0 0 / 18%);
+  --shadow-floating: 0 20px 50px rgb(0 0 0 / 28%);
+  --shadow-popover: 0 28px 80px rgb(0 0 0 / 48%);
+}
+
+:root[data-platform="macos"] {
+  --window-safe-top: max(28px, env(safe-area-inset-top, 0px));
+}
+
 * {
   box-sizing: border-box;
 }
-body {
+
+html,
+body,
+#root {
+  width: 100%;
   min-width: 20rem;
-  min-height: 100vh;
+  min-height: 100%;
   margin: 0;
+  overflow: hidden;
 }
+
+body {
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--color-background);
+}
+
 button,
 input,
-select {
+select,
+textarea {
+  color: inherit;
   font: inherit;
 }
+
 button {
   cursor: pointer;
 }
-button:disabled {
+
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled {
   cursor: not-allowed;
-  opacity: 0.5;
+  opacity: 0.52;
 }
-button:focus-visible,
-input:focus-visible,
-select:focus-visible {
-  outline: 3px solid rgb(32 124 232 / 28%);
+
+:where(button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 58%, transparent);
   outline-offset: 2px;
+}
+
+::selection {
+  background: rgb(0 122 255 / 20%);
+}
+
+* {
+  scrollbar-color: var(--color-scrollbar) transparent;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: var(--radius-full);
+  background: var(--color-scrollbar);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-scrollbar-hover);
+  background-clip: padding-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

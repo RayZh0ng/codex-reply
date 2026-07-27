@@ -1,10 +1,16 @@
-import { ArrowCounterClockwise, Trash, Warning } from "@phosphor-icons/react";
+import { ArrowCounterClockwise } from "@phosphor-icons/react/ArrowCounterClockwise";
+import { Desktop } from "@phosphor-icons/react/Desktop";
+import { Moon } from "@phosphor-icons/react/Moon";
+import { Sun } from "@phosphor-icons/react/Sun";
+import { Trash } from "@phosphor-icons/react/Trash";
+import { Warning } from "@phosphor-icons/react/Warning";
 
 import {
   type DesktopWorkspaceHistoryItem,
   type DesktopWorkspaceMode,
   type DesktopWorkspaceSettings,
 } from "../../shared/ipc";
+import type { ThemePreference } from "../../shared/theme";
 
 const modes: Array<{
   mode: DesktopWorkspaceMode;
@@ -29,11 +35,23 @@ const modes: Array<{
   },
 ];
 
+const themes: Array<{
+  value: ThemePreference;
+  label: string;
+  icon: typeof Desktop;
+}> = [
+  { value: "system", label: "跟随系统", icon: Desktop },
+  { value: "light", label: "浅色", icon: Sun },
+  { value: "dark", label: "深色", icon: Moon },
+];
+
 interface SettingsProps {
   settings: DesktopWorkspaceSettings;
   workspaces: DesktopWorkspaceHistoryItem[];
   busy: boolean;
+  themePreference: ThemePreference;
   onChangeMode: (mode: DesktopWorkspaceMode) => Promise<void>;
+  onThemePreferenceChange: (preference: ThemePreference) => void;
   onRestore: (id: string) => Promise<void>;
   onDelete: (id: string, alias: string) => void;
 }
@@ -42,7 +60,9 @@ export function Settings({
   settings,
   workspaces,
   busy,
+  themePreference,
   onChangeMode,
+  onThemePreferenceChange,
   onRestore,
   onDelete,
 }: SettingsProps) {
@@ -50,13 +70,49 @@ export function Settings({
     <div className="page settings-page">
       <header className="page-heading" data-animate="heading">
         <div>
-          <p className="section-kicker">Desktop workspace</p>
           <h1>客户端工作区</h1>
-          <p className="page-subtitle">
-            选择切换 Codex 档案时如何使用 ChatGPT/Codex 桌面客户端。
-          </p>
+          <p className="page-subtitle">管理应用外观与 Codex 档案的桌面工作区。</p>
         </div>
       </header>
+      <section className="surface-card appearance-settings" data-animate="cards">
+        <div className="card-heading">
+          <div>
+            <h2>外观</h2>
+            <p>跟随系统，或为 Relay 单独选择浅色与深色主题。</p>
+          </div>
+        </div>
+        <fieldset className="theme-picker" aria-label="应用主题">
+          <legend className="sr-only">应用主题</legend>
+          {themes.map((option) => {
+            const Icon = option.icon;
+            return (
+              <label
+                className={themePreference === option.value ? "selected" : ""}
+                key={option.value}
+              >
+                <input
+                  checked={themePreference === option.value}
+                  name="application-theme"
+                  onChange={() => onThemePreferenceChange(option.value)}
+                  type="radio"
+                  value={option.value}
+                />
+                <Icon
+                  size={17}
+                  weight={themePreference === option.value ? "fill" : "regular"}
+                />
+                <span>{option.label}</span>
+              </label>
+            );
+          })}
+        </fieldset>
+      </section>
+      <div className="section-heading compact-section-heading">
+        <div>
+          <h2>工作区模式</h2>
+          <p>选择切换档案时桌面客户端使用的本机状态。</p>
+        </div>
+      </div>
       <section
         className="workspace-mode-grid"
         data-animate="cards"
@@ -80,20 +136,18 @@ export function Settings({
           </label>
         ))}
       </section>
-      <article className="privacy-banner" data-animate="notice">
-        <Warning size={23} weight="fill" />
-        <div>
-          <strong>ChatGPT 账号数据不会跨账号迁移</strong>
-          <p>
-            Relay 不读取、复制或合并 ChatGPT Chat/Work 的
-            Cookie、钥匙串、云端聊天或记忆；共享模式只复用原客户端已有的本地数据目录。
-          </p>
-        </div>
-      </article>
+      {settings.mode === "shared" && (
+        <article className="privacy-banner contextual-notice" data-animate="notice">
+          <Warning size={20} weight="fill" />
+          <div>
+            <strong>共享模式只复用原客户端的本机状态</strong>
+            <p>账号 Cookie、钥匙串、云端聊天与记忆不会在档案之间迁移。</p>
+          </div>
+        </article>
+      )}
       <section className="surface-card workspace-history">
         <div className="card-heading">
           <div>
-            <p className="section-kicker">Fresh workspace history</p>
             <h2>全新工作区历史</h2>
           </div>
         </div>
