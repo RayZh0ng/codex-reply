@@ -26,7 +26,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 base64 = "0.22"
 chrono = "0.4"
 futures-util = "0.3"
-if-addrs = "0.14"
+if-addrs = "0.15"
 ipnet = "2"
 rand = "0.8"
 rcgen = { version = "0.13", features = ["x509-parser"] }
