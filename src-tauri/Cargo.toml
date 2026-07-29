@@ -46,7 +46,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 feishu-sdk = { version = "0.1.2", features = ["websocket"] }
 tokio-tungstenite = "0.28"
 aes = "0.8"
-cbc = "0.1"
+cbc = "0.2"
 sha1 = "0.10"
 tauri-plugin-updater = "2"
 
