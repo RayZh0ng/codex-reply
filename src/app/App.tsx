@@ -40,7 +40,7 @@ import {
 import { Button, Dialog, StatusPill } from "../shared/ui";
 import { useTheme } from "../shared/theme";
 import type { ThemePreference } from "../shared/theme";
-import logo from "../../assets/codex-relay-mark.png";
+import logo from "../../src-tauri/icons/icon.png";
 
 const loadProfilesPage = () => import("../features/profiles/Profiles");
 const loadGatewayPage = () => import("../features/gateway/Gateway");
