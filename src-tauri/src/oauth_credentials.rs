@@ -283,7 +283,7 @@ mod tests {
     use super::{CredentialAccess, OAuthCredentialStore};
     use crate::{
         database::StoredProfile,
-        domain::{GatewayProvider, MaskedProfile, ProfileKind},
+        domain::{GatewayProvider, GatewayWireApi, MaskedProfile, ProfileKind},
         profiles::{CodexOAuthCredential, ImportedAuthFileCredential},
         secrets::{MemorySecretStore, SecretStore},
     };
@@ -296,11 +296,13 @@ mod tests {
                 kind: ProfileKind::CodexOauth,
                 base_url: None,
                 provider: GatewayProvider::OpenAi,
+                wire_api: GatewayWireApi::Responses,
                 enabled: true,
                 in_pool: true,
                 priority: 0,
                 weight: 1,
                 models: vec!["gpt-test".into()],
+                model_mappings: Vec::new(),
                 health: "healthy".into(),
                 cooldown_until_ms: None,
                 credential_configured: true,

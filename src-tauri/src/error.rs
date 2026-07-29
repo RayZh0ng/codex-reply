@@ -18,10 +18,14 @@ pub enum AppError {
     Conflict,
     #[error("网关尚未运行")]
     GatewayNotRunning,
+    #[error("选择的网关模型当前不可用；请刷新模型并确认账号已加入网关账号池")]
+    GatewayModelUnavailable,
     #[error("网络目标不在允许范围内")]
     ForbiddenNetworkTarget,
     #[error("上游服务当前不可用")]
     UpstreamUnavailable,
+    #[error("软件更新暂不可用")]
+    AppUpdateUnavailable,
     #[error("此操作需要明确确认")]
     ConfirmationRequired,
     #[error("本机运行时不可用")]
@@ -34,6 +38,8 @@ pub enum AppError {
     CodexKeychainUnavailable,
     #[error("请先选择一个已授权的 OAuth 档案，再启动受管 Codex 任务")]
     CurrentProfileRequired,
+    #[error("本机会话状态暂不可读")]
+    LocalStateUnavailable,
     #[error("内部状态不可用")]
     Internal,
 }
@@ -41,7 +47,7 @@ pub enum AppError {
 pub type AppResult<T> = Result<T, AppError>;
 
 impl AppError {
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::ValidationFailed => "validation_failed",
             Self::SecretStoreUnavailable => "secret_store_unavailable",
@@ -50,14 +56,17 @@ impl AppError {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::GatewayNotRunning => "gateway_not_running",
+            Self::GatewayModelUnavailable => "gateway_model_unavailable",
             Self::ForbiddenNetworkTarget => "forbidden_network_target",
             Self::UpstreamUnavailable => "upstream_unavailable",
+            Self::AppUpdateUnavailable => "app_update_unavailable",
             Self::ConfirmationRequired => "confirmation_required",
             Self::RuntimeUnavailable => "runtime_unavailable",
             Self::ProfileRuntimeUnavailable => "profile_runtime_unavailable",
             Self::DesktopUnavailable => "desktop_unavailable",
             Self::CodexKeychainUnavailable => "codex_keychain_unavailable",
             Self::CurrentProfileRequired => "current_profile_required",
+            Self::LocalStateUnavailable => "local_state_unavailable",
             Self::Internal => "internal",
         }
     }
@@ -95,10 +104,34 @@ mod tests {
     }
 
     #[test]
+    fn serializes_local_state_unavailable_with_actionable_code() {
+        let payload = serde_json::to_value(AppError::LocalStateUnavailable).unwrap();
+
+        assert_eq!(payload["code"], "local_state_unavailable");
+        assert_eq!(payload["message"], "本机会话状态暂不可读");
+    }
+
+    #[test]
     fn serializes_keychain_authorization_without_platform_details() {
         let payload = serde_json::to_value(AppError::KeychainInteractionRequired).unwrap();
 
         assert_eq!(payload["code"], "keychain_interaction_required");
         assert_eq!(payload["message"], "系统钥匙串需要用户授权");
+    }
+
+    #[test]
+    fn serializes_gateway_model_unavailable_with_actionable_code() {
+        let payload = serde_json::to_value(AppError::GatewayModelUnavailable).unwrap();
+
+        assert_eq!(payload["code"], "gateway_model_unavailable");
+        assert!(payload["message"].as_str().unwrap().contains("网关模型"));
+    }
+
+    #[test]
+    fn serializes_app_update_unavailable_with_actionable_code() {
+        let payload = serde_json::to_value(AppError::AppUpdateUnavailable).unwrap();
+
+        assert_eq!(payload["code"], "app_update_unavailable");
+        assert_eq!(payload["message"], "软件更新暂不可用");
     }
 }

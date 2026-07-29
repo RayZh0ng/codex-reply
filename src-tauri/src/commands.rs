@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
@@ -15,7 +15,8 @@ use argon2::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_updater::{Update, UpdaterExt};
 use uuid::Uuid;
 
 use crate::{
@@ -24,22 +25,25 @@ use crate::{
     collaboration::CollaborationManager,
     database::Repository,
     domain::{
-        CancelCodexSessionInput, CancelManagedTaskInput, CodexAuthMode, CodexSessionSummary,
+        AppUpdateChannel, AppUpdateInfo, AppUpdateSettings, CancelCodexSessionInput,
+        CancelManagedTaskInput, CheckAppUpdateInput, CodexAuthMode, CodexSessionSummary,
         CollaborationCallbackStatus, CollaborationProjectBinding, CollaborationProvider,
         CommitJsonProfileImportInput, CompleteOAuthImportInput, ContinueCodexSessionInput,
-        CreateClientKeyInput, CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
-        CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCollaborationBotInput,
-        DeleteCollaborationProjectBindingInput, DeleteDesktopWorkspaceInput, DeleteFeishuBotInput,
-        DeleteFeishuProjectBindingInput, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
-        DesktopWorkspaceSettings, DiscardJsonProfileImportInput, FeishuProjectBinding,
-        GatewayCodexConfigStatus, GatewayStatus, JsonProfileImportPreview, JsonProfileImportResult,
+        CreateApiServiceProfileInput, CreateClientKeyInput, CreateProfileInput, CreatedClientKey,
+        CurrentProfileActivation, CurrentProfileActivationStatusInput, DashboardSnapshot,
+        DeleteCollaborationBotInput, DeleteCollaborationProjectBindingInput,
+        DeleteDesktopWorkspaceInput, DeleteFeishuBotInput, DeleteFeishuProjectBindingInput,
+        DesktopWorkspaceHistoryItem, DesktopWorkspaceMode, DesktopWorkspaceSettings,
+        DiscardJsonProfileImportInput, FeishuProjectBinding, GatewayCodexConfigStatus,
+        GatewayStatus, InstallAppUpdateInput, JsonProfileImportPreview, JsonProfileImportResult,
         ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey, MaskedCollaborationBot,
         MaskedFeishuBot, MaskedProfile, OAuthImportStatus, PreviewJsonProfileImportInput,
         ProfileQuotaRefreshReport, RestoreDesktopWorkspaceInput, RetryJsonProfileImportInput,
-        SelectCurrentProfileInput, StartManagedTaskInput, StartOAuthImportInput,
-        TestApiServiceInput, UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput,
-        UpdateProfileInput, UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput,
-        UpsertFeishuBotInput, UpsertFeishuProjectBindingInput,
+        SelectCurrentProfileInput, SetCodexGatewayOAuthProfileInput, StartManagedTaskInput,
+        StartOAuthImportInput, TestApiServiceInput, UpdateAppUpdateSettingsInput,
+        UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput, UpdateProfileInput,
+        UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput, UpsertFeishuBotInput,
+        UpsertFeishuProjectBindingInput,
     },
     error::{AppError, AppResult},
     gateway::{
@@ -95,6 +99,24 @@ pub async fn create_profile(
     state: State<'_, AppState>,
 ) -> AppResult<MaskedProfile> {
     profiles::create_profile(&state.repository, state.secrets.clone(), input).await
+}
+
+#[tauri::command]
+pub async fn create_api_service_profile(
+    input: CreateApiServiceProfileInput,
+    state: State<'_, AppState>,
+) -> AppResult<MaskedProfile> {
+    let report = test_api_service(&input.provider, &input.base_url, &input.api_key).await?;
+    if report.status != "verified" {
+        return Err(AppError::UpstreamUnavailable);
+    }
+    profiles::create_api_service_profile(
+        &state.repository,
+        state.secrets.clone(),
+        input,
+        report.models,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -340,6 +362,80 @@ pub fn update_desktop_workspace_settings(
 }
 
 #[tauri::command]
+pub fn app_update_settings(state: State<'_, AppState>) -> AppResult<AppUpdateSettings> {
+    state.repository.app_update_settings()
+}
+
+#[tauri::command]
+pub fn update_app_update_settings(
+    input: UpdateAppUpdateSettingsInput,
+    state: State<'_, AppState>,
+) -> AppResult<AppUpdateSettings> {
+    state
+        .repository
+        .set_app_update_settings(input.channel, input.auto_check)
+}
+
+#[tauri::command]
+pub async fn check_app_update(
+    input: CheckAppUpdateInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Option<AppUpdateInfo>> {
+    let channel = input
+        .channel
+        .unwrap_or(state.repository.app_update_settings()?.channel);
+    check_update_for_channel(&app, channel)
+        .await
+        .map(|update| update.map(|update| app_update_info(channel, &update)))
+}
+
+#[tauri::command]
+pub async fn install_app_update(
+    input: InstallAppUpdateInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    let channel = input
+        .channel
+        .unwrap_or(state.repository.app_update_settings()?.channel);
+    let Some(update) = check_update_for_channel(&app, channel).await? else {
+        return Err(AppError::NotFound);
+    };
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|_| AppError::AppUpdateUnavailable)?;
+    app.restart();
+}
+
+async fn check_update_for_channel(
+    app: &AppHandle,
+    channel: AppUpdateChannel,
+) -> AppResult<Option<Update>> {
+    let endpoint = url::Url::parse(channel.endpoint()).map_err(|_| AppError::Internal)?;
+    app.updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|_| AppError::AppUpdateUnavailable)?
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|_| AppError::AppUpdateUnavailable)?
+        .check()
+        .await
+        .map_err(|_| AppError::AppUpdateUnavailable)
+}
+
+fn app_update_info(channel: AppUpdateChannel, update: &Update) -> AppUpdateInfo {
+    AppUpdateInfo {
+        version: update.version.clone(),
+        current_version: update.current_version.clone(),
+        body: update.body.clone(),
+        date: update.date.as_ref().map(ToString::to_string),
+        channel,
+    }
+}
+
+#[tauri::command]
 pub fn list_desktop_workspaces(
     state: State<'_, AppState>,
 ) -> AppResult<Vec<DesktopWorkspaceHistoryItem>> {
@@ -509,8 +605,10 @@ pub fn trust_gateway_ca(state: State<'_, AppState>) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub async fn codex_gateway_config_status() -> AppResult<GatewayCodexConfigStatus> {
-    codex_gateway::status().await
+pub async fn codex_gateway_config_status(
+    state: State<'_, AppState>,
+) -> AppResult<GatewayCodexConfigStatus> {
+    codex_gateway::status(&state.repository).await
 }
 
 #[tauri::command]
@@ -520,6 +618,7 @@ pub async fn enable_codex_gateway(
     codex_gateway::enable(
         &state.repository,
         state.secrets.clone(),
+        state.oauth_credentials.clone(),
         state.gateway.status()?,
         &state.data_dir,
     )
@@ -530,7 +629,20 @@ pub async fn enable_codex_gateway(
 pub async fn disable_codex_gateway(
     state: State<'_, AppState>,
 ) -> AppResult<GatewayCodexConfigStatus> {
-    codex_gateway::disable(state.secrets.clone()).await
+    codex_gateway::disable(&state.repository, state.secrets.clone()).await
+}
+
+#[tauri::command]
+pub async fn set_codex_gateway_oauth_profile(
+    input: SetCodexGatewayOAuthProfileInput,
+    state: State<'_, AppState>,
+) -> AppResult<GatewayCodexConfigStatus> {
+    codex_gateway::set_codex_oauth_profile(&state.repository, input)
+}
+
+#[tauri::command]
+pub fn list_gateway_model_options(state: State<'_, AppState>) -> AppResult<Vec<String>> {
+    codex_gateway::gateway_model_options(&state.repository)
 }
 
 #[tauri::command]
@@ -543,6 +655,7 @@ pub async fn activate_api_service_profile(
         state.secrets.clone(),
         &id,
         &state.data_dir,
+        state.gateway.status()?,
     )
     .await
 }
@@ -759,6 +872,7 @@ pub async fn upsert_feishu_bot(
             application_id: None,
             bot_token: None,
             guild_id: None,
+            system_prompt: None,
         })
         .await?;
     Ok(feishu_bot_from_collaboration(bot))
@@ -813,9 +927,11 @@ pub fn upsert_feishu_project_binding(
             project_name: input.project_name,
             project_slug: input.project_slug,
             working_directory: input.working_directory,
-            profile_id: input.profile_id,
+            profile_id: Some(input.profile_id),
             enabled: input.enabled,
             concurrency_limit: input.concurrency_limit,
+            execution_target: Some("profile".to_owned()),
+            model_id: None,
             confirmed: input.confirmed,
         })
         .map(feishu_binding_from_collaboration)
@@ -879,8 +995,8 @@ fn feishu_binding_from_collaboration(binding: CollaborationProjectBinding) -> Fe
         project_name: binding.project_name,
         project_slug: binding.project_slug,
         working_directory: binding.working_directory,
-        profile_id: binding.profile_id,
-        profile_alias: binding.profile_alias,
+        profile_id: binding.profile_id.unwrap_or_default(),
+        profile_alias: binding.profile_alias.unwrap_or_default(),
         chat_id: binding.chat_id,
         bind_code: binding.bind_code,
         enabled: binding.enabled,
@@ -1113,13 +1229,14 @@ mod tests {
 
     fn test_app_state(repository: Arc<Repository>, secrets: Arc<dyn SecretStore>) -> AppState {
         let oauth_credentials = Arc::new(OAuthCredentialStore::new(secrets.clone()));
+        let gateway = Arc::new(GatewayManager::new(
+            repository.clone(),
+            secrets.clone(),
+            oauth_credentials.clone(),
+            PathBuf::from("/tmp/codex-relay-test-certs"),
+        ));
         AppState {
-            gateway: Arc::new(GatewayManager::new(
-                repository.clone(),
-                secrets.clone(),
-                oauth_credentials.clone(),
-                PathBuf::from("/tmp/codex-relay-test-certs"),
-            )),
+            gateway: gateway.clone(),
             runtime: Arc::new(CodexRuntime::new(
                 PathBuf::from("/tmp/codex-relay-test-runtime"),
                 secrets.clone(),
@@ -1128,6 +1245,7 @@ mod tests {
                 repository.clone(),
                 secrets.clone(),
                 oauth_credentials.clone(),
+                gateway,
                 PathBuf::from("/tmp/codex-relay-test-data"),
             )),
             repository,

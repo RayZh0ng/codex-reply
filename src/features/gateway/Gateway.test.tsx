@@ -1,11 +1,15 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { GatewayStatus } from "../../shared/ipc";
 import { api } from "../../shared/ipc";
 import { Gateway } from "./Gateway";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: vi.fn() }));
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
 vi.mock("../../shared/ipc", () => ({
   api: {
     listClientKeys: vi.fn().mockResolvedValue([]),
@@ -16,6 +20,10 @@ vi.mock("../../shared/ipc", () => ({
       message: "Codex 尚未切换到 Relay 网关。",
       auth_status: "missing",
       needs_repair: false,
+      oauth_profile_id: null,
+      oauth_profile_alias: null,
+      oauth_profile_available: false,
+      oauth_profile_options: [],
     }),
     createClientKey: vi.fn(),
     revokeClientKey: vi.fn(),
@@ -23,6 +31,7 @@ vi.mock("../../shared/ipc", () => ({
     trustGatewayCa: vi.fn(),
     enableCodexGateway: vi.fn(),
     disableCodexGateway: vi.fn(),
+    setCodexGatewayOAuthProfile: vi.fn(),
   },
 }));
 
@@ -155,6 +164,58 @@ describe("Gateway", () => {
     expect(screen.queryByText("Alice 的 Mac")).not.toBeInTheDocument();
   });
 
+  it("uses backend oauth profile options and unavailable reasons", async () => {
+    vi.mocked(api.codexGatewayConfigStatus).mockResolvedValueOnce({
+      enabled: true,
+      message: "Codex 已切换到 Relay 网关。",
+      auth_status: "ok",
+      needs_repair: false,
+      config_path: "/Users/test/.codex/config.toml",
+      service_url: "https://10.12.14.248:53765",
+      oauth_profile_id: "oauth-work",
+      oauth_profile_alias: "工作 OAuth",
+      oauth_profile_available: true,
+      oauth_profile_options: [
+        {
+          id: "oauth-work",
+          alias: "工作 OAuth",
+          available: true,
+          reason: null,
+        },
+        {
+          id: "oauth-missing",
+          alias: "未授权 OAuth",
+          available: false,
+          reason: "凭据未保存，请重新授权",
+        },
+        {
+          id: "json-import",
+          alias: "JSON 导入账号",
+          available: false,
+          reason: "JSON 导入账号用于反代账号池，不能用于登录态解锁",
+        },
+      ],
+    });
+
+    renderGateway({ available_profiles: 1 });
+
+    expect(await screen.findByText("当前登录档案：工作 OAuth")).toBeInTheDocument();
+    const trigger = screen.getByRole("combobox", { name: "OAuth 登录档案" });
+    expect(trigger).toHaveTextContent("工作 OAuth");
+
+    fireEvent.click(trigger);
+    expect(await screen.findByText("凭据未保存，请重新授权")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /未授权 OAuth/ })).toHaveAttribute(
+      "data-disabled",
+    );
+    expect(
+      screen.getByText("JSON 导入账号用于反代账号池，不能用于登录态解锁"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /JSON 导入账号/ })).toHaveAttribute(
+      "data-disabled",
+    );
+  });
+
   it("repairs codex key and refreshes gateway state", async () => {
     vi.mocked(api.codexGatewayConfigStatus).mockResolvedValue({
       enabled: true,
@@ -163,6 +224,10 @@ describe("Gateway", () => {
       needs_repair: true,
       config_path: "/Users/test/.codex/config.toml",
       service_url: null,
+      oauth_profile_id: null,
+      oauth_profile_alias: null,
+      oauth_profile_available: false,
+      oauth_profile_options: [],
     });
     vi.mocked(api.enableCodexGateway).mockResolvedValue({
       enabled: true,
@@ -171,6 +236,10 @@ describe("Gateway", () => {
       needs_repair: false,
       config_path: "/Users/test/.codex/config.toml",
       service_url: "https://10.12.14.248:53765",
+      oauth_profile_id: null,
+      oauth_profile_alias: null,
+      oauth_profile_available: false,
+      oauth_profile_options: [],
     });
     const { onRefresh } = renderGateway({ available_profiles: 1 });
 

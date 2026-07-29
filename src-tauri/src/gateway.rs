@@ -29,8 +29,8 @@ use crate::{
     database::Repository,
     database::StoredProfile,
     domain::{
-        ApiServiceTestReport, GatewayNetworkAddress, GatewayProvider, GatewayStatus, MaskedProfile,
-        ProfileKind,
+        ApiServiceTestReport, GatewayModelMapping, GatewayNetworkAddress, GatewayProvider,
+        GatewayStatus, GatewayWireApi, MaskedProfile, ProfileKind,
     },
     error::{AppError, AppResult},
     oauth_credentials::{CredentialAccess, OAuthCredentialStore},
@@ -107,7 +107,25 @@ pub async fn discover_profile_models(
     if report.status != "verified" {
         return Err(AppError::UpstreamUnavailable);
     }
-    stored.profile.models = report.models;
+    let mappings = if stored.profile.model_mappings.is_empty() {
+        report
+            .models
+            .iter()
+            .map(|model| GatewayModelMapping {
+                model: model.clone(),
+                upstream_model: model.clone(),
+                display_name: None,
+                context_window: None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        stored.profile.model_mappings.clone()
+    };
+    stored.profile.models = mappings
+        .iter()
+        .map(|mapping| mapping.model.clone())
+        .collect();
+    stored.profile.model_mappings = mappings;
     stored.profile.health = "healthy".to_owned();
     repository.update_profile(&stored)?;
     Ok(stored.profile)
@@ -176,10 +194,43 @@ pub async fn test_api_service(
             models: Vec::new(),
         });
     }
-    let body = response
-        .json::<Value>()
-        .await
-        .map_err(|_| AppError::UpstreamUnavailable)?;
+    let body_text = match response.text().await {
+        Ok(text) => text,
+        Err(error) => {
+            let category = if error.is_timeout() {
+                "timeout"
+            } else if error.is_decode() {
+                "json"
+            } else {
+                "network"
+            };
+            return Ok(ApiServiceTestReport {
+                status: "failed".to_owned(),
+                category: category.to_owned(),
+                endpoint: endpoint_text,
+                message: format!("上游模型目录响应读取失败（{category}）。"),
+                http_status: Some(status.as_u16()),
+                latency_ms,
+                model_count: 0,
+                models: Vec::new(),
+            });
+        }
+    };
+    let body = match serde_json::from_str::<Value>(&body_text) {
+        Ok(body) => body,
+        Err(_) => {
+            return Ok(ApiServiceTestReport {
+                status: "failed".to_owned(),
+                category: "json".to_owned(),
+                endpoint: endpoint_text,
+                message: "上游返回的模型目录不是有效 JSON。".to_owned(),
+                http_status: Some(status.as_u16()),
+                latency_ms,
+                model_count: 0,
+                models: Vec::new(),
+            });
+        }
+    };
     let models = model_ids_from_provider_response(provider, &body);
     if models.is_empty() {
         return Ok(ApiServiceTestReport {
@@ -251,27 +302,54 @@ fn discovery_request(
 }
 
 fn model_ids_from_provider_response(provider: &GatewayProvider, body: &Value) -> Vec<String> {
-    let values = match provider {
-        GatewayProvider::Ollama => body.get("models").and_then(Value::as_array),
-        GatewayProvider::Gemini => body.get("models").and_then(Value::as_array),
-        _ => body.get("data").and_then(Value::as_array),
+    let mut arrays = Vec::new();
+    match provider {
+        GatewayProvider::Ollama | GatewayProvider::Gemini => {
+            if let Some(values) = body.get("models").and_then(Value::as_array) {
+                arrays.push(values);
+            }
+            if let Some(values) = body.get("data").and_then(Value::as_array) {
+                arrays.push(values);
+            }
+        }
+        _ => {
+            if let Some(values) = body.get("data").and_then(Value::as_array) {
+                arrays.push(values);
+            }
+            if let Some(values) = body.get("models").and_then(Value::as_array) {
+                arrays.push(values);
+            }
+        }
     }
-    .cloned()
-    .unwrap_or_default();
-    let mut models = values
+    if let Some(values) = body.as_array() {
+        arrays.push(values);
+    }
+    let mut models = arrays
         .into_iter()
-        .filter_map(|value| {
-            value
-                .get("id")
-                .or_else(|| value.get("name"))
-                .and_then(Value::as_str)
-                .map(|name| name.trim_start_matches("models/").to_owned())
-        })
+        .flat_map(|values| values.iter())
+        .filter_map(model_id_from_value)
         .filter(|name| !name.trim().is_empty())
         .collect::<Vec<_>>();
     models.sort();
     models.dedup();
     models
+}
+
+fn model_id_from_value(value: &Value) -> Option<String> {
+    let name = value.as_str().or_else(|| {
+        value
+            .get("id")
+            .or_else(|| value.get("name"))
+            .or_else(|| value.get("model"))
+            .or_else(|| value.get("slug"))
+            .and_then(Value::as_str)
+    })?;
+    let name = name.trim().trim_start_matches("models/").trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
 }
 
 struct GatewayRuntime {
@@ -767,6 +845,58 @@ enum GatewayRequestKind {
     ChatCompletions,
 }
 
+enum ApiResponseAdapter {
+    Direct {
+        visible_model: String,
+    },
+    ChatToResponses {
+        client_stream: bool,
+        visible_model: String,
+    },
+    ResponsesToChat {
+        client_stream: bool,
+        visible_model: String,
+        profile_id: String,
+    },
+}
+
+fn visible_model_for(profile: &MaskedProfile, requested: Option<&str>) -> String {
+    requested
+        .map(str::to_owned)
+        .or_else(|| {
+            profile
+                .model_mappings
+                .first()
+                .map(|mapping| mapping.model.clone())
+        })
+        .or_else(|| profile.models.first().cloned())
+        .unwrap_or_else(|| "model".to_owned())
+}
+
+fn upstream_model_for(profile: &MaskedProfile, requested: Option<&str>) -> Option<String> {
+    let requested = requested?;
+    profile
+        .model_mappings
+        .iter()
+        .find(|mapping| mapping.model == requested)
+        .map(|mapping| mapping.upstream_model.clone())
+        .or_else(|| {
+            profile
+                .models
+                .iter()
+                .any(|model| model == requested)
+                .then(|| requested.to_owned())
+        })
+}
+
+fn payload_with_model(payload: &Value, model: &str) -> Value {
+    let mut next = payload.clone();
+    if let Some(object) = next.as_object_mut() {
+        object.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
+    next
+}
+
 async fn ollama_tags(
     State(state): State<GatewayApiState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -926,13 +1056,51 @@ async fn forward(
                 }
             }
         }
-        let Some(base_url) = candidate.profile.base_url else {
+        let Some(base_url) = candidate.profile.base_url.clone() else {
             continue;
         };
-        let Some(secret_ref) = candidate.secret_ref else {
+        let Some(secret_ref) = candidate.secret_ref.clone() else {
             continue;
         };
-        let endpoint = match build_upstream_url(&base_url, route) {
+        let visible_model = visible_model_for(&candidate.profile, model);
+        let upstream_model =
+            upstream_model_for(&candidate.profile, model).unwrap_or_else(|| visible_model.clone());
+        let client_stream = payload
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut upstream_route = route.to_owned();
+        let mut upstream_payload = payload_with_model(&payload, &upstream_model);
+        let mut response_adapter = ApiResponseAdapter::Direct {
+            visible_model: visible_model.clone(),
+        };
+        if candidate.profile.wire_api == GatewayWireApi::ChatCompletions
+            && request_kind == Some(GatewayRequestKind::Responses)
+        {
+            upstream_route = "chat/completions".to_owned();
+            upstream_payload = match responses_to_chat_completion(&payload, &upstream_model) {
+                Ok(value) => value,
+                Err(message) => return openai_bad_request(&message),
+            };
+            response_adapter = ApiResponseAdapter::ChatToResponses {
+                client_stream,
+                visible_model,
+            };
+        } else if candidate.profile.wire_api == GatewayWireApi::Responses
+            && request_kind == Some(GatewayRequestKind::ChatCompletions)
+        {
+            upstream_route = "responses".to_owned();
+            upstream_payload = match chat_to_responses(&payload) {
+                Ok(value) => payload_with_model(&value, &upstream_model),
+                Err(message) => return openai_bad_request(&message),
+            };
+            response_adapter = ApiResponseAdapter::ResponsesToChat {
+                client_stream,
+                visible_model,
+                profile_id: candidate.profile.id.clone(),
+            };
+        }
+        let endpoint = match build_upstream_url(&base_url, &upstream_route) {
             Ok(url) => url,
             Err(_) => continue,
         };
@@ -944,7 +1112,7 @@ async fn forward(
             client.post(endpoint),
             &candidate.profile.provider,
             &key,
-            &payload,
+            &upstream_payload,
         );
         match send_with_first_response_timeout(request).await {
             Ok(response)
@@ -966,7 +1134,45 @@ async fn forward(
                 let _ = state
                     .repository
                     .record_metric(successful, started.elapsed().as_millis() as i64);
-                return upstream_response(response, state.repository.clone(), request_kind);
+                return match response_adapter {
+                    ApiResponseAdapter::Direct { visible_model } => {
+                        upstream_response_with_visible_model(
+                            response,
+                            state.repository.clone(),
+                            request_kind,
+                            visible_model,
+                        )
+                        .await
+                    }
+                    ApiResponseAdapter::ChatToResponses {
+                        client_stream,
+                        visible_model,
+                    } => {
+                        adapt_chat_completion_response(
+                            response,
+                            client_stream,
+                            visible_model,
+                            state.repository.clone(),
+                        )
+                        .await
+                    }
+                    ApiResponseAdapter::ResponsesToChat {
+                        client_stream,
+                        visible_model,
+                        profile_id,
+                    } => {
+                        adapt_oauth_response(
+                            response,
+                            GatewayRequestKind::ChatCompletions,
+                            client_stream,
+                            visible_model,
+                            profile_id,
+                            state.repository.clone(),
+                            state.affinities.clone(),
+                        )
+                        .await
+                    }
+                };
             }
             Err(_) => {
                 record_gateway_upstream_error(&state.repository, GATEWAY_ERROR_FIRST_RESPONSE);
@@ -1476,6 +1682,351 @@ fn chat_to_responses(payload: &Value) -> Result<Value, String> {
     Ok(output)
 }
 
+fn responses_to_chat_completion(payload: &Value, upstream_model: &str) -> Result<Value, String> {
+    let mut messages = Vec::new();
+    if let Some(instructions) = payload
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    match payload.get("input") {
+        Some(Value::String(text)) => {
+            messages.push(json!({"role": "user", "content": text}));
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("message") => {
+                        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                        messages.push(json!({
+                            "role": role,
+                            "content": responses_content_to_chat(item.get("content").unwrap_or(&Value::Null))
+                        }));
+                    }
+                    Some("function_call_output") => {
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": item.get("call_id").cloned().unwrap_or_default(),
+                            "content": item.get("output").cloned().unwrap_or_else(|| Value::String(String::new()))
+                        }));
+                    }
+                    Some("function_call") => {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": Value::Null,
+                            "tool_calls": [{
+                                "id": item.get("call_id").or_else(|| item.get("id")).cloned().unwrap_or_default(),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name").cloned().unwrap_or_default(),
+                                    "arguments": item.get("arguments").cloned().unwrap_or_else(|| Value::String("{}".to_owned()))
+                                }
+                            }]
+                        }));
+                    }
+                    _ => {
+                        if let Some(role) = item.get("role").and_then(Value::as_str) {
+                            messages.push(json!({
+                                "role": role,
+                                "content": responses_content_to_chat(item.get("content").unwrap_or(item))
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        _ => return Err("input is required".to_owned()),
+    }
+    if messages.is_empty() {
+        return Err("input is required".to_owned());
+    }
+    let tools = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name").cloned().unwrap_or_default(),
+                            "description": tool.get("description").cloned().unwrap_or_default(),
+                            "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"})),
+                            "strict": tool.get("strict").cloned().unwrap_or(Value::Bool(false))
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut output = json!({
+        "model": upstream_model,
+        "messages": messages,
+        "stream": payload.get("stream").and_then(Value::as_bool).unwrap_or(false)
+    });
+    let object = output
+        .as_object_mut()
+        .ok_or_else(|| "invalid request".to_owned())?;
+    if !tools.is_empty() {
+        object.insert("tools".to_owned(), Value::Array(tools));
+    }
+    for field in ["temperature", "top_p", "parallel_tool_calls"] {
+        if let Some(value) = payload.get(field).filter(|value| !value.is_null()) {
+            object.insert(field.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = payload
+        .get("max_output_tokens")
+        .or_else(|| payload.get("max_completion_tokens"))
+        .or_else(|| payload.get("max_tokens"))
+        .filter(|value| !value.is_null())
+    {
+        object.insert("max_tokens".to_owned(), value.clone());
+    }
+    if let Some(choice) = payload.get("tool_choice").filter(|value| !value.is_null()) {
+        let mapped = choice
+            .get("name")
+            .map(|name| json!({"type": "function", "function": {"name": name}}))
+            .unwrap_or_else(|| choice.clone());
+        object.insert("tool_choice".to_owned(), mapped);
+    }
+    Ok(output)
+}
+
+fn responses_content_to_chat(content: &Value) -> Value {
+    match content {
+        Value::String(_) => content.clone(),
+        Value::Array(parts) => Value::String(
+            parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("input_text"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => Value::String(String::new()),
+    }
+}
+
+async fn adapt_chat_completion_response(
+    response: reqwest::Response,
+    client_stream: bool,
+    model: String,
+    repository: Arc<Repository>,
+) -> Response {
+    if client_stream {
+        let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
+            ChatToResponsesStreamState::new(model),
+            move |state, chunk| {
+                let result = match chunk {
+                    Ok(bytes) => {
+                        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let events = drain_sse_events(&mut state.buffer);
+                        let mut output = String::new();
+                        for event in events {
+                            output.push_str(&state.translate(event));
+                        }
+                        Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
+                    }
+                    Err(_) => {
+                        record_gateway_upstream_error(
+                            &repository,
+                            GATEWAY_ERROR_STREAM_INTERRUPTED,
+                        );
+                        Some(Ok(Bytes::from(sse_upstream_error_event(Some(
+                            GatewayRequestKind::Responses,
+                        )))))
+                    }
+                };
+                futures_util::future::ready(result)
+            },
+        );
+        return sse_response(Body::from_stream(stream));
+    }
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let Some(completed) = completed_chat_completion(&bytes) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"code": "invalid_upstream_response"}})),
+        )
+            .into_response();
+    };
+    Json(chat_completion_to_response(&completed, &model)).into_response()
+}
+
+fn completed_chat_completion(bytes: &[u8]) -> Option<Value> {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return Some(value);
+    }
+    let text = String::from_utf8_lossy(bytes);
+    parse_sse_events(&text).into_iter().rev().find(|event| {
+        event
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| !choices.is_empty())
+    })
+}
+
+fn chat_completion_to_response(completion: &Value, model: &str) -> Value {
+    let choice = completion
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .cloned()
+        .unwrap_or_default();
+    let message = choice.get("message").cloned().unwrap_or_default();
+    let mut output = Vec::new();
+    if let Some(content) = message.get("content").and_then(Value::as_str) {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}]
+        }));
+    }
+    for tool_call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let function = tool_call.get("function").cloned().unwrap_or_default();
+        output.push(json!({
+            "type": "function_call",
+            "id": tool_call.get("id").cloned().unwrap_or_default(),
+            "call_id": tool_call.get("id").cloned().unwrap_or_default(),
+            "name": function.get("name").cloned().unwrap_or_default(),
+            "arguments": function.get("arguments").cloned().unwrap_or(Value::String("{}".to_owned()))
+        }));
+    }
+    json!({
+        "id": completion.get("id").cloned().unwrap_or_else(|| Value::String(format!("resp_{}", uuid::Uuid::new_v4()))),
+        "object": "response",
+        "created_at": completion.get("created").cloned().unwrap_or_else(|| json!(timestamp_ms() / 1000)),
+        "model": model,
+        "status": "completed",
+        "output": output,
+        "usage": responses_usage_from_chat(completion.get("usage"))
+    })
+}
+
+fn responses_usage_from_chat(usage: Option<&Value>) -> Value {
+    let input = usage
+        .and_then(|usage| usage.get("prompt_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let output = usage
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": usage
+            .and_then(|usage| usage.get("total_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(input + output)
+    })
+}
+
+struct ChatToResponsesStreamState {
+    buffer: String,
+    id: String,
+    model: String,
+    created: i64,
+    text: String,
+    emitted_created: bool,
+}
+
+impl ChatToResponsesStreamState {
+    fn new(model: String) -> Self {
+        Self {
+            buffer: String::new(),
+            id: format!("resp_{}", uuid::Uuid::new_v4()),
+            model,
+            created: timestamp_ms() / 1000,
+            text: String::new(),
+            emitted_created: false,
+        }
+    }
+
+    fn translate(&mut self, event: Value) -> String {
+        if let Some(id) = event.get("id").and_then(Value::as_str) {
+            self.id = id.to_owned();
+        }
+        let Some(choice) = event
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return String::new();
+        };
+        let mut output = String::new();
+        if !self.emitted_created {
+            self.emitted_created = true;
+            output.push_str(&format!(
+                "event: response.created\ndata: {}\n\n",
+                json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": self.id,
+                        "object": "response",
+                        "created_at": self.created,
+                        "model": self.model,
+                        "status": "in_progress",
+                        "output": []
+                    }
+                })
+            ));
+        }
+        if let Some(delta) = choice
+            .get("delta")
+            .and_then(|delta| delta.get("content"))
+            .and_then(Value::as_str)
+        {
+            self.text.push_str(delta);
+            output.push_str(&format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({"type": "response.output_text.delta", "delta": delta})
+            ));
+        }
+        if choice
+            .get("finish_reason")
+            .is_some_and(|value| !value.is_null())
+        {
+            output.push_str(&format!(
+                "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": self.id,
+                        "object": "response",
+                        "created_at": self.created,
+                        "model": self.model,
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": self.text}]
+                        }]
+                    }
+                })
+            ));
+        }
+        output
+    }
+}
+
 fn completed_response(bytes: &[u8]) -> Option<Value> {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
         return Some(value.get("response").cloned().unwrap_or(value));
@@ -1861,6 +2412,64 @@ fn upstream_response(
     output
 }
 
+async fn upstream_response_with_visible_model(
+    response: reqwest::Response,
+    repository: Arc<Repository>,
+    kind: Option<GatewayRequestKind>,
+    visible_model: String,
+) -> Response {
+    let status = response.status();
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let is_sse = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    if is_sse {
+        return upstream_response(response, repository, kind);
+    }
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let mut output = Response::new(Body::from(bytes.clone()));
+    *output.status_mut() = status;
+    if let Some(content_type) = content_type {
+        output
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type.clone());
+        if content_type
+            .to_str()
+            .ok()
+            .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+        {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
+                rewrite_model_fields(&mut value, &visible_model);
+                return (status, Json(value)).into_response();
+            }
+        }
+    }
+    output
+}
+
+fn rewrite_model_fields(value: &mut Value, visible_model: &str) {
+    match value {
+        Value::Object(object) => {
+            if object.contains_key("model") {
+                object.insert("model".to_owned(), Value::String(visible_model.to_owned()));
+            }
+            for value in object.values_mut() {
+                rewrite_model_fields(value, visible_model);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                rewrite_model_fields(value, visible_model);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn gateway_http_client(proxy: &GatewayUpstreamProxy) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
@@ -2095,14 +2704,18 @@ mod tests {
     use super::{
         build_upstream_url, chat_to_responses, completed_response, gateway_http_client,
         mask_proxy_url, model_discovery_route, model_ids_from_provider_response,
-        response_to_chat_completion, send_oauth_request, send_with_first_response_timeout_after,
-        upstream_response, validate_binding, validate_manual_proxy_url, GatewayRequestKind,
-        GatewayUpstreamProxy, WeightedScheduler,
+        payload_with_model, response_to_chat_completion, responses_to_chat_completion,
+        rewrite_model_fields, send_oauth_request, send_with_first_response_timeout_after,
+        test_api_service, upstream_model_for, upstream_response, validate_binding,
+        validate_manual_proxy_url, visible_model_for, GatewayRequestKind, GatewayUpstreamProxy,
+        WeightedScheduler,
     };
     use crate::error::AppError;
     use crate::{
         database::{Repository, StoredProfile},
-        domain::{GatewayProvider, MaskedProfile, ProfileKind},
+        domain::{
+            GatewayModelMapping, GatewayProvider, GatewayWireApi, MaskedProfile, ProfileKind,
+        },
         profiles::CodexOAuthCredential,
     };
 
@@ -2114,11 +2727,13 @@ mod tests {
                 kind: ProfileKind::CodexOauth,
                 base_url: None,
                 provider: GatewayProvider::OpenAi,
+                wire_api: GatewayWireApi::Responses,
                 enabled: true,
                 in_pool: true,
                 priority: 0,
                 weight,
                 models: vec!["gpt-test".into()],
+                model_mappings: Vec::new(),
                 health: "healthy".into(),
                 cooldown_until_ms: None,
                 credential_configured: true,
@@ -2164,11 +2779,13 @@ mod tests {
                 kind: ProfileKind::ApiKey,
                 base_url: Some("https://example.test".into()),
                 provider: GatewayProvider::Gemini,
+                wire_api: GatewayWireApi::Responses,
                 enabled: true,
                 in_pool: true,
                 priority: 0,
                 weight: 1,
                 models: Vec::new(),
+                model_mappings: Vec::new(),
                 health: "unknown".into(),
                 cooldown_until_ms: None,
                 credential_configured: true,
@@ -2185,6 +2802,57 @@ mod tests {
             vec!["gemini-2.5-pro"]
         );
         let _ = Repository::memory();
+    }
+
+    #[test]
+    fn discovers_openai_compatible_string_and_models_arrays() {
+        let data_strings = serde_json::json!({"data": ["coder-small", "coder-large"]});
+        assert_eq!(
+            model_ids_from_provider_response(&GatewayProvider::OpenAiCompatible, &data_strings),
+            vec!["coder-large", "coder-small"]
+        );
+
+        let models_objects = serde_json::json!({
+            "models": [
+                "provider-string",
+                {"name": "provider-name"},
+                {"id": "provider-id"}
+            ]
+        });
+        assert_eq!(
+            model_ids_from_provider_response(&GatewayProvider::OpenAiCompatible, &models_objects),
+            vec!["provider-id", "provider-name", "provider-string"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_service_returns_a_structured_report_for_invalid_json() {
+        async fn invalid_json() -> &'static str {
+            "not json"
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/models", axum::routing::get(invalid_json)),
+            )
+            .await
+            .unwrap();
+        });
+
+        let report = test_api_service(
+            &GatewayProvider::OpenAiCompatible,
+            &format!("http://{address}/v1"),
+            "sk-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.category, "json");
+        assert_eq!(report.http_status, Some(200));
+        assert!(report.models.is_empty());
     }
 
     #[test]
@@ -2254,6 +2922,68 @@ mod tests {
         }
         assert_eq!(counts.get("one"), Some(&10));
         assert_eq!(counts.get("three"), Some(&30));
+    }
+
+    #[test]
+    fn maps_visible_models_to_upstream_payloads() {
+        let mut stored = candidate("mapped", 1);
+        stored.profile.models = vec!["codex-visible".into()];
+        stored.profile.model_mappings = vec![GatewayModelMapping {
+            model: "codex-visible".into(),
+            upstream_model: "provider-real".into(),
+            display_name: Some("Provider Real".into()),
+            context_window: Some(64_000),
+        }];
+
+        assert_eq!(
+            visible_model_for(&stored.profile, Some("codex-visible")),
+            "codex-visible"
+        );
+        assert_eq!(
+            upstream_model_for(&stored.profile, Some("codex-visible")).as_deref(),
+            Some("provider-real")
+        );
+        let payload = payload_with_model(
+            &serde_json::json!({"model": "codex-visible", "input": "hello"}),
+            "provider-real",
+        );
+        assert_eq!(payload["model"], "provider-real");
+    }
+
+    #[test]
+    fn rewrites_upstream_model_fields_back_to_visible_names() {
+        let mut value = serde_json::json!({
+            "model": "provider-real",
+            "output": [{"model": "provider-real", "content": []}]
+        });
+        rewrite_model_fields(&mut value, "codex-visible");
+
+        assert_eq!(value["model"], "codex-visible");
+        assert_eq!(value["output"][0]["model"], "codex-visible");
+    }
+
+    #[test]
+    fn converts_responses_requests_to_chat_completion_upstreams() {
+        let converted = responses_to_chat_completion(
+            &serde_json::json!({
+                "model": "codex-visible",
+                "instructions": "Be concise",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}]
+                }],
+                "max_output_tokens": 128,
+                "stream": false
+            }),
+            "provider-real",
+        )
+        .unwrap();
+
+        assert_eq!(converted["model"], "provider-real");
+        assert_eq!(converted["messages"][0]["role"], "system");
+        assert_eq!(converted["messages"][1]["content"], "Hello");
+        assert_eq!(converted["max_tokens"], 128);
     }
 
     #[test]

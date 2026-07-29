@@ -48,6 +48,7 @@ tokio-tungstenite = "0.28"
 aes = "0.8"
 cbc = "0.1"
 sha1 = "0.10"
+tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

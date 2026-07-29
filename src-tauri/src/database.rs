@@ -5,14 +5,16 @@ use std::{
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::Value;
 
 use crate::{
     domain::{
-        CodexAuthMode, CodexSessionEvent, CodexSessionSummary, CollaborationProjectBinding,
-        CollaborationProvider, CollaborationSummary, DesktopWorkspaceHistoryItem,
-        DesktopWorkspaceMode, FeishuProjectBinding, GatewayNetworkAddress, GatewayProvider,
-        GatewayStatus, MaskedClientKey, MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile,
-        MetricsSnapshot, ProfileAccountSummary, ProfileKind, ProfileQuota, ProfileSubscription,
+        AppUpdateChannel, AppUpdateSettings, CodexAuthMode, CodexSessionEvent, CodexSessionSummary,
+        CollaborationProjectBinding, CollaborationProvider, CollaborationSummary,
+        DesktopWorkspaceHistoryItem, DesktopWorkspaceMode, FeishuProjectBinding,
+        GatewayModelMapping, GatewayNetworkAddress, GatewayProvider, GatewayStatus, GatewayWireApi,
+        MaskedClientKey, MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile, MetricsSnapshot,
+        ProfileAccountSummary, ProfileKind, ProfileQuota, ProfileSubscription,
         GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
     },
     error::{AppError, AppResult},
@@ -92,11 +94,13 @@ impl Repository {
                       kind TEXT NOT NULL,
                       base_url TEXT,
                       provider TEXT NOT NULL DEFAULT 'openai_compatible',
+                      wire_api TEXT NOT NULL DEFAULT 'responses',
                       enabled INTEGER NOT NULL,
                       in_pool INTEGER NOT NULL,
                       priority INTEGER NOT NULL,
                       weight INTEGER NOT NULL,
                       models_json TEXT NOT NULL,
+                      model_mappings_json TEXT NOT NULL DEFAULT '[]',
                       health TEXT NOT NULL,
                       cooldown_until_ms INTEGER,
                       secret_ref TEXT,
@@ -116,7 +120,7 @@ impl Repository {
                     );
                     CREATE TABLE IF NOT EXISTS desktop_workspaces (
                       id TEXT PRIMARY KEY,
-                      profile_id TEXT NOT NULL,
+                      profile_id TEXT,
                       created_at_ms INTEGER NOT NULL,
                       last_launched_at_ms INTEGER NOT NULL
                     );
@@ -191,11 +195,13 @@ impl Repository {
                       project_name TEXT NOT NULL,
                       project_slug TEXT NOT NULL,
                       working_directory TEXT NOT NULL,
-                      profile_id TEXT NOT NULL,
+                      profile_id TEXT,
                       chat_id TEXT,
                       bind_code TEXT NOT NULL UNIQUE,
                       enabled INTEGER NOT NULL,
                       concurrency_limit INTEGER NOT NULL,
+                      execution_target TEXT NOT NULL DEFAULT 'profile',
+                      model_id TEXT,
                       created_at_ms INTEGER NOT NULL,
                       updated_at_ms INTEGER NOT NULL,
                       FOREIGN KEY(bot_id) REFERENCES collaboration_bots(id) ON DELETE CASCADE,
@@ -214,7 +220,7 @@ impl Repository {
                     CREATE TABLE IF NOT EXISTS codex_sessions (
                       id TEXT PRIMARY KEY,
                       binding_id TEXT NOT NULL,
-                      profile_id TEXT NOT NULL,
+                      profile_id TEXT,
                       provider TEXT NOT NULL DEFAULT 'feishu',
                       provider_bot_id TEXT,
                       provider_chat_id TEXT,
@@ -229,6 +235,8 @@ impl Repository {
                       finished_at_ms INTEGER,
                       summary TEXT,
                       last_error TEXT,
+                      execution_target TEXT NOT NULL DEFAULT 'profile',
+                      model_id TEXT,
                       working_directory TEXT NOT NULL,
                       FOREIGN KEY(binding_id) REFERENCES collaboration_project_bindings(id) ON DELETE CASCADE,
                       FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
@@ -280,11 +288,29 @@ impl Repository {
                 ("account_quota_json", "TEXT"),
                 ("account_subscription_json", "TEXT"),
                 ("provider", "TEXT NOT NULL DEFAULT 'openai_compatible'"),
+                ("wire_api", "TEXT NOT NULL DEFAULT 'responses'"),
+                ("model_mappings_json", "TEXT NOT NULL DEFAULT '[]'"),
             ] {
                 if !profile_columns.iter().any(|column| column == name) {
                     connection
                         .execute(
                             &format!("ALTER TABLE profiles ADD COLUMN {name} {definition}"),
+                            [],
+                        )
+                        .map_err(|_| AppError::Internal)?;
+                }
+            }
+            let binding_columns = table_columns(connection, "collaboration_project_bindings")?;
+            for (name, definition) in [
+                ("execution_target", "TEXT NOT NULL DEFAULT 'profile'"),
+                ("model_id", "TEXT"),
+            ] {
+                if !binding_columns.iter().any(|column| column == name) {
+                    connection
+                        .execute(
+                            &format!(
+                                "ALTER TABLE collaboration_project_bindings ADD COLUMN {name} {definition}"
+                            ),
                             [],
                         )
                         .map_err(|_| AppError::Internal)?;
@@ -296,6 +322,8 @@ impl Repository {
                 ("provider_bot_id", "TEXT"),
                 ("provider_chat_id", "TEXT"),
                 ("provider_message_id", "TEXT"),
+                ("execution_target", "TEXT NOT NULL DEFAULT 'profile'"),
+                ("model_id", "TEXT"),
             ] {
                 if !session_columns.iter().any(|column| column == name) {
                     connection
@@ -303,9 +331,10 @@ impl Repository {
                             &format!("ALTER TABLE codex_sessions ADD COLUMN {name} {definition}"),
                             [],
                         )
-                        .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::Internal)?;
                 }
             }
+            make_collaboration_profile_columns_nullable(connection)?;
             migrate_feishu_to_collaboration(connection)?;
             Ok(())
         })
@@ -315,19 +344,21 @@ impl Repository {
         self.with_connection(|connection| {
             connection
                 .execute(
-                    "INSERT INTO profiles(id, alias, kind, base_url, provider, enabled, in_pool, priority, weight, models_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                    "INSERT INTO profiles(id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
                         profile_kind_name(&stored.profile.kind),
                         stored.profile.base_url,
                         provider_name(&stored.profile.provider),
+                        wire_api_name(&stored.profile.wire_api),
                         stored.profile.enabled,
                         stored.profile.in_pool,
                         stored.profile.priority,
                         stored.profile.weight,
                         serde_json::to_string(&stored.profile.models).map_err(|_| AppError::Internal)?,
+                        serde_json::to_string(&stored.profile.model_mappings).map_err(|_| AppError::Internal)?,
                         stored.profile.health,
                         stored.profile.cooldown_until_ms,
                         stored.secret_ref,
@@ -361,41 +392,47 @@ impl Repository {
                 .optional()
                 .map_err(|_| AppError::Internal)?;
             let mut statement = connection
-                .prepare("SELECT id, alias, kind, base_url, provider, enabled, in_pool, priority, weight, models_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json FROM profiles ORDER BY priority, alias")
+                .prepare("SELECT id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json FROM profiles ORDER BY priority, alias")
                 .map_err(|_| AppError::Internal)?;
             let rows = statement
                 .query_map([], |row| {
                     let id: String = row.get(0)?;
                     let kind: String = row.get(2)?;
-                    let models_json: String = row.get(9)?;
-                    let models = serde_json::from_str(&models_json).unwrap_or_default();
+                    let models_json: String = row.get(10)?;
+                    let models: Vec<String> = serde_json::from_str(&models_json).unwrap_or_default();
+                    let mappings_json: String = row.get(11)?;
+                    let parsed_mappings =
+                        serde_json::from_str(&mappings_json).unwrap_or_default();
+                    let model_mappings = stored_or_identity_model_mappings(&models, parsed_mappings);
                     Ok(StoredProfile {
-                        secret_ref: row.get(12)?,
-                        credential_fingerprint: row.get(15)?,
+                        secret_ref: row.get(14)?,
+                        credential_fingerprint: row.get(17)?,
                         profile: MaskedProfile {
                             id: id.clone(),
                             alias: row.get(1)?,
                             kind: parse_profile_kind(&kind).unwrap_or(ProfileKind::ApiKey),
                             base_url: row.get(3)?,
                             provider: parse_provider(&row.get::<_, String>(4)?).unwrap_or_default(),
-                            enabled: row.get(5)?,
-                            in_pool: row.get(6)?,
-                            priority: row.get(7)?,
-                            weight: row.get(8)?,
+                            wire_api: parse_wire_api(&row.get::<_, String>(5)?).unwrap_or_default(),
+                            enabled: row.get(6)?,
+                            in_pool: row.get(7)?,
+                            priority: row.get(8)?,
+                            weight: row.get(9)?,
                             models,
-                            health: row.get(10)?,
-                            cooldown_until_ms: row.get(11)?,
-                            credential_configured: row.get(13)?,
-                            auth_mode: parse_auth_mode(&row.get::<_, String>(14)?)
+                            model_mappings,
+                            health: row.get(12)?,
+                            cooldown_until_ms: row.get(13)?,
+                            credential_configured: row.get(15)?,
+                            auth_mode: parse_auth_mode(&row.get::<_, String>(16)?)
                                 .unwrap_or_default(),
                             is_current: current_id.as_deref() == Some(id.as_str()),
                             account: account_summary(
-                                row.get(16)?,
-                                row.get(17)?,
                                 row.get(18)?,
                                 row.get(19)?,
                                 row.get(20)?,
                                 row.get(21)?,
+                                row.get(22)?,
+                                row.get(23)?,
                             ),
                         },
                     })
@@ -416,16 +453,18 @@ impl Repository {
         self.with_connection(|connection| {
             let updated = connection
                 .execute(
-                    "UPDATE profiles SET alias = ?2, provider = ?3, enabled = ?4, in_pool = ?5, priority = ?6, weight = ?7, models_json = ?8, secret_ref = ?9, credential_configured = ?10, auth_mode = ?11, credential_fingerprint = ?12, account_display_name = ?13, account_email = ?14, account_id = ?15, account_updated_at_ms = ?16, account_quota_json = ?17, account_subscription_json = ?18 WHERE id = ?1",
+                    "UPDATE profiles SET alias = ?2, provider = ?3, wire_api = ?4, enabled = ?5, in_pool = ?6, priority = ?7, weight = ?8, models_json = ?9, model_mappings_json = ?10, secret_ref = ?11, credential_configured = ?12, auth_mode = ?13, credential_fingerprint = ?14, account_display_name = ?15, account_email = ?16, account_id = ?17, account_updated_at_ms = ?18, account_quota_json = ?19, account_subscription_json = ?20 WHERE id = ?1",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
                         provider_name(&stored.profile.provider),
+                        wire_api_name(&stored.profile.wire_api),
                         stored.profile.enabled,
                         stored.profile.in_pool,
                         stored.profile.priority,
                         stored.profile.weight,
                         serde_json::to_string(&stored.profile.models).map_err(|_| AppError::Internal)?,
+                        serde_json::to_string(&stored.profile.model_mappings).map_err(|_| AppError::Internal)?,
                         stored.secret_ref,
                         stored.profile.credential_configured,
                         auth_mode_name(&stored.profile.auth_mode),
@@ -540,6 +579,49 @@ impl Repository {
             DesktopWorkspaceMode::Shared => "shared",
         };
         self.set_setting("desktop_workspace_mode", value)
+    }
+
+    pub fn app_update_settings(&self) -> AppResult<AppUpdateSettings> {
+        let channel = match self.setting("app_update_channel")?.as_deref() {
+            None | Some("stable") => AppUpdateChannel::Stable,
+            Some("beta") => AppUpdateChannel::Beta,
+            Some(_) => return Err(AppError::ValidationFailed),
+        };
+        let auto_check = match self.setting("app_update_auto_check")?.as_deref() {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(_) => return Err(AppError::ValidationFailed),
+        };
+        Ok(AppUpdateSettings {
+            channel,
+            auto_check,
+        })
+    }
+
+    pub fn set_app_update_settings(
+        &self,
+        channel: AppUpdateChannel,
+        auto_check: bool,
+    ) -> AppResult<AppUpdateSettings> {
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO app_settings(key, value) VALUES('app_update_channel', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![channel.as_setting_value()],
+                )
+                .map_err(|_| AppError::Internal)?;
+            connection
+                .execute(
+                    "INSERT INTO app_settings(key, value) VALUES('app_update_auto_check', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![if auto_check { "true" } else { "false" }],
+                )
+                .map_err(|_| AppError::Internal)?;
+            Ok(())
+        })?;
+        Ok(AppUpdateSettings {
+            channel,
+            auto_check,
+        })
     }
 
     pub fn create_desktop_workspace(
@@ -899,6 +981,7 @@ impl Repository {
             ).map_err(|_| AppError::Internal)?;
             let rows = statement.query_map([], |row| {
                 let provider: String = row.get(1)?;
+                let config_json: String = row.get(6)?;
                 Ok(StoredCollaborationBot {
                     bot: MaskedCollaborationBot {
                         id: row.get(0)?,
@@ -911,9 +994,10 @@ impl Repository {
                         connection_status: row.get(8)?,
                         last_error: row.get(9)?,
                         callback_public_url: row.get(10)?,
+                        system_prompt: system_prompt_from_config_json(&config_json),
                         updated_at_ms: row.get(11)?,
                     },
-                    config_json: row.get(6)?,
+                    config_json,
                     secret_refs_json: row.get(7)?,
                 })
             }).map_err(|_| AppError::Internal)?;
@@ -985,9 +1069,9 @@ impl Repository {
     ) -> AppResult<()> {
         self.with_connection(|connection| {
             connection.execute(
-                "INSERT INTO collaboration_project_bindings(id, provider, bot_id, project_name, project_slug, working_directory, profile_id, chat_id, bind_code, enabled, concurrency_limit, created_at_ms, updated_at_ms)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                 ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, bot_id = excluded.bot_id, project_name = excluded.project_name, project_slug = excluded.project_slug, working_directory = excluded.working_directory, profile_id = excluded.profile_id, enabled = excluded.enabled, concurrency_limit = excluded.concurrency_limit, updated_at_ms = excluded.updated_at_ms",
+                "INSERT INTO collaboration_project_bindings(id, provider, bot_id, project_name, project_slug, working_directory, profile_id, chat_id, bind_code, enabled, concurrency_limit, execution_target, model_id, created_at_ms, updated_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, bot_id = excluded.bot_id, project_name = excluded.project_name, project_slug = excluded.project_slug, working_directory = excluded.working_directory, profile_id = excluded.profile_id, enabled = excluded.enabled, concurrency_limit = excluded.concurrency_limit, execution_target = excluded.execution_target, model_id = excluded.model_id, updated_at_ms = excluded.updated_at_ms",
                 params![
                     binding.id,
                     collaboration_provider_name(&binding.provider),
@@ -995,11 +1079,13 @@ impl Repository {
                     binding.project_name,
                     binding.project_slug,
                     binding.working_directory,
-                    binding.profile_id,
+                    binding.profile_id.as_deref(),
                     binding.chat_id,
                     binding.bind_code,
                     binding.enabled,
                     binding.concurrency_limit,
+                    binding.execution_target,
+                    binding.model_id,
                     binding.created_at_ms,
                     binding.updated_at_ms,
                 ],
@@ -1013,10 +1099,10 @@ impl Repository {
     ) -> AppResult<Vec<CollaborationProjectBinding>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT b.id, b.provider, b.bot_id, bot.name, b.project_name, b.project_slug, b.working_directory, b.profile_id, p.alias, b.chat_id, b.bind_code, b.enabled, b.concurrency_limit, b.created_at_ms, b.updated_at_ms
+                "SELECT b.id, b.provider, b.bot_id, bot.name, b.project_name, b.project_slug, b.working_directory, b.profile_id, p.alias, b.chat_id, b.bind_code, b.enabled, b.concurrency_limit, b.execution_target, b.model_id, b.created_at_ms, b.updated_at_ms
                  FROM collaboration_project_bindings b
                  JOIN collaboration_bots bot ON bot.id = b.bot_id
-                 JOIN profiles p ON p.id = b.profile_id
+                 LEFT JOIN profiles p ON p.id = b.profile_id
                  ORDER BY b.provider, b.project_name",
             ).map_err(|_| AppError::Internal)?;
             let rows = statement.query_map([], collaboration_binding_from_row).map_err(|_| AppError::Internal)?;
@@ -1150,7 +1236,7 @@ impl Repository {
                     stored.bot.last_error,
                     stored.bot.updated_at_ms,
                 ],
-            ).map_err(|_| AppError::Internal)?;
+            ).map_err(map_local_state_error)?;
             Ok(())
         })
     }
@@ -1171,7 +1257,7 @@ impl Repository {
                     stored.bot.last_error,
                     stored.bot.updated_at_ms,
                 ],
-            ).map_err(|_| AppError::Internal)?;
+            ).map_err(map_local_state_error)?;
             if changed == 0 { return Err(AppError::NotFound); }
             Ok(())
         })
@@ -1346,14 +1432,14 @@ impl Repository {
         self.with_connection(|connection| {
             connection
                 .execute("PRAGMA foreign_keys = OFF", [])
-                .map_err(|_| AppError::Internal)?;
+                .map_err(map_local_state_error)?;
             connection.execute(
-                "INSERT INTO codex_sessions(id, binding_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, working_directory)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                "INSERT INTO codex_sessions(id, binding_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, working_directory)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 params![
                     stored.session.id,
                     stored.session.binding_id,
-                    stored.session.profile_id,
+                    stored.session.profile_id.as_deref(),
                     collaboration_provider_name(&stored.session.provider),
                     stored.session.provider_bot_id,
                     stored.session.provider_chat_id,
@@ -1368,12 +1454,14 @@ impl Repository {
                     stored.session.finished_at_ms,
                     stored.session.summary,
                     stored.session.last_error,
+                    stored.session.execution_target,
+                    stored.session.model_id,
                     stored.working_directory,
                 ],
-            ).map_err(|_| AppError::Internal)?;
+            ).map_err(map_local_state_error)?;
             connection
                 .execute("PRAGMA foreign_keys = ON", [])
-                .map_err(|_| AppError::Internal)?;
+                .map_err(map_local_state_error)?;
             Ok(())
         })
     }
@@ -1390,7 +1478,7 @@ impl Repository {
             let changed = connection.execute(
                 "UPDATE codex_sessions SET relay_status = ?2, summary = COALESCE(?3, summary), last_error = ?4, finished_at_ms = ?5, updated_at_ms = ?6 WHERE id = ?1",
                 params![id, status, summary, last_error, finished_at_ms, timestamp_ms()],
-            ).map_err(|_| AppError::Internal)?;
+            ).map_err(map_local_state_error)?;
             if changed == 0 { return Err(AppError::NotFound); }
             Ok(())
         })?;
@@ -1402,7 +1490,7 @@ impl Repository {
             connection.execute(
                 "UPDATE codex_sessions SET codex_session_id = ?2, updated_at_ms = ?3 WHERE id = ?1 AND codex_session_id IS NULL",
                 params![id, codex_session_id, timestamp_ms()],
-            ).map_err(|_| AppError::Internal)?;
+            ).map_err(map_local_state_error)?;
             Ok(())
         })
     }
@@ -1412,7 +1500,7 @@ impl Repository {
             connection.execute(
                 "UPDATE codex_sessions SET provider_message_id = ?2, feishu_message_id = CASE WHEN provider = 'feishu' THEN ?2 ELSE feishu_message_id END, updated_at_ms = ?3 WHERE id = ?1",
                 params![id, message_id, timestamp_ms()],
-            ).map_err(|_| AppError::Internal)?;
+            ).map_err(map_local_state_error)?;
             Ok(())
         })
     }
@@ -1428,20 +1516,26 @@ impl Repository {
     ) -> AppResult<Vec<StoredCodexSession>> {
         self.with_connection(|connection| {
             let sql = if binding_id.is_some() {
-                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.working_directory
-                 FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id JOIN profiles p ON p.id = s.profile_id WHERE s.binding_id = ?1 ORDER BY s.started_at_ms DESC"
+                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.working_directory
+                 FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id LEFT JOIN profiles p ON p.id = s.profile_id WHERE s.binding_id = ?1 ORDER BY s.started_at_ms DESC"
             } else {
-                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.working_directory
-                 FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id JOIN profiles p ON p.id = s.profile_id ORDER BY s.started_at_ms DESC LIMIT 200"
+                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.working_directory
+                 FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id LEFT JOIN profiles p ON p.id = s.profile_id ORDER BY s.started_at_ms DESC LIMIT 200"
             };
-            let mut statement = connection.prepare(sql).map_err(|_| AppError::Internal)?;
+            let mut statement = connection.prepare(sql).map_err(map_local_state_error)?;
             let collect = |row: &rusqlite::Row<'_>| codex_session_from_row(row);
             if let Some(binding_id) = binding_id {
-                let rows = statement.query_map(params![binding_id], collect).map_err(|_| AppError::Internal)?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(|_| AppError::Internal)
+                let rows = statement
+                    .query_map(params![binding_id], collect)
+                    .map_err(map_local_state_error)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(map_local_state_error)
             } else {
-                let rows = statement.query_map([], collect).map_err(|_| AppError::Internal)?;
-                rows.collect::<Result<Vec<_>, _>>().map_err(|_| AppError::Internal)
+                let rows = statement
+                    .query_map([], collect)
+                    .map_err(map_local_state_error)?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(map_local_state_error)
             }
         })
     }
@@ -1449,11 +1543,11 @@ impl Repository {
     pub fn codex_session(&self, id: &str) -> AppResult<StoredCodexSession> {
         self.with_connection(|connection| {
             connection.query_row(
-                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.working_directory
-                 FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id JOIN profiles p ON p.id = s.profile_id WHERE s.id = ?1",
+                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.working_directory
+                 FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id LEFT JOIN profiles p ON p.id = s.profile_id WHERE s.id = ?1",
                 params![id],
                 codex_session_from_row,
-            ).map_err(|_| AppError::NotFound)
+            ).map_err(map_session_lookup_error)
         })
     }
 
@@ -1464,13 +1558,13 @@ impl Repository {
                     "SELECT COUNT(*) FROM codex_sessions WHERE binding_id = ?1 AND relay_status = 'running'",
                     params![binding_id],
                     |row| row.get(0),
-                ).map_err(|_| AppError::Internal)
+                ).map_err(map_local_state_error)
             } else {
                 connection.query_row(
                     "SELECT COUNT(*) FROM codex_sessions WHERE relay_status = 'running'",
                     [],
                     |row| row.get(0),
-                ).map_err(|_| AppError::Internal)
+                ).map_err(map_local_state_error)
             }
         })
     }
@@ -1480,7 +1574,7 @@ impl Repository {
             connection.execute(
                 "INSERT INTO codex_session_events(id, session_id, occurred_at_ms, event_type, content) VALUES(?1, ?2, ?3, ?4, ?5)",
                 params![event.id, event.session_id, event.occurred_at_ms, event.event_type, event.content],
-            ).map_err(|_| AppError::Internal)?;
+            ).map_err(map_local_state_error)?;
             Ok(())
         })
     }
@@ -1549,13 +1643,39 @@ fn collaboration_binding_from_row(
         bind_code: row.get(10)?,
         enabled: row.get(11)?,
         concurrency_limit: row.get(12)?,
-        created_at_ms: row.get(13)?,
-        updated_at_ms: row.get(14)?,
+        execution_target: row.get(13)?,
+        model_id: row.get(14)?,
+        created_at_ms: row.get(15)?,
+        updated_at_ms: row.get(16)?,
     })
 }
 
+fn system_prompt_from_config_json(value: &str) -> Option<String> {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("system_prompt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(ToOwned::to_owned)
+        })
+        .filter(|prompt| !prompt.is_empty())
+}
+
+fn map_local_state_error(_: rusqlite::Error) -> AppError {
+    AppError::LocalStateUnavailable
+}
+
+fn map_session_lookup_error(error: rusqlite::Error) -> AppError {
+    match error {
+        rusqlite::Error::QueryReturnedNoRows => AppError::NotFound,
+        _ => AppError::LocalStateUnavailable,
+    }
+}
+
 fn codex_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCodexSession> {
-    let working_directory: String = row.get(20)?;
+    let working_directory: String = row.get(22)?;
     let provider: String = row.get(2)?;
     Ok(StoredCodexSession {
         session: CodexSessionSummary {
@@ -1580,6 +1700,8 @@ fn codex_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCod
             finished_at_ms: row.get(17)?,
             summary: row.get(18)?,
             last_error: row.get(19)?,
+            execution_target: row.get(20)?,
+            model_id: row.get(21)?,
         },
         working_directory,
     })
@@ -1602,15 +1724,48 @@ fn provider_name(provider: &GatewayProvider) -> &'static str {
     }
 }
 
+fn wire_api_name(wire_api: &GatewayWireApi) -> &'static str {
+    match wire_api {
+        GatewayWireApi::Responses => "responses",
+        GatewayWireApi::ChatCompletions => "chat_completions",
+    }
+}
+
 fn parse_provider(value: &str) -> Option<GatewayProvider> {
     match value {
-        "openai" => Some(GatewayProvider::OpenAi),
-        "openai_compatible" => Some(GatewayProvider::OpenAiCompatible),
+        "openai" | "open_ai" => Some(GatewayProvider::OpenAi),
+        "openai_compatible" | "open_ai_compatible" => Some(GatewayProvider::OpenAiCompatible),
         "anthropic" => Some(GatewayProvider::Anthropic),
         "gemini" => Some(GatewayProvider::Gemini),
         "ollama" => Some(GatewayProvider::Ollama),
         _ => None,
     }
+}
+
+fn parse_wire_api(value: &str) -> Option<GatewayWireApi> {
+    match value {
+        "responses" => Some(GatewayWireApi::Responses),
+        "chat_completions" => Some(GatewayWireApi::ChatCompletions),
+        _ => None,
+    }
+}
+
+fn stored_or_identity_model_mappings(
+    models: &[String],
+    mappings: Vec<GatewayModelMapping>,
+) -> Vec<GatewayModelMapping> {
+    if !mappings.is_empty() {
+        return mappings;
+    }
+    models
+        .iter()
+        .map(|model| GatewayModelMapping {
+            model: model.clone(),
+            upstream_model: model.clone(),
+            display_name: None,
+            context_window: None,
+        })
+        .collect()
 }
 
 fn profile_kind_name(kind: &ProfileKind) -> &'static str {
@@ -1671,6 +1826,104 @@ fn table_columns(connection: &Connection, table: &str) -> AppResult<Vec<String>>
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(|_| AppError::Internal)
+}
+
+fn table_column_notnull(connection: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .and_then(|mut statement| {
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })?;
+            for row in rows {
+                let (name, notnull) = row?;
+                if name == column {
+                    return Ok(notnull != 0);
+                }
+            }
+            Ok(false)
+        })
+        .map_err(|_| AppError::Internal)
+}
+
+fn make_collaboration_profile_columns_nullable(connection: &Connection) -> AppResult<()> {
+    if table_column_notnull(connection, "collaboration_project_bindings", "profile_id")? {
+        connection
+            .execute_batch(
+                "
+                PRAGMA foreign_keys = OFF;
+                ALTER TABLE collaboration_project_bindings RENAME TO collaboration_project_bindings_notnull_profile;
+                CREATE TABLE collaboration_project_bindings (
+                  id TEXT PRIMARY KEY,
+                  provider TEXT NOT NULL,
+                  bot_id TEXT NOT NULL,
+                  project_name TEXT NOT NULL,
+                  project_slug TEXT NOT NULL,
+                  working_directory TEXT NOT NULL,
+                  profile_id TEXT,
+                  chat_id TEXT,
+                  bind_code TEXT NOT NULL UNIQUE,
+                  enabled INTEGER NOT NULL,
+                  concurrency_limit INTEGER NOT NULL,
+                  execution_target TEXT NOT NULL DEFAULT 'profile',
+                  model_id TEXT,
+                  created_at_ms INTEGER NOT NULL,
+                  updated_at_ms INTEGER NOT NULL,
+                  FOREIGN KEY(bot_id) REFERENCES collaboration_bots(id) ON DELETE CASCADE,
+                  FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+                );
+                INSERT INTO collaboration_project_bindings(id, provider, bot_id, project_name, project_slug, working_directory, profile_id, chat_id, bind_code, enabled, concurrency_limit, execution_target, model_id, created_at_ms, updated_at_ms)
+                SELECT id, provider, bot_id, project_name, project_slug, working_directory, profile_id, chat_id, bind_code, enabled, concurrency_limit, execution_target, model_id, created_at_ms, updated_at_ms
+                FROM collaboration_project_bindings_notnull_profile;
+                DROP TABLE collaboration_project_bindings_notnull_profile;
+                CREATE INDEX IF NOT EXISTS idx_collaboration_project_bindings_bot_chat
+                  ON collaboration_project_bindings(provider, bot_id, chat_id);
+                PRAGMA foreign_keys = ON;
+                ",
+            )
+            .map_err(|_| AppError::Internal)?;
+    }
+    if table_column_notnull(connection, "codex_sessions", "profile_id")? {
+        connection
+            .execute_batch(
+                "
+                PRAGMA foreign_keys = OFF;
+                ALTER TABLE codex_sessions RENAME TO codex_sessions_notnull_profile;
+                CREATE TABLE codex_sessions (
+                  id TEXT PRIMARY KEY,
+                  binding_id TEXT NOT NULL,
+                  profile_id TEXT,
+                  provider TEXT NOT NULL DEFAULT 'feishu',
+                  provider_bot_id TEXT,
+                  provider_chat_id TEXT,
+                  provider_message_id TEXT,
+                  relay_status TEXT NOT NULL,
+                  codex_session_id TEXT,
+                  feishu_message_id TEXT,
+                  feishu_chat_id TEXT,
+                  started_by TEXT,
+                  started_at_ms INTEGER NOT NULL,
+                  updated_at_ms INTEGER NOT NULL,
+                  finished_at_ms INTEGER,
+                  summary TEXT,
+                  last_error TEXT,
+                  execution_target TEXT NOT NULL DEFAULT 'profile',
+                  model_id TEXT,
+                  working_directory TEXT NOT NULL,
+                  FOREIGN KEY(binding_id) REFERENCES collaboration_project_bindings(id) ON DELETE CASCADE
+                );
+                INSERT INTO codex_sessions(id, binding_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, working_directory)
+                SELECT id, binding_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, working_directory
+                FROM codex_sessions_notnull_profile;
+                DROP TABLE codex_sessions_notnull_profile;
+                CREATE INDEX IF NOT EXISTS idx_codex_sessions_binding_status
+                  ON codex_sessions(binding_id, relay_status);
+                PRAGMA foreign_keys = ON;
+                ",
+            )
+            .map_err(|_| AppError::Internal)?;
+    }
+    Ok(())
 }
 
 fn migrate_feishu_to_collaboration(connection: &Connection) -> AppResult<()> {
@@ -1870,12 +2123,15 @@ fn parse_profile_kind(value: &str) -> Option<ProfileKind> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{profile_columns, Repository, StoredProfile};
+    use super::{profile_columns, table_columns, Repository, StoredCodexSession, StoredProfile};
     use crate::{
         domain::{
+            AppUpdateChannel, AppUpdateSettings, CodexSessionEvent, CodexSessionSummary,
             CollaborationProvider, CollaborationSummary, DesktopWorkspaceMode, GatewayProvider,
-            MaskedClientKey, MaskedProfile, ProfileKind, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+            GatewayWireApi, MaskedClientKey, MaskedProfile, ProfileKind,
+            GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
         },
+        error::AppError,
         profiles,
         secrets::MemorySecretStore,
     };
@@ -1890,11 +2146,13 @@ mod tests {
                 kind,
                 base_url: Some("https://api.example.com/v1".into()),
                 provider: GatewayProvider::OpenAi,
+                wire_api: GatewayWireApi::Responses,
                 enabled: true,
                 in_pool: true,
                 priority: 0,
                 weight: 1,
                 models: vec!["gpt-5".into()],
+                model_mappings: Vec::new(),
                 health: health.into(),
                 cooldown_until_ms: None,
                 credential_configured: true,
@@ -1905,6 +2163,130 @@ mod tests {
             secret_ref: Some(format!("profile:{id}:credential")),
             credential_fingerprint: None,
         }
+    }
+
+    fn stored_codex_session(id: &str) -> StoredCodexSession {
+        StoredCodexSession {
+            session: CodexSessionSummary {
+                id: id.into(),
+                binding_id: "binding-1".into(),
+                provider: CollaborationProvider::Feishu,
+                provider_bot_id: Some("bot-1".into()),
+                provider_chat_id: Some("chat-1".into()),
+                provider_message_id: None,
+                project_name: "Relay".into(),
+                project_slug: "relay".into(),
+                profile_id: Some("profile-1".into()),
+                profile_alias: Some("工作账号".into()),
+                relay_status: "running".into(),
+                codex_session_id: None,
+                feishu_message_id: None,
+                feishu_chat_id: Some("chat-1".into()),
+                started_by: Some("sender-1".into()),
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                finished_at_ms: None,
+                summary: Some("任务已启动。".into()),
+                last_error: None,
+                execution_target: "profile".into(),
+                model_id: None,
+            },
+            working_directory: "/tmp".into(),
+        }
+    }
+
+    #[test]
+    fn codex_session_distinguishes_missing_from_unreadable_local_state() {
+        let repository = Repository::memory();
+
+        let missing = repository.codex_session("missing").unwrap_err();
+        assert!(matches!(missing, AppError::NotFound));
+
+        repository
+            .with_connection(|connection| {
+                connection
+                    .execute("DROP TABLE codex_sessions", [])
+                    .map_err(|_| AppError::Internal)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let unreadable = repository.codex_session("missing").unwrap_err();
+        assert!(matches!(unreadable, AppError::LocalStateUnavailable));
+    }
+
+    #[test]
+    fn list_codex_sessions_reports_unreadable_local_state() {
+        let repository = Repository::memory();
+        repository
+            .with_connection(|connection| {
+                connection
+                    .execute("DROP TABLE codex_sessions", [])
+                    .map_err(|_| AppError::Internal)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = repository.list_codex_sessions(None).unwrap_err();
+        assert!(matches!(error, AppError::LocalStateUnavailable));
+    }
+
+    #[test]
+    fn insert_codex_session_reports_unreadable_local_state() {
+        let repository = Repository::memory();
+        repository
+            .with_connection(|connection| {
+                connection
+                    .execute("DROP TABLE codex_sessions", [])
+                    .map_err(|_| AppError::Internal)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = repository
+            .insert_codex_session(&stored_codex_session("session-1"))
+            .unwrap_err();
+        assert!(matches!(error, AppError::LocalStateUnavailable));
+    }
+
+    #[test]
+    fn insert_codex_session_event_reports_unreadable_local_state() {
+        let repository = Repository::memory();
+        repository
+            .with_connection(|connection| {
+                connection
+                    .execute("DROP TABLE codex_session_events", [])
+                    .map_err(|_| AppError::Internal)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = repository
+            .insert_codex_session_event(&CodexSessionEvent {
+                id: "event-1".into(),
+                session_id: "session-1".into(),
+                occurred_at_ms: 1,
+                event_type: "cancelled".into(),
+                content: "任务已取消。".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, AppError::LocalStateUnavailable));
+    }
+
+    #[test]
+    fn collaboration_schema_includes_execution_snapshot_columns() {
+        let repository = Repository::memory();
+        repository
+            .with_connection(|connection| {
+                let binding_columns = table_columns(connection, "collaboration_project_bindings")?;
+                assert!(binding_columns.contains(&"execution_target".to_owned()));
+                assert!(binding_columns.contains(&"model_id".to_owned()));
+                let session_columns = table_columns(connection, "codex_sessions")?;
+                assert!(session_columns.contains(&"execution_target".to_owned()));
+                assert!(session_columns.contains(&"model_id".to_owned()));
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1928,6 +2310,7 @@ mod tests {
                   secret_ref TEXT
                 );
                 INSERT INTO profiles VALUES ('legacy', 'Legacy', 'codex_oauth', NULL, 1, 0, 0, 1, '[]', 'unknown', NULL, 'profile:legacy:oauth');
+                INSERT INTO profiles VALUES ('legacy-api', 'Legacy API', 'api_key', 'https://api.example.com/v1', 1, 1, 0, 1, '[\"model-a\"]', 'healthy', NULL, 'profile:legacy-api:credential');
                 ",
             )
             .unwrap();
@@ -1942,6 +2325,13 @@ mod tests {
             .expect("migrated columns must be readable");
         assert!(columns.contains(&"account_email".to_owned()));
         assert!(columns.contains(&"account_subscription_json".to_owned()));
+        assert!(columns.contains(&"wire_api".to_owned()));
+        assert!(columns.contains(&"model_mappings_json".to_owned()));
+        let api_profile = repository.profile("legacy-api").unwrap().profile;
+        assert_eq!(api_profile.wire_api, GatewayWireApi::Responses);
+        assert_eq!(api_profile.model_mappings.len(), 1);
+        assert_eq!(api_profile.model_mappings[0].model, "model-a");
+        assert_eq!(api_profile.model_mappings[0].upstream_model, "model-a");
         let profile = repository.profile("legacy").unwrap().profile;
         assert!(profile.account.is_none());
         assert!(profile.credential_configured);
@@ -1996,7 +2386,7 @@ mod tests {
                   project_name TEXT NOT NULL,
                   project_slug TEXT NOT NULL,
                   working_directory TEXT NOT NULL,
-                  profile_id TEXT NOT NULL,
+                  profile_id TEXT,
                   chat_id TEXT,
                   bind_code TEXT NOT NULL UNIQUE,
                   enabled INTEGER NOT NULL,
@@ -2174,11 +2564,13 @@ mod tests {
                 kind,
                 base_url: Some("https://api.example.com/v1".into()),
                 provider: GatewayProvider::OpenAi,
+                wire_api: GatewayWireApi::Responses,
                 enabled: true,
                 in_pool: true,
                 priority: 0,
                 weight: 1,
                 models: vec!["gpt-5".into()],
+                model_mappings: Vec::new(),
                 health: health.into(),
                 cooldown_until_ms: None,
                 credential_configured: true,
@@ -2264,6 +2656,32 @@ mod tests {
             .set_setting("desktop_workspace_mode", "untrusted")
             .unwrap();
         assert!(repository.desktop_workspace_mode().is_err());
+    }
+
+    #[test]
+    fn defaults_to_stable_auto_update_settings_and_rejects_unknown_values() {
+        let repository = Repository::memory();
+        assert_eq!(
+            repository.app_update_settings().unwrap(),
+            AppUpdateSettings {
+                channel: AppUpdateChannel::Stable,
+                auto_check: true,
+            }
+        );
+        repository
+            .set_app_update_settings(AppUpdateChannel::Beta, false)
+            .unwrap();
+        assert_eq!(
+            repository.app_update_settings().unwrap(),
+            AppUpdateSettings {
+                channel: AppUpdateChannel::Beta,
+                auto_check: false,
+            }
+        );
+        repository
+            .set_setting("app_update_channel", "nightly")
+            .unwrap();
+        assert!(repository.app_update_settings().is_err());
     }
 
     fn insert_test_client_key(repository: &Repository, id: &str, name: &str, secret_ref: &str) {

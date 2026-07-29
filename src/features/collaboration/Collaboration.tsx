@@ -17,6 +17,7 @@ import { FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import type {
   CodexSessionSummary,
   CollaborationCallbackStatus,
+  CollaborationExecutionTarget,
   CollaborationProjectBinding,
   CollaborationProvider,
   MaskedCollaborationBot,
@@ -39,6 +40,7 @@ interface CollaborationProps {
   bindings: CollaborationProjectBinding[];
   sessions: CodexSessionSummary[];
   profiles: MaskedProfile[];
+  gatewayModelOptions: string[];
   busy: boolean;
   onSaveBot: (input: Record<string, unknown>) => Promise<void>;
   onTestBot: (id: string) => Promise<void>;
@@ -138,6 +140,7 @@ export function Collaboration({
   bindings,
   sessions,
   profiles,
+  gatewayModelOptions,
   busy,
   onSaveBot,
   onTestBot,
@@ -214,6 +217,7 @@ export function Collaboration({
               busy={busy}
               bots={selectedBots}
               profiles={codexProfiles}
+              gatewayModelOptions={gatewayModelOptions}
               onSubmit={onSaveBinding}
             />
           ) : (
@@ -226,6 +230,7 @@ export function Collaboration({
             <BotList
               bots={selectedBots}
               busy={busy}
+              onSaveBot={onSaveBot}
               onTest={onTestBot}
               onDelete={onDeleteBot}
               onRegisterDiscordCommands={onRegisterDiscordCommands}
@@ -519,6 +524,7 @@ function BotForm({
 }) {
   const [name, setName] = useState("");
   const [values, setValues] = useState<Record<string, string>>({});
+  const [systemPrompt, setSystemPrompt] = useState("");
   const meta = providerMeta(provider);
   const fields = providerFields(provider);
   const setField = (key: string, value: string) =>
@@ -531,11 +537,13 @@ function BotForm({
       name,
       enabled: true,
       confirmed: true,
+      system_prompt: systemPrompt,
     };
     for (const field of fields) payload[field.key] = values[field.key] ?? "";
     await onSubmit(payload);
     setName("");
     setValues({});
+    setSystemPrompt("");
   };
   return (
     <section className="form-sheet">
@@ -569,6 +577,18 @@ function BotForm({
             />
           </label>
         ))}
+        <label>
+          机器人专属提示词（可选）
+          <textarea
+            aria-label="机器人专属提示词（可选）"
+            value={systemPrompt}
+            placeholder="例如：你是本项目的代码评审助手，回复请优先给出结论、变更文件和验证命令。"
+            onChange={(event) => setSystemPrompt(event.target.value)}
+          />
+          <p className="form-note">
+            这段提示词会自动附加到该机器人发起的新任务和继续任务，不会展示给群成员。
+          </p>
+        </label>
         <p className="form-note">{providerNote(provider)}</p>
         <div className="form-actions">
           <button className="primary-button" disabled={busy} type="submit">
@@ -583,11 +603,13 @@ function BotForm({
 function BindingForm({
   bots,
   profiles,
+  gatewayModelOptions,
   busy,
   onSubmit,
 }: {
   bots: MaskedCollaborationBot[];
   profiles: MaskedProfile[];
+  gatewayModelOptions: string[];
   busy: boolean;
   onSubmit: (input: Record<string, unknown>) => Promise<void>;
 }) {
@@ -597,6 +619,21 @@ function BindingForm({
   const [slug, setSlug] = useState("");
   const [directory, setDirectory] = useState("");
   const [limit, setLimit] = useState(2);
+  const [executionTarget, setExecutionTarget] =
+    useState<CollaborationExecutionTarget>("profile");
+  const [modelId, setModelId] = useState("");
+  const gatewayModelSelectOptions = useMemo(() => {
+    return Array.from(new Set(gatewayModelOptions))
+      .sort((left, right) => left.localeCompare(right))
+      .map((model) => ({ value: model, label: model }));
+  }, [gatewayModelOptions]);
+  const projectSlug = slugify(slug || name);
+  const slugMissing = Boolean(name.trim()) && !projectSlug;
+  useEffect(() => {
+    if (executionTarget === "gateway" && profileId) {
+      setProfileId("");
+    }
+  }, [executionTarget, profileId]);
   const selectDirectory = async () => {
     const selected = await open({
       title: "选择协作项目工作目录",
@@ -607,27 +644,31 @@ function BindingForm({
   };
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (slugMissing) return;
     await onSubmit({
       id: null,
       bot_id: botId,
       project_name: name,
-      project_slug: slug || slugify(name),
+      project_slug: projectSlug,
       working_directory: directory,
-      profile_id: profileId,
+      profile_id: executionTarget === "profile" ? profileId : null,
       enabled: true,
       concurrency_limit: limit,
+      execution_target: executionTarget,
+      model_id: executionTarget === "gateway" ? modelId : null,
       confirmed: true,
     });
     setName("");
     setSlug("");
     setDirectory("");
+    setModelId("");
   };
   return (
     <section className="form-sheet">
       <div className="form-sheet-heading">
         <div>
           <h2>绑定本机项目</h2>
-          <p>选择机器人和 Codex 档案，目录只在本机使用。</p>
+          <p>选择机器人、执行方式和本机目录。</p>
         </div>
         <LinkSimple size={24} />
       </div>
@@ -648,20 +689,67 @@ function BindingForm({
             value={botId}
           />
         </label>
+        {executionTarget === "profile" && (
+          <label>
+            Codex 档案
+            <Select
+              ariaLabel="Codex 档案"
+              disabled={!profiles.length}
+              onValueChange={setProfileId}
+              options={profiles.map((profile) => ({
+                value: profile.id,
+                label: profile.alias,
+              }))}
+              placeholder={profiles.length ? "选择档案" : "暂无可用档案"}
+              value={profileId}
+            />
+          </label>
+        )}
         <label>
-          Codex 档案
+          执行方式
           <Select
-            ariaLabel="Codex 档案"
-            disabled={!profiles.length}
-            onValueChange={setProfileId}
-            options={profiles.map((profile) => ({
-              value: profile.id,
-              label: profile.alias,
-            }))}
-            placeholder={profiles.length ? "选择档案" : "暂无可用档案"}
-            value={profileId}
+            ariaLabel="执行方式"
+            onValueChange={(value) => {
+              setExecutionTarget(value as CollaborationExecutionTarget);
+              setModelId("");
+            }}
+            options={[
+              {
+                value: "profile",
+                label: "Codex 档案直连",
+                description: "沿用所选档案凭据启动 Codex",
+              },
+              {
+                value: "gateway",
+                label: "API 服务网关",
+                description: "请求发送到 Relay /v1 网关并按账号池路由",
+              },
+            ]}
+            value={executionTarget}
           />
         </label>
+        {executionTarget === "gateway" && (
+          <label>
+            默认模型
+            <Select
+              ariaLabel="默认模型"
+              disabled={!gatewayModelSelectOptions.length}
+              onValueChange={setModelId}
+              options={gatewayModelSelectOptions}
+              placeholder={
+                gatewayModelSelectOptions.length
+                  ? "选择网关模型"
+                  : "请先为网关账号池刷新模型"
+              }
+              value={modelId}
+            />
+            {!gatewayModelSelectOptions.length && (
+              <p className="form-note error-note">
+                先刷新可用模型，并确认至少一个账号已启用、加入网关账号池且状态可用。
+              </p>
+            )}
+          </label>
+        )}
         <label>
           项目名称
           <input
@@ -678,6 +766,12 @@ function BindingForm({
             onChange={(event) => setSlug(event.target.value)}
             placeholder={name ? slugify(name) : "例如 relay"}
           />
+          {slugMissing && (
+            <p className="form-note error-note">
+              群命令项目名需要至少包含一个英文字母或数字；中文项目名请手动填写，例如
+              relay。
+            </p>
+          )}
         </label>
         <label>
           单项目并发上限
@@ -702,7 +796,15 @@ function BindingForm({
         <div className="form-actions">
           <button
             className="primary-button"
-            disabled={busy || !botId || !profileId || !name || !directory}
+            disabled={
+              busy ||
+              !botId ||
+              (executionTarget === "profile" && !profileId) ||
+              !name ||
+              slugMissing ||
+              !directory ||
+              (executionTarget === "gateway" && !modelId)
+            }
             type="submit"
           >
             创建绑定
@@ -716,18 +818,40 @@ function BindingForm({
 function BotList({
   bots,
   busy,
+  onSaveBot,
   onTest,
   onDelete,
   onRegisterDiscordCommands,
 }: {
   bots: MaskedCollaborationBot[];
   busy: boolean;
+  onSaveBot: (input: Record<string, unknown>) => Promise<void>;
   onTest: (id: string) => Promise<void>;
   onDelete: (id: string, name: string) => void;
   onRegisterDiscordCommands: (id: string) => Promise<void>;
 }) {
+  const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
+  const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
+  const editPrompt = (bot: MaskedCollaborationBot) => {
+    setEditingPromptId(bot.id);
+    setPromptDrafts((current) => ({
+      ...current,
+      [bot.id]: current[bot.id] ?? bot.system_prompt ?? "",
+    }));
+  };
+  const savePrompt = async (bot: MaskedCollaborationBot) => {
+    await onSaveBot({
+      id: bot.id,
+      provider: bot.provider,
+      name: bot.name,
+      enabled: bot.enabled,
+      confirmed: true,
+      system_prompt: promptDrafts[bot.id] ?? "",
+    });
+    setEditingPromptId(null);
+  };
   return (
-    <section className="panel-card">
+    <section className="flat-panel">
       <div className="card-heading">
         <div>
           <h2>机器人连接</h2>
@@ -759,8 +883,54 @@ function BotList({
                   </small>
                 )}
                 {bot.last_error && <small>{bot.last_error}</small>}
+                {bot.system_prompt && (
+                  <small className="prompt-state">已配置专属提示词</small>
+                )}
+                {editingPromptId === bot.id && (
+                  <div className="prompt-editor">
+                    <label>
+                      机器人专属提示词
+                      <textarea
+                        value={promptDrafts[bot.id] ?? ""}
+                        placeholder="输入该机器人发起任务时自动附加的提示词"
+                        onChange={(event) =>
+                          setPromptDrafts((current) => ({
+                            ...current,
+                            [bot.id]: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <div className="prompt-editor-actions">
+                      <button
+                        className="quiet-button"
+                        disabled={busy}
+                        type="button"
+                        onClick={() => void savePrompt(bot)}
+                      >
+                        保存提示词
+                      </button>
+                      <button
+                        className="text-button"
+                        disabled={busy}
+                        type="button"
+                        onClick={() => setEditingPromptId(null)}
+                      >
+                        取消编辑
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
               <div className="channel-actions">
+                <button
+                  className="quiet-button"
+                  disabled={busy}
+                  type="button"
+                  onClick={() => editPrompt(bot)}
+                >
+                  编辑提示词
+                </button>
                 {bot.provider === "discord" && (
                   <button
                     className="quiet-button"
@@ -811,7 +981,7 @@ function BindingList({
   onDelete: (id: string, name: string) => void;
 }) {
   return (
-    <section className="panel-card">
+    <section className="flat-panel">
       <div className="card-heading">
         <div>
           <h2>群项目绑定</h2>
@@ -835,9 +1005,33 @@ function BindingList({
                 </div>
                 <p>
                   {providerLabel(binding.provider)} · /codex run {binding.project_slug}{" "}
-                  … · {binding.profile_alias}
+                  …
                 </p>
-                <small>绑定码：{binding.bind_code}</small>
+                <dl
+                  className="binding-facts"
+                  aria-label={`${binding.project_name} 执行设置`}
+                >
+                  <div>
+                    <dt>执行方式</dt>
+                    <dd>{bindingExecutionLabel(binding)}</dd>
+                  </div>
+                  <div>
+                    <dt>模型 / 档案</dt>
+                    <dd>
+                      {binding.execution_target === "gateway"
+                        ? (binding.model_id ?? "默认网关模型")
+                        : profileAliasLabel(binding.profile_alias)}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>绑定码</dt>
+                    <dd>{binding.bind_code}</dd>
+                  </div>
+                  <div>
+                    <dt>群状态</dt>
+                    <dd>{binding.chat_id ? "已绑定" : "待绑定"}</dd>
+                  </div>
+                </dl>
               </div>
               <div className="channel-actions">
                 <button
@@ -875,7 +1069,7 @@ function SessionList({
 }) {
   const [continueText, setContinueText] = useState<Record<string, string>>({});
   return (
-    <section className="panel-card sessions-panel" data-animate="cards">
+    <section className="flat-panel sessions-panel" data-animate="cards">
       <div className="card-heading">
         <div>
           <h2>Codex 会话</h2>
@@ -892,16 +1086,22 @@ function SessionList({
                 <div>
                   <h2>{session.project_name}</h2>
                   <span
-                    className={`status-pill compact ${session.relay_status === "running" ? "success" : "neutral"}`}
+                    className={`status-pill compact ${sessionStatusClass(session.relay_status)}`}
                   >
                     <i /> {sessionStatusLabel(session.relay_status)}
                   </span>
                 </div>
                 <p>
                   {providerLabel(session.provider)} · {shortId(session.id)} ·{" "}
-                  {session.profile_alias}
+                  {profileAliasLabel(session.profile_alias)} ·{" "}
+                  {sessionExecutionLabel(session)}
                 </p>
-                <small>{session.summary ?? session.last_error ?? "暂无摘要"}</small>
+                <small>{session.summary ?? "暂无摘要"}</small>
+                {session.relay_status === "failed" && session.last_error && (
+                  <small className="session-error">
+                    失败原因：{session.last_error}
+                  </small>
+                )}
                 {session.codex_session_id && (
                   <small>Codex session：{shortId(session.codex_session_id)}</small>
                 )}
@@ -1066,6 +1266,22 @@ function setupSteps(
   ];
 }
 
+function bindingExecutionLabel(binding: CollaborationProjectBinding) {
+  return binding.execution_target === "gateway"
+    ? `API 网关${binding.model_id ? ` · ${binding.model_id}` : ""}`
+    : "档案直连";
+}
+
+function sessionExecutionLabel(session: CodexSessionSummary) {
+  return session.execution_target === "gateway"
+    ? `API 网关${session.model_id ? ` · ${session.model_id}` : ""}`
+    : "档案直连";
+}
+
+function profileAliasLabel(alias: string | null) {
+  return alias?.trim() || "网关全局设置";
+}
+
 function providerFields(provider: CollaborationProvider) {
   return {
     feishu: [
@@ -1207,6 +1423,10 @@ function statusClass(status: string) {
     : status === "failed"
       ? "danger"
       : "neutral";
+}
+
+function sessionStatusClass(status: string) {
+  return status === "running" ? "success" : status === "failed" ? "danger" : "neutral";
 }
 
 function sessionStatusLabel(status: string) {

@@ -3,8 +3,17 @@ import { invoke } from "@tauri-apps/api/core";
 export type ProfileKind = "api_key" | "codex_oauth";
 export type GatewayProvider =
   "openai" | "openai_compatible" | "anthropic" | "gemini" | "ollama";
+export type GatewayWireApi = "responses" | "chat_completions";
 export type CodexAuthMode = "oauth" | "agent_identity" | "personal_access_token";
 export type DesktopWorkspaceMode = "fresh" | "per_profile" | "shared";
+export type AppUpdateChannel = "stable" | "beta";
+
+export interface GatewayModelMapping {
+  model: string;
+  upstream_model: string;
+  display_name: string | null;
+  context_window: number | null;
+}
 
 export interface MaskedProfile {
   id: string;
@@ -12,11 +21,13 @@ export interface MaskedProfile {
   kind: ProfileKind;
   base_url: string | null;
   provider?: GatewayProvider;
+  wire_api?: GatewayWireApi;
   enabled: boolean;
   in_pool: boolean;
   priority: number;
   weight: number;
   models: string[];
+  model_mappings?: GatewayModelMapping[];
   health: string;
   cooldown_until_ms: number | null;
   credential_configured: boolean;
@@ -49,6 +60,8 @@ export interface JsonProfileImportResultItem {
   alias: string;
   action: "created" | "updated" | "skipped" | "failed";
   message: string;
+  profile_id: string | null;
+  auth_mode: CodexAuthMode | null;
 }
 
 export interface JsonProfileImportResult {
@@ -140,6 +153,13 @@ export interface GatewayNetworkAddress {
   is_default: boolean;
 }
 
+export interface GatewayOAuthProfileOption {
+  id: string;
+  alias: string;
+  available: boolean;
+  reason: string | null;
+}
+
 export interface GatewayCodexConfigStatus {
   enabled: boolean;
   config_path: string;
@@ -147,6 +167,10 @@ export interface GatewayCodexConfigStatus {
   message: string;
   auth_status: "ok" | "missing" | "legacy" | "invalid";
   needs_repair: boolean;
+  oauth_profile_id: string | null;
+  oauth_profile_alias: string | null;
+  oauth_profile_available: boolean;
+  oauth_profile_options: GatewayOAuthProfileOption[];
 }
 
 export interface ApiServiceTestReport {
@@ -180,6 +204,7 @@ export interface MaskedClientKey {
 }
 
 export type CollaborationProvider = "feishu" | "qq" | "wecom" | "discord" | "telegram";
+export type CollaborationExecutionTarget = "profile" | "gateway";
 export type CollaborationBotStatus =
   | "disabled"
   | "configured"
@@ -199,6 +224,7 @@ export interface MaskedCollaborationBot {
   config_summary: string;
   callback_public_url: string | null;
   last_error: string | null;
+  system_prompt: string | null;
   updated_at_ms: number;
 }
 
@@ -210,12 +236,14 @@ export interface CollaborationProjectBinding {
   project_name: string;
   project_slug: string;
   working_directory: string;
-  profile_id: string;
-  profile_alias: string;
+  profile_id: string | null;
+  profile_alias: string | null;
   chat_id: string | null;
   bind_code: string;
   enabled: boolean;
   concurrency_limit: number;
+  execution_target: CollaborationExecutionTarget;
+  model_id: string | null;
   created_at_ms: number;
   updated_at_ms: number;
 }
@@ -266,12 +294,14 @@ export interface CodexSessionSummary {
   provider_message_id: string | null;
   project_name: string;
   project_slug: string;
-  profile_id: string;
-  profile_alias: string;
+  profile_id: string | null;
+  profile_alias: string | null;
   relay_status: CodexSessionStatus;
   codex_session_id: string | null;
   feishu_message_id: string | null;
   feishu_chat_id: string | null;
+  execution_target: CollaborationExecutionTarget;
+  model_id: string | null;
   started_by: string | null;
   started_at_ms: number;
   updated_at_ms: number;
@@ -324,6 +354,19 @@ export interface CurrentProfileActivation {
 
 export interface DesktopWorkspaceSettings {
   mode: DesktopWorkspaceMode;
+}
+
+export interface AppUpdateSettings {
+  channel: AppUpdateChannel;
+  auto_check: boolean;
+}
+
+export interface AppUpdateInfo {
+  version: string;
+  current_version: string;
+  body: string | null;
+  date: string | null;
+  channel: AppUpdateChannel;
 }
 
 export interface DesktopWorkspaceHistoryItem {
@@ -381,6 +424,13 @@ export async function relayInvoke<T>(command: string, args?: Record<string, unkn
           : "本机操作未完成。";
       throw new RelayError(code, `${message}（错误码：${code}）${recoveryFor(code)}`);
     }
+    if (typeof error === "string" && error.trim()) {
+      const code = "internal";
+      throw new RelayError(
+        code,
+        `${error.trim()}（错误码：${code}）${recoveryFor(code)}`,
+      );
+    }
     throw new RelayError(
       "internal",
       "本机操作未完成。（错误码：internal）请重启 Codex Relay；若仍出现，请保留该错误码后重试。",
@@ -392,6 +442,8 @@ function recoveryFor(code: string) {
   return (
     {
       internal: "请重启 Codex Relay；若仍出现，请保留该错误码后重试。",
+      local_state_unavailable:
+        "请在协作页刷新机器人连接；若仍出现，请重启 Codex Relay 并保留该错误码。",
       runtime_unavailable: "请确认 Codex CLI 可用后重试。",
       secret_store_unavailable: "请解锁系统安全存储后重试。",
       keychain_interaction_required:
@@ -399,6 +451,9 @@ function recoveryFor(code: string) {
       profile_credential_migration_required:
         "该档案由旧版应用保存；请使用“更新凭据”重新完成一次 OAuth。",
       profile_runtime_unavailable: "请重新授权该 OAuth 档案后重试。",
+      gateway_model_unavailable:
+        "请刷新可用模型，并确认对应账号已启用且加入网关账号池。",
+      app_update_unavailable: "请检查网络连接，或稍后在设置页手动检查软件更新。",
       auth_file_write_failed: "请确认默认 .codex 目录可写后重试。",
       codex_keychain_unavailable:
         "请解锁 macOS 钥匙串并允许 Codex Relay 写入“Codex Auth”后重试。",
@@ -410,6 +465,8 @@ export const api = {
   dashboard: () => relayInvoke<DashboardSnapshot>("dashboard_snapshot"),
   createProfile: (input: Record<string, unknown>) =>
     relayInvoke<MaskedProfile>("create_profile", { input }),
+  createApiServiceProfile: (input: Record<string, unknown>) =>
+    relayInvoke<MaskedProfile>("create_api_service_profile", { input }),
   updateProfile: (input: Record<string, unknown>) =>
     relayInvoke<MaskedProfile>("update_profile", { input }),
   syncProfileAccountInfo: (id: string) =>
@@ -430,6 +487,22 @@ export const api = {
   updateDesktopWorkspaceSettings: (mode: DesktopWorkspaceMode) =>
     relayInvoke<DesktopWorkspaceSettings>("update_desktop_workspace_settings", {
       input: { mode },
+    }),
+  appUpdateSettings: () => relayInvoke<AppUpdateSettings>("app_update_settings"),
+  updateAppUpdateSettings: (settings: AppUpdateSettings) =>
+    relayInvoke<AppUpdateSettings>("update_app_update_settings", {
+      input: {
+        channel: settings.channel,
+        auto_check: settings.auto_check,
+      },
+    }),
+  checkAppUpdate: (channel?: AppUpdateChannel | null) =>
+    relayInvoke<AppUpdateInfo | null>("check_app_update", {
+      input: { channel: channel ?? null },
+    }),
+  installAppUpdate: (channel?: AppUpdateChannel | null) =>
+    relayInvoke<void>("install_app_update", {
+      input: { channel: channel ?? null },
     }),
   listDesktopWorkspaces: () =>
     relayInvoke<DesktopWorkspaceHistoryItem[]>("list_desktop_workspaces"),
@@ -467,6 +540,11 @@ export const api = {
     relayInvoke<GatewayCodexConfigStatus>("enable_codex_gateway"),
   disableCodexGateway: () =>
     relayInvoke<GatewayCodexConfigStatus>("disable_codex_gateway"),
+  setCodexGatewayOAuthProfile: (profileId: string | null) =>
+    relayInvoke<GatewayCodexConfigStatus>("set_codex_gateway_oauth_profile", {
+      input: { profile_id: profileId, confirmed: true },
+    }),
+  listGatewayModelOptions: () => relayInvoke<string[]>("list_gateway_model_options"),
   activateApiServiceProfile: (id: string) =>
     relayInvoke<GatewayCodexConfigStatus>("activate_api_service_profile", { id }),
   listClientKeys: () => relayInvoke<MaskedClientKey[]>("list_client_keys"),

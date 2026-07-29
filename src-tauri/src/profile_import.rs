@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    codex_runtime::{CodexRuntime, ImportAuthVerification},
+    codex_runtime::{CodexRuntime, ImportAuthVerification, ImportAuthVerificationSource},
     database::Repository,
     domain::{
         CodexAuthMode, CommitJsonProfileImportInput, DiscardJsonProfileImportInput,
@@ -272,9 +272,12 @@ impl JsonProfileImportStore {
             }
             if candidate.status != ImportStatus::Valid {
                 result.failed += 1;
-                result
-                    .items
-                    .push(result_item(&candidate, "failed", "该项尚未通过验证。"));
+                result.items.push(result_item(
+                    &candidate,
+                    "failed",
+                    "该项尚未通过验证。",
+                    None,
+                ));
                 continue;
             }
             let account = imported_account_summary(
@@ -303,6 +306,7 @@ impl JsonProfileImportStore {
                         &candidate,
                         "failed",
                         "无法安全读取已有凭据，未覆盖该档案。",
+                        None,
                     ));
                     continue;
                 }
@@ -317,7 +321,7 @@ impl JsonProfileImportStore {
                     account,
                 )
                 .await
-                .map(|_| "updated"),
+                .map(|profile| ("updated", profile.id)),
                 None => create_imported_profile(
                     repository,
                     secrets.clone(),
@@ -327,20 +331,26 @@ impl JsonProfileImportStore {
                     account,
                 )
                 .await
-                .map(|_| "created"),
+                .map(|profile| ("created", profile.id)),
             };
             match outcome {
-                Ok("created") => {
+                Ok(("created", profile_id)) => {
                     result.created += 1;
-                    result
-                        .items
-                        .push(result_item(&candidate, "created", "档案已创建。"));
+                    result.items.push(result_item(
+                        &candidate,
+                        "created",
+                        "档案已创建。",
+                        Some(profile_id),
+                    ));
                 }
-                Ok(_) => {
+                Ok((_, profile_id)) => {
                     result.updated += 1;
-                    result
-                        .items
-                        .push(result_item(&candidate, "updated", "已有档案的凭据已更新。"));
+                    result.items.push(result_item(
+                        &candidate,
+                        "updated",
+                        "已有档案的凭据已更新。",
+                        Some(profile_id),
+                    ));
                 }
                 Err(_) => {
                     result.failed += 1;
@@ -348,6 +358,7 @@ impl JsonProfileImportStore {
                         &candidate,
                         "failed",
                         "安全存储或数据库写入未完成。",
+                        None,
                     ));
                 }
             }
@@ -379,17 +390,35 @@ async fn verify_candidate(candidate: &mut ImportCandidate, runtime: &CodexRuntim
         .await
     {
         Ok(verification) => {
+            let source = verification.source;
             hydrate_candidate_identity(candidate, verification);
-            candidate.message = if candidate.existing_profile_id.is_some() {
-                "已验证；导入后会更新已有档案。".to_owned()
-            } else {
-                "已验证，可导入。".to_owned()
+            candidate.message = match (source, candidate.existing_profile_id.is_some()) {
+                (ImportAuthVerificationSource::DirectApi, true) => {
+                    "app-server 拒绝但 ChatGPT 直连验证通过；导入后会更新已有档案。".to_owned()
+                }
+                (ImportAuthVerificationSource::DirectApi, false) => {
+                    "app-server 拒绝但 ChatGPT 直连验证通过，可导入。".to_owned()
+                }
+                (_, true) => "已验证；导入后会更新已有档案。".to_owned(),
+                (_, false) => "已验证，可导入。".to_owned(),
             };
             ImportStatus::Valid
         }
         Err(AppError::ProfileRuntimeUnavailable) => {
-            candidate.message = "凭据已被上游拒绝。".to_owned();
+            candidate.message = if candidate.has_refresh_token {
+                "refresh_token 刷新失败，或直连验证也被上游拒绝。".to_owned()
+            } else {
+                "access token 直连验证也被上游拒绝。".to_owned()
+            };
             ImportStatus::Invalid
+        }
+        Err(AppError::RuntimeUnavailable) | Err(AppError::UpstreamUnavailable) => {
+            candidate.message = if candidate.has_refresh_token {
+                "refresh_token 刷新或直连验证暂时不可达；请稍后重试预检。".to_owned()
+            } else {
+                "app-server 未验证通过，直连验证暂时不可达；请稍后重试预检。".to_owned()
+            };
+            ImportStatus::Unverified
         }
         Err(_) => {
             candidate.message = "暂时无法联网验证，请稍后重试预检。".to_owned();
@@ -508,10 +537,20 @@ fn entries_from_json(value: Value, file_name: &str) -> AppResult<Vec<ImportEntry
             .iter()
             .enumerate()
             .map(|(index, account)| {
-                let supported = account.get("platform").and_then(Value::as_str) == Some("openai")
-                    && account.get("type").and_then(Value::as_str) == Some("oauth");
+                let supported = account
+                    .get("platform")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("openai"))
+                    && account
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("oauth"));
                 ImportEntry {
-                    value: account.get("credentials").cloned().unwrap_or(Value::Null),
+                    value: if supported {
+                        account.clone()
+                    } else {
+                        account.get("credentials").cloned().unwrap_or(Value::Null)
+                    },
                     alias: account
                         .get("name")
                         .and_then(Value::as_str)
@@ -539,13 +578,20 @@ fn entries_from_json(value: Value, file_name: &str) -> AppResult<Vec<ImportEntry
                 fallback_alias: format!("{} #{}", file_stem(file_name), index + 1),
             })
             .collect()),
-        value => Ok(vec![ImportEntry {
-            value,
-            alias: None,
-            source: "JSON 文件".to_owned(),
-            supported: true,
-            fallback_alias: file_stem(file_name).to_owned(),
-        }]),
+        value => {
+            let source = if value.get("credentials").is_some() {
+                "credentials 包裹 JSON".to_owned()
+            } else {
+                "JSON 文件".to_owned()
+            };
+            Ok(vec![ImportEntry {
+                value,
+                alias: None,
+                source,
+                supported: true,
+                fallback_alias: file_stem(file_name).to_owned(),
+            }])
+        }
     }
 }
 
@@ -647,24 +693,72 @@ struct ParsedCredential {
 }
 
 fn parse_credential(value: &Value) -> Result<ParsedCredential, String> {
-    if let Some(token) = value.as_str() {
-        return parse_token_value(token, None, None, None, None);
+    let wrapper = value.as_object();
+    let payload = wrapper
+        .and_then(|object| object.get("credentials"))
+        .unwrap_or(value);
+    if let Some(token) = payload.as_str() {
+        return parse_token_value(
+            token,
+            string_at_any(
+                payload.as_object(),
+                wrapper,
+                &[&["email"], &["user", "email"]],
+            ),
+            string_at_any(
+                payload.as_object(),
+                wrapper,
+                &[
+                    &["account_id"],
+                    &["accountId"],
+                    &["chatgpt_account_id"],
+                    &["chatgptAccountId"],
+                ],
+            ),
+            string_at_any(
+                payload.as_object(),
+                wrapper,
+                &[&["plan_type"], &["planType"]],
+            ),
+            None,
+        );
     }
-    let object = value
+    let object = payload
         .as_object()
         .ok_or_else(|| "JSON 项必须是对象或 token 字符串。".to_owned())?;
-    let auth_mode = string_at(object, &["auth_mode"]).or_else(|| string_at(object, &["authMode"]));
-    if auth_mode.as_deref() == Some("agent_identity") || object.contains_key("agent_identity") {
+    let auth_mode = string_at_any(Some(object), wrapper, &[&["auth_mode"], &["authMode"]]);
+    if is_agent_identity_mode(auth_mode.as_deref())
+        || object.contains_key("agent_identity")
+        || object.contains_key("agentIdentity")
+        || looks_like_agent_identity_object(object)
+    {
         let identity = object
             .get("agent_identity")
+            .or_else(|| object.get("agentIdentity"))
             .cloned()
-            .ok_or_else(|| "Agent Identity 缺少 agent_identity。".to_owned())?;
+            .or_else(|| {
+                if looks_like_agent_identity_object(object) {
+                    Some(Value::Object(object.clone()))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| "Agent Identity 缺少 agent_identity/agentIdentity。".to_owned())?;
+        let identity = canonical_agent_identity(identity)?;
         validate_agent_identity(&identity)?;
-        let account_id = string_at(object, &["agent_identity", "account_id"])
-            .or_else(|| string_at(object, &["agent_identity", "accountId"]));
-        let email = string_at(object, &["agent_identity", "email"]);
-        let plan_type = string_at(object, &["agent_identity", "plan_type"])
-            .or_else(|| string_at(object, &["agent_identity", "planType"]));
+        let identity_object = identity.as_object();
+        let account_id = string_at_any(
+            identity_object,
+            wrapper,
+            &[
+                &["account_id"],
+                &["accountId"],
+                &["chatgpt_account_id"],
+                &["chatgptAccountId"],
+            ],
+        );
+        let email = string_at_any(identity_object, wrapper, &[&["email"], &["user", "email"]]);
+        let plan_type = string_at_any(identity_object, wrapper, &[&["plan_type"], &["planType"]]);
         let auth_json = json!({"auth_mode":"agent_identity","agent_identity":identity}).to_string();
         return Ok(ParsedCredential {
             auth_mode: CodexAuthMode::AgentIdentity,
@@ -681,38 +775,84 @@ fn parse_credential(value: &Value) -> Result<ParsedCredential, String> {
         });
     }
     let pat = string_at(object, &["personal_access_token"])
-        .or_else(|| string_at(object, &["personalAccessToken"]));
+        .or_else(|| string_at(object, &["personalAccessToken"]))
+        .or_else(|| {
+            string_at_any(
+                None,
+                wrapper,
+                &[&["personal_access_token"], &["personalAccessToken"]],
+            )
+        });
     let access = string_at(object, &["tokens", "access_token"])
         .or_else(|| string_at(object, &["tokens", "accessToken"]))
+        .or_else(|| string_at(object, &["credentials", "access_token"]))
+        .or_else(|| string_at(object, &["credentials", "accessToken"]))
         .or_else(|| string_at(object, &["access_token"]))
         .or_else(|| string_at(object, &["accessToken"]))
         .or_else(|| string_at(object, &["session", "access_token"]))
-        .or_else(|| string_at(object, &["session", "accessToken"]));
+        .or_else(|| string_at(object, &["session", "accessToken"]))
+        .or_else(|| string_at_any(None, wrapper, &[&["access_token"], &["accessToken"]]));
     let refresh = string_at(object, &["tokens", "refresh_token"])
         .or_else(|| string_at(object, &["tokens", "refreshToken"]))
+        .or_else(|| string_at(object, &["credentials", "refresh_token"]))
+        .or_else(|| string_at(object, &["credentials", "refreshToken"]))
         .or_else(|| string_at(object, &["refresh_token"]))
         .or_else(|| string_at(object, &["refreshToken"]))
         .or_else(|| string_at(object, &["session", "refresh_token"]))
-        .or_else(|| string_at(object, &["session", "refreshToken"]));
+        .or_else(|| string_at(object, &["session", "refreshToken"]))
+        .or_else(|| string_at_any(None, wrapper, &[&["refresh_token"], &["refreshToken"]]));
     let id_token = string_at(object, &["tokens", "id_token"])
         .or_else(|| string_at(object, &["tokens", "idToken"]))
+        .or_else(|| string_at(object, &["credentials", "id_token"]))
+        .or_else(|| string_at(object, &["credentials", "idToken"]))
         .or_else(|| string_at(object, &["id_token"]))
         .or_else(|| string_at(object, &["idToken"]))
         .or_else(|| string_at(object, &["session", "id_token"]))
-        .or_else(|| string_at(object, &["session", "idToken"]));
-    let email = string_at(object, &["email"])
-        .or_else(|| string_at(object, &["user", "email"]))
-        .or_else(|| string_at(object, &["session", "email"]));
+        .or_else(|| string_at(object, &["session", "idToken"]))
+        .or_else(|| string_at_any(None, wrapper, &[&["id_token"], &["idToken"]]));
+    let email = string_at_any(
+        Some(object),
+        wrapper,
+        &[&["email"], &["user", "email"], &["session", "email"]],
+    );
     let account_id = string_at(object, &["tokens", "account_id"])
         .or_else(|| string_at(object, &["tokens", "accountId"]))
+        .or_else(|| string_at(object, &["tokens", "chatgpt_account_id"]))
+        .or_else(|| string_at(object, &["tokens", "chatgptAccountId"]))
+        .or_else(|| string_at(object, &["credentials", "account_id"]))
+        .or_else(|| string_at(object, &["credentials", "accountId"]))
+        .or_else(|| string_at(object, &["credentials", "chatgpt_account_id"]))
+        .or_else(|| string_at(object, &["credentials", "chatgptAccountId"]))
         .or_else(|| string_at(object, &["account_id"]))
         .or_else(|| string_at(object, &["accountId"]))
+        .or_else(|| string_at(object, &["chatgpt_account_id"]))
+        .or_else(|| string_at(object, &["chatgptAccountId"]))
         .or_else(|| string_at(object, &["session", "account_id"]))
-        .or_else(|| string_at(object, &["session", "accountId"]));
-    let plan_type = string_at(object, &["plan_type"])
-        .or_else(|| string_at(object, &["planType"]))
-        .or_else(|| string_at(object, &["session", "plan_type"]))
-        .or_else(|| string_at(object, &["session", "planType"]));
+        .or_else(|| string_at(object, &["session", "accountId"]))
+        .or_else(|| string_at(object, &["session", "chatgpt_account_id"]))
+        .or_else(|| string_at(object, &["session", "chatgptAccountId"]))
+        .or_else(|| {
+            string_at_any(
+                None,
+                wrapper,
+                &[
+                    &["account_id"],
+                    &["accountId"],
+                    &["chatgpt_account_id"],
+                    &["chatgptAccountId"],
+                ],
+            )
+        });
+    let plan_type = string_at_any(
+        Some(object),
+        wrapper,
+        &[
+            &["plan_type"],
+            &["planType"],
+            &["session", "plan_type"],
+            &["session", "planType"],
+        ],
+    );
     if let Some(pat) = pat {
         return parse_token_value(&pat, email, account_id, plan_type, Some("pat"));
     }
@@ -794,6 +934,13 @@ fn parse_oauth(
                 .and_then(|value| value.get("chatgpt_account_id"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
+                .or_else(|| {
+                    claims
+                        .get("chatgpt_account_id")
+                        .or_else(|| claims.get("chatgptAccountId"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
         });
     }
     let auth_json = json!({
@@ -829,6 +976,104 @@ fn parse_oauth(
     })
 }
 
+fn is_agent_identity_mode(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            value
+                .chars()
+                .filter(|character| {
+                    *character != '_' && *character != '-' && !character.is_whitespace()
+                })
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .is_some_and(|value| value == "agentidentity")
+}
+
+fn looks_like_agent_identity_object(object: &serde_json::Map<String, Value>) -> bool {
+    string_at_any(
+        Some(object),
+        None,
+        &[
+            &["agent_runtime_id"],
+            &["agentRuntimeId"],
+            &["agent_private_key"],
+            &["agentPrivateKey"],
+        ],
+    )
+    .is_some()
+        && string_at_any(
+            Some(object),
+            None,
+            &[
+                &["account_id"],
+                &["accountId"],
+                &["chatgpt_account_id"],
+                &["chatgptAccountId"],
+            ],
+        )
+        .is_some()
+}
+
+fn canonical_agent_identity(value: Value) -> Result<Value, String> {
+    let Value::Object(mut object) = value else {
+        return Ok(value);
+    };
+    let agent_runtime_id = string_at_any(
+        Some(&object),
+        None,
+        &[
+            &["agent_runtime_id"],
+            &["agentRuntimeId"],
+            &["runtime_id"],
+            &["runtimeId"],
+        ],
+    );
+    let agent_private_key = string_at_any(
+        Some(&object),
+        None,
+        &[
+            &["agent_private_key"],
+            &["agentPrivateKey"],
+            &["private_key"],
+            &["privateKey"],
+        ],
+    );
+    let account_id = string_at_any(
+        Some(&object),
+        None,
+        &[
+            &["account_id"],
+            &["accountId"],
+            &["chatgpt_account_id"],
+            &["chatgptAccountId"],
+        ],
+    );
+    let chatgpt_user_id = string_at_any(
+        Some(&object),
+        None,
+        &[
+            &["chatgpt_user_id"],
+            &["chatgptUserId"],
+            &["user_id"],
+            &["userId"],
+        ],
+    );
+    for (key, value) in [
+        ("agent_runtime_id", agent_runtime_id),
+        ("agent_private_key", agent_private_key),
+        ("account_id", account_id),
+        ("chatgpt_user_id", chatgpt_user_id),
+    ] {
+        if let Some(value) = value {
+            object
+                .entry(key.to_owned())
+                .or_insert_with(|| Value::String(value));
+        }
+    }
+    Ok(Value::Object(object))
+}
+
 fn validate_agent_identity(value: &Value) -> Result<(), String> {
     match value {
         Value::String(value) if !value.trim().is_empty() => {
@@ -856,6 +1101,18 @@ fn validate_agent_identity(value: &Value) -> Result<(), String> {
         }
         _ => Err("Agent Identity 缺少必要字段。".to_owned()),
     }
+}
+
+fn string_at_any(
+    object: Option<&serde_json::Map<String, Value>>,
+    wrapper: Option<&serde_json::Map<String, Value>>,
+    paths: &[&[&str]],
+) -> Option<String> {
+    paths.iter().find_map(|path| {
+        object
+            .and_then(|object| string_at(object, path))
+            .or_else(|| wrapper.and_then(|wrapper| string_at(wrapper, path)))
+    })
 }
 
 fn string_at(object: &serde_json::Map<String, Value>, path: &[&str]) -> Option<String> {
@@ -943,12 +1200,15 @@ fn result_item(
     candidate: &ImportCandidate,
     action: &str,
     message: &str,
+    profile_id: Option<String>,
 ) -> JsonProfileImportResultItem {
     JsonProfileImportResultItem {
         id: candidate.id.clone(),
         alias: candidate.alias.clone(),
         action: action.to_owned(),
         message: message.to_owned(),
+        profile_id,
+        auth_mode: matches!(action, "created" | "updated").then(|| candidate.auth_mode.clone()),
     }
 }
 
@@ -982,6 +1242,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_credentials_wrappers_and_chatgpt_account_aliases() {
+        let wrapped = parse_credential(&json!({
+            "name": "Wrapped",
+            "email": "wrapped@example.com",
+            "chatgpt_account_id": "account-wrapped",
+            "credentials": {
+                "accessToken": "wrapped-access",
+                "refreshToken": "wrapped-refresh"
+            }
+        }))
+        .unwrap();
+        assert_eq!(wrapped.auth_mode, CodexAuthMode::OAuth);
+        assert!(wrapped.has_refresh_token);
+        assert_eq!(wrapped.email.as_deref(), Some("wrapped@example.com"));
+        assert_eq!(wrapped.account_id.as_deref(), Some("account-wrapped"));
+
+        let entries = entries_from_json(
+            json!({
+                "accounts": [{
+                    "name": "Sub2API",
+                    "platform": "openai",
+                    "type": "oauth",
+                    "chatgptAccountId": "account-sub2api",
+                    "credentials": {"access_token": "sub2api-access"}
+                }]
+            }),
+            "sub2api.json",
+        )
+        .unwrap();
+        let parsed = parse_credential(&entries[0].value).unwrap();
+        assert_eq!(entries[0].source, "Sub2API 导出");
+        assert_eq!(parsed.account_id.as_deref(), Some("account-sub2api"));
+    }
+
+    #[test]
     fn parses_pat_and_agent_identity_without_exposing_tokens() {
         let pat = parse_credential(&json!({
             "personal_access_token":"at-secret",
@@ -1009,6 +1304,33 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(agent_jwt.auth_mode, CodexAuthMode::AgentIdentity);
+        let camel_agent = parse_credential(&json!({
+            "authMode":"agentIdentity",
+            "credentials": {
+                "agentIdentity": {
+                    "agentRuntimeId":"runtime-camel",
+                    "agentPrivateKey":"private-camel",
+                    "chatgptAccountId":"account-camel",
+                    "chatgptUserId":"user-camel",
+                    "email":"camel@example.com",
+                    "planType":"team"
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(camel_agent.auth_mode, CodexAuthMode::AgentIdentity);
+        assert_eq!(camel_agent.email.as_deref(), Some("camel@example.com"));
+        assert_eq!(camel_agent.account_id.as_deref(), Some("account-camel"));
+        let auth_json: serde_json::Value =
+            serde_json::from_str(&camel_agent.credential.auth_json).unwrap();
+        assert_eq!(
+            auth_json["agent_identity"]["agent_runtime_id"],
+            serde_json::Value::String("runtime-camel".to_owned())
+        );
+        assert_eq!(
+            auth_json["agent_identity"]["chatgpt_user_id"],
+            serde_json::Value::String("user-camel".to_owned())
+        );
         assert!(parse_credential(&json!({"agent_identity":"not-a-jwt"})).is_err());
         assert!(parse_credential(&json!({"session_token":"browser-cookie"})).is_err());
     }
@@ -1017,7 +1339,7 @@ mod tests {
     fn exposes_only_openai_oauth_entries_from_sub2api() {
         let entries = entries_from_json(
             json!({"accounts":[
-                {"name":"OpenAI", "platform":"openai", "type":"oauth", "credentials":{"access_token":"a"}},
+                {"name":"OpenAI", "platform":"OpenAI", "type":"OAuth", "credentials":{"access_token":"a"}},
                 {"name":"Other", "platform":"anthropic", "type":"oauth", "credentials":{}}
             ]}),
             "export.json",

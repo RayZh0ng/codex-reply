@@ -13,8 +13,9 @@ use uuid::Uuid;
 use crate::{
     database::{Repository, StoredProfile},
     domain::{
-        CodexAuthMode, CreateProfileInput, GatewayProvider, MaskedProfile, ProfileAccountSummary,
-        ProfileKind, ProfileQuota, ProfileSubscription, UpdateProfileInput,
+        CodexAuthMode, CreateApiServiceProfileInput, CreateProfileInput, GatewayModelMapping,
+        GatewayProvider, GatewayWireApi, MaskedProfile, ProfileAccountSummary, ProfileKind,
+        ProfileQuota, ProfileSubscription, UpdateProfileInput,
     },
     error::{AppError, AppResult},
     gateway::normalize_base_url,
@@ -109,6 +110,11 @@ pub async fn create_profile(
 ) -> AppResult<MaskedProfile> {
     validate_profile_input(&input)?;
     let id = Uuid::new_v4().to_string();
+    let model_mappings = normalized_model_mappings(input.models, input.model_mappings)?;
+    let models = model_mappings
+        .iter()
+        .map(|mapping| mapping.model.clone())
+        .collect::<Vec<_>>();
     let secret_ref = match input.kind {
         ProfileKind::ApiKey => {
             let key = input.api_key.as_deref().ok_or(AppError::ValidationFailed)?;
@@ -128,11 +134,13 @@ pub async fn create_profile(
             .map(|url| normalize_base_url(&input.provider, url))
             .transpose()?,
         provider: input.provider,
+        wire_api: input.wire_api,
         enabled: true,
         in_pool: input.in_pool,
         priority: input.priority,
         weight: input.weight,
-        models: normalized_models(input.models),
+        models,
+        model_mappings,
         health: "unknown".to_owned(),
         cooldown_until_ms: None,
         credential_configured: secret_ref.is_some(),
@@ -154,6 +162,36 @@ pub async fn create_profile(
     Ok(profile)
 }
 
+pub async fn create_api_service_profile(
+    repository: &Repository,
+    secrets: Arc<dyn SecretStore>,
+    input: CreateApiServiceProfileInput,
+    discovered_models: Vec<String>,
+) -> AppResult<MaskedProfile> {
+    let models = normalized_models(discovered_models);
+    if models.is_empty() {
+        return Err(AppError::UpstreamUnavailable);
+    }
+    create_profile(
+        repository,
+        secrets,
+        CreateProfileInput {
+            alias: input.alias,
+            kind: ProfileKind::ApiKey,
+            base_url: Some(input.base_url),
+            provider: input.provider,
+            wire_api: input.wire_api,
+            api_key: Some(input.api_key),
+            models,
+            model_mappings: input.model_mappings,
+            in_pool: input.in_pool,
+            priority: input.priority,
+            weight: input.weight,
+        },
+    )
+    .await
+}
+
 pub async fn update_profile(
     repository: &Repository,
     secrets: Arc<dyn SecretStore>,
@@ -168,7 +206,27 @@ pub async fn update_profile(
     stored.profile.in_pool = input.in_pool;
     stored.profile.priority = input.priority;
     stored.profile.weight = input.weight;
-    stored.profile.models = normalized_models(input.models);
+    let model_mappings = match input.model_mappings {
+        Some(mappings) => normalized_model_mappings(input.models, mappings)?,
+        None => {
+            let existing_visible = stored
+                .profile
+                .model_mappings
+                .iter()
+                .map(|mapping| mapping.model.clone())
+                .collect::<Vec<_>>();
+            if normalized_models(input.models.clone()) == normalized_models(existing_visible) {
+                stored.profile.model_mappings.clone()
+            } else {
+                normalized_model_mappings(input.models, Vec::new())?
+            }
+        }
+    };
+    stored.profile.models = model_mappings
+        .iter()
+        .map(|mapping| mapping.model.clone())
+        .collect();
+    stored.profile.model_mappings = model_mappings;
     if let Some(api_key) = input.api_key.filter(|key| !key.trim().is_empty()) {
         if stored.profile.kind != ProfileKind::ApiKey {
             return Err(AppError::ValidationFailed);
@@ -220,6 +278,7 @@ pub fn save_oauth_credential_metadata(
             .unwrap_or_else(|| oauth_secret_reference(id)),
     );
     stored.profile.credential_configured = true;
+    stored.credential_fingerprint = None;
     let previous_account = stored.profile.account.clone();
     stored.profile.account = account_summary(credential).map(|mut account| {
         if let Some(previous) = previous_account {
@@ -431,11 +490,13 @@ pub async fn create_oauth_profile(
         kind: ProfileKind::CodexOauth,
         base_url: None,
         provider: GatewayProvider::OpenAi,
+        wire_api: GatewayWireApi::Responses,
         enabled: true,
         in_pool: false,
         priority: 0,
         weight: 1,
         models: Vec::new(),
+        model_mappings: Vec::new(),
         health: "unknown".to_owned(),
         cooldown_until_ms: None,
         credential_configured: true,
@@ -475,11 +536,13 @@ pub async fn create_imported_profile(
         kind: ProfileKind::CodexOauth,
         base_url: None,
         provider: GatewayProvider::OpenAi,
+        wire_api: GatewayWireApi::Responses,
         enabled: true,
         in_pool: false,
         priority: 0,
         weight: 1,
         models: Vec::new(),
+        model_mappings: Vec::new(),
         health: "unknown".to_owned(),
         cooldown_until_ms: None,
         credential_configured: true,
@@ -550,7 +613,7 @@ pub fn imported_account_summary(
     let display_name = None;
     let email = normalized_account_value(email, 320);
     let account_id = normalized_account_value(account_id, 160);
-    let plan_type = normalized_account_value(plan_type, 120);
+    let plan_type = normalize_imported_plan_type(plan_type);
     if email.is_none() && account_id.is_none() && plan_type.is_none() {
         return None;
     }
@@ -674,6 +737,30 @@ fn account_summary_with_snapshot(
     })
 }
 
+fn normalize_imported_plan_type(plan_type: Option<String>) -> Option<String> {
+    let normalized = normalized_account_value(plan_type, 120)?
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    let plan_type = match normalized.as_str() {
+        "unknown" | "none" | "null" => return None,
+        "chatgptfreeplan" | "freeplan" | "chatgpt_free" => "free",
+        "chatgptgoplan" | "goplan" | "chatgpt_go" => "go",
+        "chatgptplusplan" | "plusplan" | "chatgpt_plus" => "plus",
+        "chatgptproplan" | "proplan" | "chatgpt_pro" => "pro",
+        "chatgptproliteplan" | "proliteplan" | "chatgpt_pro_lite" => "prolite",
+        "chatgptteamplan" | "teamplan" | "chatgpt_team" => "team",
+        "chatgptbusinessplan" | "businessplan" | "chatgpt_business" => "business",
+        "chatgptenterpriseplan" | "enterpriseplan" | "chatgpt_enterprise" => "enterprise",
+        "chatgpteduplan" | "eduplan" | "chatgpt_edu" => "edu",
+        "chatgptk12plan" | "k12plan" | "chatgpt_k12" | "k-12" => "k12",
+        value => value,
+    };
+    Some(plan_type.to_owned())
+}
+
 pub fn unavailable_quota(message: impl Into<String>) -> ProfileQuota {
     ProfileQuota {
         status: "unavailable".to_owned(),
@@ -780,7 +867,7 @@ fn validate_profile_input(input: &CreateProfileInput) -> AppResult<()> {
     }
     match input.kind {
         ProfileKind::ApiKey => {
-            if input.in_pool && input.models.is_empty() {
+            if input.in_pool && input.models.is_empty() && input.model_mappings.is_empty() {
                 return Err(AppError::ValidationFailed);
             }
             let url = input
@@ -803,6 +890,50 @@ fn validate_profile_input(input: &CreateProfileInput) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+pub fn normalized_model_mappings(
+    models: Vec<String>,
+    mappings: Vec<GatewayModelMapping>,
+) -> AppResult<Vec<GatewayModelMapping>> {
+    let source = if mappings.is_empty() {
+        normalized_models(models)
+            .into_iter()
+            .map(|model| GatewayModelMapping {
+                model: model.clone(),
+                upstream_model: model,
+                display_name: None,
+                context_window: None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        mappings
+    };
+    let mut values = source
+        .into_iter()
+        .filter_map(|mapping| {
+            let model = mapping.model.trim().to_owned();
+            let upstream_model = mapping.upstream_model.trim().to_owned();
+            if model.is_empty() || upstream_model.is_empty() {
+                return None;
+            }
+            Some(GatewayModelMapping {
+                model,
+                upstream_model,
+                display_name: mapping
+                    .display_name
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty()),
+                context_window: mapping.context_window.filter(|value| *value > 0),
+            })
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| left.model.cmp(&right.model));
+    values.dedup_by(|left, right| left.model == right.model);
+    if values.is_empty() {
+        return Err(AppError::ValidationFailed);
+    }
+    Ok(values)
 }
 
 fn valid_upstream_scheme(provider: &GatewayProvider, parsed: &Url) -> bool {
@@ -834,13 +965,17 @@ fn normalized_models(models: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidates_for_model, create_oauth_profile, create_profile, imported_account_summary,
-        migrate_oauth_credentials, sync_oauth_account_info, sync_oauth_account_info_with_snapshot,
-        unavailable_quota, CodexOAuthCredential, KEYCHAIN_SIGNING_MIGRATION_SETTING,
+        candidates_for_model, create_imported_profile, create_oauth_profile, create_profile,
+        imported_account_summary, migrate_oauth_credentials, save_oauth_credential,
+        sync_oauth_account_info, sync_oauth_account_info_with_snapshot, unavailable_quota,
+        CodexOAuthCredential, ImportedAuthFileCredential, KEYCHAIN_SIGNING_MIGRATION_SETTING,
     };
     use crate::{
         database::Repository,
-        domain::{CreateProfileInput, GatewayProvider, ProfileKind, ProfileSubscription},
+        domain::{
+            CodexAuthMode, CreateProfileInput, GatewayProvider, GatewayWireApi, ProfileKind,
+            ProfileSubscription,
+        },
         secrets::MemorySecretStore,
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -899,8 +1034,10 @@ mod tests {
                 kind: ProfileKind::ApiKey,
                 base_url: Some("https://relay.example.com/v1".into()),
                 provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
                 api_key: Some("secret".into()),
                 models: vec!["gpt-5-codex".into()],
+                model_mappings: Vec::new(),
                 in_pool: true,
                 priority: 0,
                 weight: 1,
@@ -922,8 +1059,10 @@ mod tests {
                 kind: ProfileKind::ApiKey,
                 base_url: Some("https://relay.example.com/v1".into()),
                 provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
                 api_key: Some("super-secret".into()),
                 models: vec!["gpt-5-codex".into()],
+                model_mappings: Vec::new(),
                 in_pool: true,
                 priority: 0,
                 weight: 1,
@@ -978,8 +1117,10 @@ mod tests {
                 kind: ProfileKind::ApiKey,
                 base_url: Some("https://api.example.com/v1".into()),
                 provider: GatewayProvider::OpenAi,
+                wire_api: GatewayWireApi::Responses,
                 api_key: Some("api-secret".into()),
                 models: vec!["gpt-5".into()],
+                model_mappings: Vec::new(),
                 in_pool: true,
                 priority: 0,
                 weight: 1,
@@ -1022,6 +1163,59 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.profile.id == oauth_profile.id));
+    }
+
+    #[tokio::test]
+    async fn official_oauth_update_clears_import_fingerprint() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let imported_credential = CodexOAuthCredential {
+            id_token: "import-id".into(),
+            access_token: "import-access".into(),
+            refresh_token: Some("import-refresh".into()),
+            account_id: None,
+            last_refresh_ms: 1,
+        };
+        let imported = create_imported_profile(
+            &repository,
+            secrets.clone(),
+            "Imported OAuth".into(),
+            &ImportedAuthFileCredential {
+                version: 1,
+                auth_mode: CodexAuthMode::OAuth,
+                auth_json: imported_credential.auth_json().unwrap(),
+            },
+            "json:fingerprint".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(repository
+            .profile(&imported.id)
+            .unwrap()
+            .credential_fingerprint
+            .is_some());
+
+        save_oauth_credential(
+            &repository,
+            secrets,
+            &imported.id,
+            &CodexOAuthCredential {
+                id_token: "oauth-id".into(),
+                access_token: "oauth-access".into(),
+                refresh_token: Some("oauth-refresh".into()),
+                account_id: None,
+                last_refresh_ms: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(repository
+            .profile(&imported.id)
+            .unwrap()
+            .credential_fingerprint
+            .is_none());
     }
 
     #[tokio::test]
@@ -1242,8 +1436,10 @@ mod tests {
                 kind: ProfileKind::CodexOauth,
                 base_url: None,
                 provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
                 api_key: None,
                 models: vec!["unknown".into()],
+                model_mappings: Vec::new(),
                 in_pool: false,
                 priority: 0,
                 weight: 1,

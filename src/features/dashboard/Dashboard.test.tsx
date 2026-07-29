@@ -86,6 +86,15 @@ function renderDashboard(phase: "idle" | "running" = "idle") {
 }
 
 describe("Dashboard managed Codex task", () => {
+  it("shows the request trend chart so compact layouts keep the card content", () => {
+    renderDashboard();
+
+    expect(
+      screen.getByRole("img", { name: /近七日请求趋势，总计 0 次请求/ }),
+    ).toHaveClass("trend-chart");
+    expect(screen.getByRole("heading", { name: "请求趋势" })).toBeInTheDocument();
+  });
+
   it("starts one managed task only after a folder and instruction are supplied", async () => {
     dialog.open.mockResolvedValueOnce("/private/workspace");
     const { onStartTask } = renderDashboard();

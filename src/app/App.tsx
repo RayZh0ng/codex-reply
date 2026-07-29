@@ -20,6 +20,9 @@ import { flushSync } from "react-dom";
 import { Dashboard } from "../features/dashboard/Dashboard";
 import {
   api,
+  type AppUpdateChannel,
+  type AppUpdateInfo,
+  type AppUpdateSettings,
   type CurrentProfileActivation,
   type DesktopWorkspaceHistoryItem,
   type DesktopWorkspaceMode,
@@ -73,6 +76,10 @@ const idleTaskStatus: ManagedTaskStatus = {
 };
 const PROFILE_ACTIVATION_TIMEOUT_MS = 20_000;
 const defaultWorkspaceSettings: DesktopWorkspaceSettings = { mode: "per_profile" };
+const defaultAppUpdateSettings: AppUpdateSettings = {
+  channel: "stable",
+  auto_check: true,
+};
 const COMPACT_SIDEBAR_QUERY = "(max-width: 1179px)";
 const SIDEBAR_STORAGE_KEY = "codex-relay.sidebar.v1";
 
@@ -99,6 +106,7 @@ function App() {
     CollaborationProjectBinding[]
   >([]);
   const [codexSessions, setCodexSessions] = useState<CodexSessionSummary[]>([]);
+  const [gatewayModelOptions, setGatewayModelOptions] = useState<string[]>([]);
   const [taskStatus, setTaskStatus] = useState<ManagedTaskStatus>(idleTaskStatus);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -109,6 +117,14 @@ function App() {
   const [workspaceSettings, setWorkspaceSettings] = useState<DesktopWorkspaceSettings>(
     defaultWorkspaceSettings,
   );
+  const [appUpdateSettings, setAppUpdateSettings] = useState<AppUpdateSettings>(
+    defaultAppUpdateSettings,
+  );
+  const [availableAppUpdate, setAvailableAppUpdate] = useState<AppUpdateInfo | null>(
+    null,
+  );
+  const [appUpdateStatus, setAppUpdateStatus] = useState<string | null>(null);
+  const [appUpdateBusy, setAppUpdateBusy] = useState(false);
   const [workspaceHistory, setWorkspaceHistory] = useState<
     DesktopWorkspaceHistoryItem[]
   >([]);
@@ -138,14 +154,16 @@ function App() {
   }, []);
   const refreshCollaboration = useCallback(async () => {
     try {
-      const [bots, bindings, sessions] = await Promise.all([
+      const [bots, bindings, sessions, models] = await Promise.all([
         api.listCollaborationBots(),
         api.listCollaborationProjectBindings(),
         api.listCodexSessions(),
+        api.listGatewayModelOptions(),
       ]);
       setCollaborationBots(bots);
       setCollaborationBindings(bindings);
       setCodexSessions(sessions);
+      setGatewayModelOptions(models);
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -155,6 +173,64 @@ function App() {
       setWorkspaceHistory(await api.listDesktopWorkspaces());
     } catch (reason) {
       setError(errorMessage(reason));
+    }
+  }, []);
+  const installAppUpdate = useCallback(async (channel: AppUpdateChannel) => {
+    setAppUpdateBusy(true);
+    try {
+      await api.installAppUpdate(channel);
+      setNotice("更新已安装，应用将重启。");
+    } catch (reason) {
+      setAppUpdateStatus(errorMessage(reason));
+      throw reason;
+    } finally {
+      setAppUpdateBusy(false);
+    }
+  }, []);
+  const requestAppUpdateInstall = useCallback(
+    (update: AppUpdateInfo) => {
+      setConfirmation({
+        title: `安装 Codex Relay ${update.version}？`,
+        detail:
+          `当前版本 ${update.current_version}，将从 ${formatAppUpdateChannel(update.channel)} 通道下载安装包。` +
+          "安装完成后应用会重启，Windows 可能会在安装阶段自动退出。",
+        confirmLabel: "安装并重启",
+        successMessage: "正在安装更新，应用将重启。",
+        action: () => installAppUpdate(update.channel),
+        refresh: async () => {},
+      });
+    },
+    [installAppUpdate],
+  );
+  const checkForAppUpdate = useCallback(
+    async (channel: AppUpdateChannel, prompt = false, showStatus = true) => {
+      setAppUpdateBusy(true);
+      try {
+        const update = await api.checkAppUpdate(channel);
+        setAvailableAppUpdate(update);
+        setAppUpdateStatus(update ? null : "当前已是最新版本。");
+        if (update && prompt) requestAppUpdateInstall(update);
+        return update;
+      } catch (reason) {
+        if (showStatus) setAppUpdateStatus(errorMessage(reason));
+        return null;
+      } finally {
+        setAppUpdateBusy(false);
+      }
+    },
+    [requestAppUpdateInstall],
+  );
+  const changeAppUpdateSettings = useCallback(async (settings: AppUpdateSettings) => {
+    setAppUpdateBusy(true);
+    try {
+      const saved = await api.updateAppUpdateSettings(settings);
+      setAppUpdateSettings(saved);
+      setAvailableAppUpdate(null);
+      setAppUpdateStatus("软件更新设置已保存。");
+    } catch (reason) {
+      setAppUpdateStatus(errorMessage(reason));
+    } finally {
+      setAppUpdateBusy(false);
     }
   }, []);
   hasRefreshableCodexProfiles.current =
@@ -185,6 +261,24 @@ function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .appUpdateSettings()
+      .then(async (settings) => {
+        if (cancelled) return;
+        setAppUpdateSettings(settings);
+        if (settings.auto_check && navigator.onLine !== false) {
+          await checkForAppUpdate(settings.channel, true, false);
+        }
+      })
+      .catch(() => {
+        // Startup update checks must not block the main local-first experience.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [checkForAppUpdate]);
   useEffect(() => {
     const media = window.matchMedia(COMPACT_SIDEBAR_QUERY);
     const update = (event: MediaQueryListEvent | MediaQueryList) => {
@@ -251,12 +345,12 @@ function App() {
   const execute = async (
     action: () => Promise<unknown>,
     message?: string,
-    refreshAction: () => Promise<void> = refresh,
+    refreshAction?: () => Promise<void>,
   ) => {
     setActionBusy(true);
     try {
       await action();
-      await refreshAction();
+      await (refreshAction ?? refreshCurrentPage)();
       if (message) setNotice(message);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -454,17 +548,29 @@ function App() {
       requestDelete={requestDelete}
       notify={setNotice}
       workspaceSettings={workspaceSettings}
+      appUpdateSettings={appUpdateSettings}
+      availableAppUpdate={availableAppUpdate}
+      appUpdateStatus={appUpdateStatus}
+      appUpdateBusy={appUpdateBusy}
       workspaceHistory={workspaceHistory}
       themePreference={themePreference}
       collaborationBots={collaborationBots}
       collaborationBindings={collaborationBindings}
       codexSessions={codexSessions}
+      gatewayModelOptions={gatewayModelOptions}
       onChangeWorkspaceMode={async (mode) => {
         await execute(
           () => api.updateDesktopWorkspaceSettings(mode),
           "客户端工作区模式已保存。",
         );
         await refreshWorkspaceHistory();
+      }}
+      onChangeAppUpdateSettings={changeAppUpdateSettings}
+      onCheckAppUpdate={async () => {
+        await checkForAppUpdate(appUpdateSettings.channel, false, true);
+      }}
+      onInstallAppUpdate={async () => {
+        if (availableAppUpdate) requestAppUpdateInstall(availableAppUpdate);
       }}
       onRestoreWorkspace={async (id) => {
         const activation = await api.restoreDesktopWorkspace(id);
@@ -478,6 +584,7 @@ function App() {
       }}
       onThemePreferenceChange={setThemePreference}
       onRefresh={refreshCurrentPage}
+      onRefreshCollaboration={refreshCollaboration}
       onJsonImportComplete={refresh}
     />
   ) : (
@@ -541,9 +648,6 @@ function App() {
           />
         </nav>
         <div className="sidebar-bottom">
-          <span className="desktop-status">
-            <i /> 本机优先
-          </span>
           <NavItem
             active={page === "settings"}
             icon={<GearSix size={20} />}
@@ -616,7 +720,7 @@ function App() {
                 type="button"
                 onClick={() => {
                   setError(null);
-                  void refresh();
+                  void refreshCurrentPage();
                 }}
               >
                 重试
@@ -664,15 +768,24 @@ function PageContent({
   requestDelete,
   notify,
   workspaceSettings,
+  appUpdateSettings,
+  availableAppUpdate,
+  appUpdateStatus,
+  appUpdateBusy,
   workspaceHistory,
   themePreference,
   collaborationBots,
   collaborationBindings,
   codexSessions,
+  gatewayModelOptions,
   onChangeWorkspaceMode,
+  onChangeAppUpdateSettings,
+  onCheckAppUpdate,
+  onInstallAppUpdate,
   onRestoreWorkspace,
   onThemePreferenceChange,
   onRefresh,
+  onRefreshCollaboration,
   onJsonImportComplete,
 }: {
   page: Page;
@@ -697,15 +810,24 @@ function PageContent({
   ) => void;
   notify: (message: string) => void;
   workspaceSettings: DesktopWorkspaceSettings;
+  appUpdateSettings: AppUpdateSettings;
+  availableAppUpdate: AppUpdateInfo | null;
+  appUpdateStatus: string | null;
+  appUpdateBusy: boolean;
   workspaceHistory: DesktopWorkspaceHistoryItem[];
   themePreference: ThemePreference;
   collaborationBots: MaskedCollaborationBot[];
   collaborationBindings: CollaborationProjectBinding[];
   codexSessions: CodexSessionSummary[];
+  gatewayModelOptions: string[];
   onChangeWorkspaceMode: (mode: DesktopWorkspaceMode) => Promise<void>;
+  onChangeAppUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
+  onCheckAppUpdate: () => Promise<void>;
+  onInstallAppUpdate: () => Promise<void>;
   onRestoreWorkspace: (id: string) => Promise<void>;
   onThemePreferenceChange: (preference: ThemePreference) => void;
   onRefresh: () => Promise<void>;
+  onRefreshCollaboration: () => Promise<void>;
   onJsonImportComplete: () => Promise<void>;
 }) {
   if (page === "dashboard")
@@ -730,8 +852,18 @@ function PageContent({
         onCancelOAuth={api.cancelOAuthImport}
         onCompleteOAuth={async (attemptId, alias) =>
           execute(
-            () => api.completeOAuthImport(attemptId, alias),
-            alias ? "档案已创建，OAuth 凭据已保存。" : "档案凭据已更新。",
+            async () => {
+              const profile = await api.completeOAuthImport(attemptId, alias);
+              try {
+                await api.syncProfileAccountInfo(profile.id);
+                await api.refreshProfileModels(profile.id);
+              } catch {
+                // 导入已完成；资料或模型刷新失败时保留档案，并允许用户手动刷新。
+              }
+            },
+            alias
+              ? "档案已创建，OAuth 凭据已保存，正在刷新资料与模型。"
+              : "档案凭据已更新，正在刷新资料与模型。",
           )
         }
         onSyncAccount={syncProfileAccount}
@@ -739,10 +871,10 @@ function PageContent({
           execute(() => api.refreshProfileModels(id), "可用模型已从上游刷新。")
         }
         onCreateApiProfile={(input) =>
-          execute(async () => {
-            const profile = await api.createProfile(input);
-            await api.refreshProfileModels(profile.id);
-          }, "上游已保存，模型目录已刷新。")
+          api.createApiServiceProfile(input).then(async () => {
+            await onRefresh();
+            notify("第三方模型提供商已保存，模型目录已刷新。");
+          })
         }
         onTogglePool={(profile) =>
           execute(
@@ -763,6 +895,10 @@ function PageContent({
               });
             },
             profile.in_pool ? "已移出网关账号池。" : "已加入网关账号池。",
+            async () => {
+              await onRefresh();
+              await onRefreshCollaboration();
+            },
           )
         }
         onConfigurePool={(profile, priority, weight, models) =>
@@ -779,6 +915,10 @@ function PageContent({
                 api_key: null,
               }),
             "账号池优先级、权重与模型范围已更新。",
+            async () => {
+              await onRefresh();
+              await onRefreshCollaboration();
+            },
           )
         }
         onActivateApiProfile={(profile) =>
@@ -820,41 +960,31 @@ function PageContent({
         bindings={collaborationBindings}
         sessions={codexSessions}
         profiles={snapshot.profiles}
+        gatewayModelOptions={gatewayModelOptions}
         busy={busy}
         onSaveBot={async (input) =>
-          execute(
-            () => api.upsertCollaborationBot(input),
-            "协作机器人已保存。",
-            onRefresh,
-          )
+          execute(() => api.upsertCollaborationBot(input), "协作机器人已保存。")
         }
         onTestBot={async (id) =>
-          execute(
-            () => api.testCollaborationBot(id),
-            "协作机器人配置已验证。",
-            onRefresh,
-          )
+          execute(() => api.testCollaborationBot(id), "协作机器人配置已验证。")
         }
         onDeleteBot={(id, name) =>
           requestDelete(
             `删除协作机器人“${name}”？`,
             "App Secret 引用、项目绑定和会话记录会从本机删除。",
             () => api.deleteCollaborationBot(id),
-            onRefresh,
           )
         }
         onSaveBinding={async (input) =>
           execute(
             () => api.upsertCollaborationProjectBinding(input),
             "项目绑定已创建。",
-            onRefresh,
           )
         }
         onRegisterDiscordCommands={async (id) =>
           execute(
             () => api.registerDiscordCommands(id),
             "Discord slash command 已注册。",
-            onRefresh,
           )
         }
         onLoadCallbackStatus={api.collaborationCallbackStatus}
@@ -863,18 +993,13 @@ function PageContent({
             `删除项目绑定“${name}”？`,
             "该项目的群绑定和会话记录会从本机删除。",
             () => api.deleteCollaborationProjectBinding(id),
-            onRefresh,
           )
         }
         onCancelSession={async (id) =>
-          execute(() => api.cancelCodexSession(id), "Codex 会话已取消。", onRefresh)
+          execute(() => api.cancelCodexSession(id), "Codex 会话已取消。")
         }
         onContinueSession={async (id, instruction) =>
-          execute(
-            () => api.continueCodexSession(id, instruction),
-            "Codex 会话已继续。",
-            onRefresh,
-          )
+          execute(() => api.continueCodexSession(id, instruction), "Codex 会话已继续。")
         }
       />
     );
@@ -885,8 +1010,15 @@ function PageContent({
         workspaces={workspaceHistory}
         busy={busy}
         themePreference={themePreference}
+        updateSettings={appUpdateSettings}
+        availableUpdate={availableAppUpdate}
+        updateStatus={appUpdateStatus}
+        updateBusy={appUpdateBusy}
         onChangeMode={onChangeWorkspaceMode}
         onThemePreferenceChange={onThemePreferenceChange}
+        onChangeUpdateSettings={onChangeAppUpdateSettings}
+        onCheckUpdate={onCheckAppUpdate}
+        onInstallUpdate={onInstallAppUpdate}
         onRestore={onRestoreWorkspace}
         onDelete={(id, alias) =>
           requestDelete(
@@ -1034,6 +1166,10 @@ function ProfileActivationDialog({
       <p>无需重新 OAuth。ChatGPT Chat/Work 的独立登录会话不会被读取、写入或切换。</p>
     </Dialog>
   );
+}
+
+function formatAppUpdateChannel(channel: AppUpdateChannel) {
+  return channel === "beta" ? "Beta" : "稳定版";
 }
 
 function errorMessage(reason: unknown) {

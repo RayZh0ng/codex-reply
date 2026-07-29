@@ -25,19 +25,19 @@
   --radius-xl: 24px;
   --radius-full: 999px;
 
-  --color-background: #f4f6f9;
+  --color-background: #f5f5f7;
   --color-surface: #fff;
-  --color-surface-translucent: rgb(255 255 255 / 78%);
+  --color-surface-translucent: rgb(255 255 255 / 84%);
   --color-surface-elevated: #fff;
-  --color-surface-soft: #f7f9fc;
-  --color-sidebar: rgb(246 248 251 / 88%);
-  --color-topbar: rgb(244 246 249 / 88%);
+  --color-surface-soft: #f9fafc;
+  --color-sidebar: rgb(245 245 247 / 86%);
+  --color-topbar: rgb(245 245 247 / 86%);
   --color-input: rgb(255 255 255 / 88%);
   --color-input-hover: #fff;
   --color-popover: rgb(255 255 255 / 96%);
   --color-overlay: rgb(20 28 42 / 30%);
-  --color-border: rgb(15 23 42 / 9%);
-  --color-border-strong: rgb(15 23 42 / 14%);
+  --color-border: rgb(60 60 67 / 10%);
+  --color-border-strong: rgb(60 60 67 / 16%);
   --color-text-primary: #172033;
   --color-text-secondary: #5f6b7a;
   --color-text-muted: #8b95a5;
@@ -55,8 +55,8 @@
   --color-scrollbar-hover: rgb(95 107 122 / 44%);
 
   --shadow-subtle: 0 1px 2px rgb(15 23 42 / 4%);
-  --shadow-card: 0 10px 30px rgb(24 39 63 / 6%);
-  --shadow-floating: 0 18px 48px rgb(24 39 63 / 12%);
+  --shadow-card: 0 14px 38px rgb(24 39 63 / 7%);
+  --shadow-floating: 0 22px 58px rgb(24 39 63 / 13%);
   --shadow-popover: 0 24px 70px rgb(18 33 54 / 22%);
 
   --motion-fast: 120ms;
@@ -167,13 +167,14 @@ textarea:disabled {
 }
 
 * {
-  scrollbar-color: var(--color-scrollbar) transparent;
-  scrollbar-width: thin;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
 *::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 *::-webkit-scrollbar-track {

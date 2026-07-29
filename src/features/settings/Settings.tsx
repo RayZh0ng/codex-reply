@@ -6,6 +6,9 @@ import { Trash } from "@phosphor-icons/react/Trash";
 import { Warning } from "@phosphor-icons/react/Warning";
 
 import {
+  type AppUpdateChannel,
+  type AppUpdateInfo,
+  type AppUpdateSettings,
   type DesktopWorkspaceHistoryItem,
   type DesktopWorkspaceMode,
   type DesktopWorkspaceSettings,
@@ -45,13 +48,37 @@ const themes: Array<{
   { value: "dark", label: "深色", icon: Moon },
 ];
 
+const updateChannels: Array<{
+  value: AppUpdateChannel;
+  label: string;
+  detail: string;
+}> = [
+  {
+    value: "stable",
+    label: "稳定版",
+    detail: "只接收正式发布版本。",
+  },
+  {
+    value: "beta",
+    label: "Beta 版",
+    detail: "提前接收预发布版本。",
+  },
+];
+
 interface SettingsProps {
   settings: DesktopWorkspaceSettings;
   workspaces: DesktopWorkspaceHistoryItem[];
   busy: boolean;
   themePreference: ThemePreference;
+  updateSettings: AppUpdateSettings;
+  availableUpdate: AppUpdateInfo | null;
+  updateStatus: string | null;
+  updateBusy: boolean;
   onChangeMode: (mode: DesktopWorkspaceMode) => Promise<void>;
   onThemePreferenceChange: (preference: ThemePreference) => void;
+  onChangeUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
+  onCheckUpdate: () => Promise<void>;
+  onInstallUpdate: () => Promise<void>;
   onRestore: (id: string) => Promise<void>;
   onDelete: (id: string, alias: string) => void;
 }
@@ -61,8 +88,15 @@ export function Settings({
   workspaces,
   busy,
   themePreference,
+  updateSettings,
+  availableUpdate,
+  updateStatus,
+  updateBusy,
   onChangeMode,
   onThemePreferenceChange,
+  onChangeUpdateSettings,
+  onCheckUpdate,
+  onInstallUpdate,
   onRestore,
   onDelete,
 }: SettingsProps) {
@@ -106,6 +140,88 @@ export function Settings({
             );
           })}
         </fieldset>
+      </section>
+      <section className="surface-card update-settings" data-animate="cards">
+        <div className="card-heading">
+          <div>
+            <h2>软件更新</h2>
+            <p>通过 GitHub Release 检查 stable / beta 双通道更新。</p>
+          </div>
+        </div>
+        <fieldset className="theme-picker update-channel-picker" aria-label="更新通道">
+          <legend className="sr-only">更新通道</legend>
+          {updateChannels.map((option) => (
+            <label
+              className={updateSettings.channel === option.value ? "selected" : ""}
+              key={option.value}
+            >
+              <input
+                checked={updateSettings.channel === option.value}
+                disabled={busy || updateBusy}
+                name="app-update-channel"
+                onChange={() =>
+                  void onChangeUpdateSettings({
+                    ...updateSettings,
+                    channel: option.value,
+                  })
+                }
+                type="radio"
+                value={option.value}
+              />
+              <span>{option.label}</span>
+              <small>{option.detail}</small>
+            </label>
+          ))}
+        </fieldset>
+        <label className="update-toggle">
+          <input
+            checked={updateSettings.auto_check}
+            disabled={busy || updateBusy}
+            onChange={(event) =>
+              void onChangeUpdateSettings({
+                ...updateSettings,
+                auto_check: event.target.checked,
+              })
+            }
+            type="checkbox"
+          />
+          <span>启动时自动检查更新</span>
+        </label>
+        {availableUpdate ? (
+          <article className="update-available-panel" role="status">
+            <strong>
+              发现 {formatUpdateChannel(availableUpdate.channel)}
+              更新：{availableUpdate.version}
+            </strong>
+            <p>
+              当前版本 {availableUpdate.current_version}
+              {availableUpdate.date ? ` · 发布于 ${availableUpdate.date}` : ""}
+            </p>
+            {availableUpdate.body && <p>{availableUpdate.body}</p>}
+          </article>
+        ) : (
+          updateStatus && <p className="form-note">{updateStatus}</p>
+        )}
+        <div className="update-actions">
+          <button
+            className="quiet-button"
+            disabled={busy || updateBusy}
+            onClick={() => void onCheckUpdate()}
+            type="button"
+          >
+            {updateBusy ? "正在检查…" : "立即检查更新"}
+          </button>
+          {availableUpdate && (
+            <button
+              className="primary-button"
+              disabled={busy || updateBusy}
+              onClick={() => void onInstallUpdate()}
+              type="button"
+            >
+              安装并重启
+            </button>
+          )}
+        </div>
       </section>
       <div className="section-heading compact-section-heading">
         <div>
@@ -199,4 +315,8 @@ function formatTimestamp(value: number) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function formatUpdateChannel(channel: AppUpdateChannel) {
+  return channel === "beta" ? "Beta" : "稳定版";
 }

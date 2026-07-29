@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -34,9 +34,11 @@ use serde_json::{json, Value};
 use sha1::{Digest as Sha1Digest, Sha1};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use toml_edit::{value as toml_value, Array, DocumentMut, Item, Table};
 use uuid::Uuid;
 
 use crate::{
+    codex_gateway,
     database::{Repository, StoredCodexSession, StoredCollaborationBot},
     domain::{
         CancelCodexSessionInput, CodexAuthMode, CodexSessionEvent, CodexSessionSummary,
@@ -46,6 +48,7 @@ use crate::{
         ProfileKind, UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput,
     },
     error::{AppError, AppResult},
+    gateway::GatewayManager,
     oauth_credentials::{CredentialAccess as OAuthCredentialAccess, OAuthCredentialStore},
     profiles::{CodexOAuthCredential, ImportedAuthFileCredential},
     secrets::SecretStore,
@@ -71,16 +74,95 @@ const CODEX_RESUME_ARGS: [&str; 7] = [
     "__SESSION__",
     "-",
 ];
+const NATURAL_TASK_RESUME_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const COLLABORATION_GATEWAY_PROVIDER: &str = "codex_relay";
+const COLLABORATION_MODEL_CATALOG_FILENAME: &str = "codex-relay-model-catalog.json";
+const MAX_INCOMING_IMAGES: usize = 5;
+const MAX_INCOMING_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const DEFAULT_IMAGE_INSTRUCTION: &str = "请分析这张图片。";
 
 type SecretRefs = HashMap<String, String>;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingChatKind {
+    Direct,
+    Group,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncomingTextIntent {
+    Command(String),
+    NaturalTask {
+        instruction: String,
+        force_new: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncomingMessage {
+    provider: CollaborationProvider,
+    bot_id: String,
+    chat_id: String,
+    sender: Option<String>,
+    text: String,
+    chat_kind: IncomingChatKind,
+    addressed: bool,
+    images: Vec<IncomingImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncomingImage {
+    source: IncomingImageSource,
+    filename_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncomingImageSource {
+    FeishuMessageResource {
+        message_id: String,
+        file_key: String,
+    },
+    TelegramFile {
+        file_id: String,
+    },
+    WecomMedia {
+        media_id: String,
+    },
+    Url {
+        url: String,
+    },
+}
+
+enum NaturalRunResolution {
+    Ready {
+        binding: Box<CollaborationProjectBinding>,
+        instruction: String,
+        resume_session: Option<Box<CodexSessionSummary>>,
+    },
+    Message(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionExecution {
+    target: String,
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionLookupScope {
+    provider: CollaborationProvider,
+    bot_id: String,
+    chat_id: String,
+}
 
 #[derive(Clone)]
 pub struct CollaborationManager {
     repository: Arc<Repository>,
     secrets: Arc<dyn SecretStore>,
     oauth_credentials: Arc<OAuthCredentialStore>,
+    gateway: Arc<GatewayManager>,
     data_dir: PathBuf,
     active: Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>,
     provider_tasks: Arc<Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>>,
@@ -95,6 +177,7 @@ struct BotConfig {
     callback_public_url: Option<String>,
     application_id: Option<String>,
     guild_id: Option<String>,
+    system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,12 +200,14 @@ impl CollaborationManager {
         repository: Arc<Repository>,
         secrets: Arc<dyn SecretStore>,
         oauth_credentials: Arc<OAuthCredentialStore>,
+        gateway: Arc<GatewayManager>,
         data_dir: PathBuf,
     ) -> Self {
         Self {
             repository,
             secrets,
             oauth_credentials,
+            gateway,
             data_dir,
             active: Arc::new(Mutex::new(HashMap::new())),
             provider_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -202,6 +287,7 @@ impl CollaborationManager {
                 credential_mask: credential_mask(input.provider, &config),
                 config_summary: config_summary(input.provider, &config),
                 callback_public_url,
+                system_prompt: config.system_prompt.clone(),
                 last_error: None,
                 updated_at_ms: now,
             },
@@ -212,6 +298,7 @@ impl CollaborationManager {
                 "callback_public_url": config.callback_public_url,
                 "application_id": config.application_id,
                 "guild_id": config.guild_id,
+                "system_prompt": config.system_prompt,
             }))
             .map_err(|_| AppError::Internal)?,
             secret_refs_json: serde_json::to_string(&secret_refs)
@@ -253,7 +340,7 @@ impl CollaborationManager {
                 ensure_success(
                     Client::new()
                         .get("https://discord.com/api/v10/users/@me")
-                        .bearer_auth(token)
+                        .header("Authorization", format!("Bot {token}"))
                         .send()
                         .await?,
                 )
@@ -302,14 +389,28 @@ impl CollaborationManager {
         {
             return Err(AppError::ValidationFailed);
         }
+        let execution_target = normalize_execution_target(input.execution_target.as_deref())?;
+        let model_id = normalized_model_id(input.model_id);
         let bot = self.repository.collaboration_bot(&input.bot_id)?;
-        let profile = self.repository.profile(&input.profile_id)?;
-        if profile.profile.kind != ProfileKind::CodexOauth
-            || !profile.profile.enabled
-            || !profile.profile.credential_configured
-        {
-            return Err(AppError::ProfileRuntimeUnavailable);
-        }
+        let (profile_id, profile_alias) = if execution_target == "profile" {
+            let profile_id = input
+                .profile_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or(AppError::ValidationFailed)?;
+            let profile = self.repository.profile(profile_id)?;
+            if !is_codex_runtime_profile(&profile.profile) {
+                return Err(AppError::ProfileRuntimeUnavailable);
+            }
+            (Some(profile.profile.id), Some(profile.profile.alias))
+        } else {
+            let Some(model) = model_id.as_deref() else {
+                return Err(AppError::ValidationFailed);
+            };
+            validate_gateway_model(&self.repository, model)?;
+            (None, None)
+        };
         let directory = PathBuf::from(&input.working_directory);
         if !directory.is_absolute() || !directory.is_dir() {
             return Err(AppError::ValidationFailed);
@@ -325,8 +426,8 @@ impl CollaborationManager {
             project_name: input.project_name.trim().to_owned(),
             project_slug: normalize_slug(&input.project_slug)?,
             working_directory: directory.display().to_string(),
-            profile_id: input.profile_id,
-            profile_alias: profile.profile.alias,
+            profile_id,
+            profile_alias,
             chat_id: existing.as_ref().and_then(|item| item.chat_id.clone()),
             bind_code: existing
                 .as_ref()
@@ -334,6 +435,10 @@ impl CollaborationManager {
                 .unwrap_or_else(generate_bind_code),
             enabled: input.enabled,
             concurrency_limit: input.concurrency_limit.clamp(1, 8),
+            execution_target: execution_target.clone(),
+            model_id: (execution_target == "gateway")
+                .then_some(model_id)
+                .flatten(),
             created_at_ms: existing
                 .as_ref()
                 .map(|item| item.created_at_ms)
@@ -372,7 +477,8 @@ impl CollaborationManager {
         if !input.confirmed {
             return Err(AppError::ConfirmationRequired);
         }
-        self.cancel_session_by_id(&input.session_id).await
+        self.cancel_session_by_reference(&input.session_id, None)
+            .await
     }
 
     pub async fn continue_session(
@@ -382,24 +488,9 @@ impl CollaborationManager {
         if !input.confirmed || input.instruction.trim().is_empty() {
             return Err(AppError::ValidationFailed);
         }
-        let stored = self.repository.codex_session(&input.session_id)?;
-        let codex_session_id = stored
-            .session
-            .codex_session_id
-            .clone()
-            .ok_or(AppError::Conflict)?;
-        let binding = self
-            .repository
-            .collaboration_project_binding(&stored.session.binding_id)?;
-        self.start_codex_session(
-            binding,
-            input.instruction,
-            stored.session.started_by,
-            true,
-            Some(codex_session_id),
-        )
-        .await
-        .map(|result| result.session.expect("continue returns session"))
+        let stored = self.resolve_codex_session_reference(&input.session_id, None)?;
+        self.continue_resolved_session(stored, input.instruction, None, Vec::new())
+            .await
     }
 
     pub async fn register_discord_commands(&self, id: String) -> AppResult<MaskedCollaborationBot> {
@@ -421,7 +512,7 @@ impl CollaborationManager {
         ensure_success(
             Client::new()
                 .post(url)
-                .bearer_auth(token)
+                .header("Authorization", format!("Bot {token}"))
                 .json(&json!({
                     "name": "codex",
                     "description": "在群聊中管理 Codex Relay 任务",
@@ -573,28 +664,120 @@ impl CollaborationManager {
         chat_id: &str,
         sender: Option<&str>,
         text: &str,
+        chat_kind: IncomingChatKind,
     ) -> AppResult<()> {
-        if !text.trim_start().starts_with("/codex") {
+        self.handle_incoming_message(IncomingMessage {
+            provider,
+            bot_id: bot_id.to_owned(),
+            chat_id: chat_id.to_owned(),
+            sender: sender.map(ToOwned::to_owned),
+            text: text.to_owned(),
+            chat_kind,
+            addressed: false,
+            images: Vec::new(),
+        })
+        .await
+    }
+
+    async fn handle_incoming_message(&self, message: IncomingMessage) -> AppResult<()> {
+        let Some(intent) = incoming_message_intent(&message) else {
             return Ok(());
+        };
+        let result = match intent {
+            IncomingTextIntent::Command(command) => {
+                self.handle_command_with_images(
+                    message.provider,
+                    &message.bot_id,
+                    &message.chat_id,
+                    message.sender.as_deref(),
+                    &command,
+                    message.images.clone(),
+                )
+                .await
+            }
+            IncomingTextIntent::NaturalTask {
+                instruction,
+                force_new,
+            } => {
+                self.handle_natural_task(
+                    message.provider,
+                    &message.bot_id,
+                    &message.chat_id,
+                    message.sender.as_deref(),
+                    instruction,
+                    force_new,
+                    message.images.clone(),
+                )
+                .await
+            }
         }
-        let result = self
-            .handle_command(provider, bot_id, chat_id, sender, text)
-            .await
-            .unwrap_or_else(|error| CollaborationCommandResult {
-                status: "failed".to_owned(),
-                message: error.to_string(),
-                session: None,
-            });
+        .unwrap_or_else(|error| CollaborationCommandResult {
+            status: "failed".to_owned(),
+            message: collaboration_error_message(&error),
+            session: None,
+        });
         if let Some(session) = result.session.as_ref() {
             let _ = self.send_or_update_session_message(session).await;
         } else {
             let _ = self
-                .send_platform_text(provider, bot_id, chat_id, &result.message)
+                .send_platform_text(
+                    message.provider,
+                    &message.bot_id,
+                    &message.chat_id,
+                    &result.message,
+                )
                 .await;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_natural_task(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        sender: Option<&str>,
+        instruction: String,
+        force_new: bool,
+        images: Vec<IncomingImage>,
+    ) -> AppResult<CollaborationCommandResult> {
+        match self.resolve_natural_run(provider, bot_id, chat_id, sender, instruction, force_new)? {
+            NaturalRunResolution::Ready {
+                binding,
+                instruction,
+                resume_session,
+            } => {
+                let execution = resume_session
+                    .as_ref()
+                    .map(|session| execution_from_session(session));
+                let codex_session_id = resume_session
+                    .as_ref()
+                    .and_then(|session| session.codex_session_id.clone());
+                let mut binding = *binding;
+                if let Some(session) = resume_session.as_ref() {
+                    apply_session_profile_snapshot(&mut binding, session);
+                }
+                self.start_codex_session(
+                    binding,
+                    instruction,
+                    sender.map(ToOwned::to_owned),
+                    codex_session_id.is_some(),
+                    codex_session_id,
+                    execution,
+                    images,
+                )
+                .await
+            }
+            NaturalRunResolution::Message(message) => Ok(CollaborationCommandResult {
+                status: "needs_project".to_owned(),
+                message,
+                session: None,
+            }),
+        }
+    }
+
+    #[allow(dead_code)]
     pub async fn handle_command(
         &self,
         provider: CollaborationProvider,
@@ -602,6 +785,19 @@ impl CollaborationManager {
         chat_id: &str,
         sender: Option<&str>,
         text: &str,
+    ) -> AppResult<CollaborationCommandResult> {
+        self.handle_command_with_images(provider, bot_id, chat_id, sender, text, Vec::new())
+            .await
+    }
+
+    async fn handle_command_with_images(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        sender: Option<&str>,
+        text: &str,
+        images: Vec<IncomingImage>,
     ) -> AppResult<CollaborationCommandResult> {
         match parse_codex_command(text)? {
             CodexCommand::Help => Ok(CollaborationCommandResult {
@@ -659,6 +855,8 @@ impl CollaborationManager {
                     sender.map(ToOwned::to_owned),
                     false,
                     None,
+                    None,
+                    images,
                 )
                 .await
             }
@@ -699,44 +897,122 @@ impl CollaborationManager {
                 })
             }
             CodexCommand::Status { session_id } => {
-                let session = self.repository.codex_session(&session_id)?.session;
+                let scope = SessionLookupScope::new(provider, bot_id, chat_id);
+                let session = self
+                    .resolve_codex_session_reference(&session_id, Some(&scope))?
+                    .session;
                 Ok(CollaborationCommandResult {
                     status: "ok".into(),
                     message: format_session_status(&session),
                     session: None,
                 })
             }
-            CodexCommand::Cancel { session_id } => self
-                .cancel_session_by_id(&session_id)
-                .await
-                .map(|session| CollaborationCommandResult {
-                    status: "cancelled".into(),
-                    message: "任务已取消。".into(),
-                    session: Some(session),
-                }),
+            CodexCommand::Cancel { session_id } => {
+                let scope = SessionLookupScope::new(provider, bot_id, chat_id);
+                self.cancel_session_by_reference(&session_id, Some(&scope))
+                    .await
+                    .map(|session| CollaborationCommandResult {
+                        status: "cancelled".into(),
+                        message: "任务已取消。".into(),
+                        session: Some(session),
+                    })
+            }
             CodexCommand::Continue {
                 session_id,
                 instruction,
             } => {
-                let stored = self.repository.codex_session(&session_id)?;
-                let codex_session_id = stored
-                    .session
-                    .codex_session_id
-                    .clone()
-                    .ok_or(AppError::Conflict)?;
-                let binding = self
-                    .repository
-                    .collaboration_project_binding(&stored.session.binding_id)?;
-                self.start_codex_session(
-                    binding,
+                let scope = SessionLookupScope::new(provider, bot_id, chat_id);
+                let stored = self.resolve_codex_session_reference(&session_id, Some(&scope))?;
+                self.continue_resolved_session(
+                    stored,
                     instruction,
                     sender.map(ToOwned::to_owned),
-                    true,
-                    Some(codex_session_id),
+                    images,
                 )
                 .await
+                .map(|session| CollaborationCommandResult {
+                    status: "running".into(),
+                    message: "Codex 会话已继续。".into(),
+                    session: Some(session),
+                })
             }
         }
+    }
+
+    fn resolve_codex_session_reference(
+        &self,
+        reference: &str,
+        scope: Option<&SessionLookupScope>,
+    ) -> AppResult<StoredCodexSession> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(AppError::ValidationFailed);
+        }
+        match self.repository.codex_session(reference) {
+            Ok(stored) => {
+                if scope.is_none_or(|scope| scope.matches(&stored.session)) {
+                    return Ok(stored);
+                }
+                return Err(AppError::NotFound);
+            }
+            Err(AppError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        if reference.chars().count() < 8 {
+            return Err(AppError::ValidationFailed);
+        }
+        let matches = self
+            .repository
+            .list_codex_sessions(None)?
+            .into_iter()
+            .filter(|stored| scope.is_none_or(|scope| scope.matches(&stored.session)))
+            .filter(|stored| session_matches_reference(&stored.session, reference))
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => Err(AppError::NotFound),
+            1 => Ok(matches.into_iter().next().expect("one session match")),
+            _ => Err(AppError::Conflict),
+        }
+    }
+
+    async fn cancel_session_by_reference(
+        &self,
+        reference: &str,
+        scope: Option<&SessionLookupScope>,
+    ) -> AppResult<CodexSessionSummary> {
+        let stored = self.resolve_codex_session_reference(reference, scope)?;
+        self.cancel_session_by_id(&stored.session.id).await
+    }
+
+    async fn continue_resolved_session(
+        &self,
+        stored: StoredCodexSession,
+        instruction: String,
+        started_by: Option<String>,
+        images: Vec<IncomingImage>,
+    ) -> AppResult<CodexSessionSummary> {
+        let codex_session_id = stored
+            .session
+            .codex_session_id
+            .clone()
+            .ok_or(AppError::Conflict)?;
+        let binding = self
+            .repository
+            .collaboration_project_binding(&stored.session.binding_id)?;
+        let mut binding = binding;
+        apply_stored_session_snapshot(&mut binding, &stored);
+        let execution = execution_from_session(&stored.session);
+        self.start_codex_session(
+            binding,
+            instruction,
+            started_by.or(stored.session.started_by),
+            true,
+            Some(codex_session_id),
+            Some(execution),
+            images,
+        )
+        .await
+        .map(|result| result.session.expect("continue returns session"))
     }
 
     fn binding_for_project(
@@ -751,6 +1027,78 @@ impl CollaborationManager {
             .into_iter()
             .find(|binding| binding.project_slug == project && binding.enabled)
             .ok_or(AppError::NotFound)
+    }
+
+    fn resolve_natural_run(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        sender: Option<&str>,
+        instruction: String,
+        force_new: bool,
+    ) -> AppResult<NaturalRunResolution> {
+        let bindings = self
+            .repository
+            .collaboration_bindings_for_chat(provider, bot_id, chat_id)?;
+        match bindings.as_slice() {
+            [] => Ok(NaturalRunResolution::Message(
+                "当前会话还没有绑定项目。请先在 Codex Relay 客户端创建项目绑定，再发送 /codex bind <code>。"
+                    .to_owned(),
+            )),
+            [binding] => {
+                let resume_session = if force_new {
+                    None
+                } else {
+                    match self.recent_resumable_session(binding, sender) {
+                        Ok(session) => session.map(Box::new),
+                        Err(
+                            AppError::LocalStateUnavailable
+                            | AppError::Internal
+                            | AppError::NotFound,
+                        ) => None,
+                        Err(error) => return Err(error),
+                    }
+                };
+                Ok(NaturalRunResolution::Ready {
+                    binding: Box::new(binding.clone()),
+                    instruction,
+                    resume_session,
+                })
+            }
+            _ => Ok(NaturalRunResolution::Message(format!(
+                "当前会话绑定了多个项目，请补项目名：\n{}\n可发送 /codex run <project> <任务说明> 指定项目。",
+                bindings
+                    .into_iter()
+                    .map(|binding| format!("- {} ({})", binding.project_name, binding.project_slug))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))),
+        }
+    }
+
+    fn recent_resumable_session(
+        &self,
+        binding: &CollaborationProjectBinding,
+        sender: Option<&str>,
+    ) -> AppResult<Option<CodexSessionSummary>> {
+        let cutoff = timestamp_ms() - NATURAL_TASK_RESUME_WINDOW_MS;
+        Ok(self
+            .repository
+            .list_codex_sessions(Some(&binding.id))?
+            .into_iter()
+            .filter(|stored| {
+                let session = &stored.session;
+                session.provider == binding.provider
+                    && session.provider_bot_id.as_deref() == Some(binding.bot_id.as_str())
+                    && session.provider_chat_id.as_deref() == binding.chat_id.as_deref()
+                    && session.started_by.as_deref() == sender
+                    && session.started_at_ms >= cutoff
+                    && matches!(session.relay_status.as_str(), "completed" | "failed")
+                    && session.codex_session_id.is_some()
+            })
+            .map(|stored| stored.session)
+            .next())
     }
 
     async fn cancel_session_by_id(&self, session_id: &str) -> AppResult<CodexSessionSummary> {
@@ -771,7 +1119,7 @@ impl CollaborationManager {
             None,
             Some(timestamp_ms()),
         )?;
-        self.record_event(session_id, "cancelled", "任务已取消。")?;
+        self.record_event(session_id, "cancelled", "任务已取消。");
         let manager = self.clone();
         let session_for_update = session.clone();
         tauri::async_runtime::spawn(async move {
@@ -780,6 +1128,7 @@ impl CollaborationManager {
         Ok(session)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_codex_session(
         &self,
         binding: CollaborationProjectBinding,
@@ -787,6 +1136,8 @@ impl CollaborationManager {
         started_by: Option<String>,
         resume: bool,
         codex_session_id: Option<String>,
+        execution_override: Option<SessionExecution>,
+        images: Vec<IncomingImage>,
     ) -> AppResult<CollaborationCommandResult> {
         if self.repository.count_running_codex_sessions(None)? >= GLOBAL_CONCURRENCY_LIMIT {
             return Ok(CollaborationCommandResult {
@@ -813,46 +1164,67 @@ impl CollaborationManager {
                 session: None,
             });
         }
-        let profile = self.repository.profile(&binding.profile_id)?;
-        let auth_json = self.profile_auth_json(&profile).await?;
+        let execution = execution_override.unwrap_or_else(|| execution_from_binding(&binding));
+        let working_directory = Path::new(&binding.working_directory);
+        if !working_directory.is_dir() {
+            return Err(AppError::RuntimeUnavailable);
+        }
         let session_id = Uuid::new_v4().to_string();
         let now = timestamp_ms();
         let session_home = self.session_home(&session_id);
-        write_auth_json_to_home(&session_home, &auth_json)?;
+        if execution.target == "gateway" {
+            let auth_json = self.gateway_oauth_auth_json().await?;
+            let model = execution
+                .model_id
+                .as_deref()
+                .ok_or(AppError::ValidationFailed)?;
+            self.write_gateway_session_config(&session_home, model, auth_json.as_deref())
+                .await?;
+        } else {
+            let profile_id = binding
+                .profile_id
+                .as_deref()
+                .ok_or(AppError::ProfileRuntimeUnavailable)?;
+            let profile = self.repository.profile(profile_id)?;
+            let auth_json = self.profile_auth_json(&profile).await?;
+            write_auth_json_to_home(&session_home, &auth_json)?;
+        }
+        let image_paths = match self
+            .download_incoming_images(&binding.provider, &binding.bot_id, &session_id, &images)
+            .await
+        {
+            Ok(paths) => paths,
+            Err(message) => {
+                return Ok(CollaborationCommandResult {
+                    status: "failed".into(),
+                    message,
+                    session: None,
+                });
+            }
+        };
         let output_file = session_home.join("last-message.txt");
         let mut command = Command::new("codex");
-        if resume {
-            let codex_id = codex_session_id.clone().ok_or(AppError::ValidationFailed)?;
-            let args = CODEX_RESUME_ARGS
-                .iter()
-                .flat_map(|arg| match *arg {
-                    "__OUTPUT__" => vec![output_file.display().to_string()],
-                    "__SESSION__" => vec![codex_id.clone()],
-                    other => vec![other.to_owned()],
-                })
-                .collect::<Vec<_>>();
-            command.args(args);
-        } else {
-            let args = CODEX_SESSION_ARGS
-                .iter()
-                .flat_map(|arg| match *arg {
-                    "__OUTPUT__" => vec![output_file.display().to_string(), "-".to_owned()],
-                    other => vec![other.to_owned()],
-                })
-                .collect::<Vec<_>>();
-            command.args(args);
-        }
+        let args = codex_command_args(
+            resume,
+            codex_session_id.as_deref(),
+            &output_file,
+            &image_paths,
+        )?;
+        command.args(args);
+        let system_prompt = self.bot_system_prompt(&binding.bot_id)?;
+        let codex_instruction =
+            build_codex_instruction(system_prompt.as_deref(), &instruction, image_paths.len());
         command
             .env("CODEX_HOME", &session_home)
             .env_remove("CODEX_API_KEY")
-            .current_dir(&binding.working_directory)
+            .current_dir(working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|_| AppError::RuntimeUnavailable)?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin
-                .write_all(instruction.as_bytes())
+                .write_all(codex_instruction.as_bytes())
                 .and_then(|()| stdin.flush())
                 .map_err(|_| AppError::RuntimeUnavailable)?;
         }
@@ -890,12 +1262,21 @@ impl CollaborationManager {
                 .into(),
             ),
             last_error: None,
+            execution_target: execution.target.clone(),
+            model_id: execution.model_id.clone(),
         };
         self.repository.insert_codex_session(&StoredCodexSession {
             session: session.clone(),
             working_directory: binding.working_directory.clone(),
         })?;
-        self.record_event(&session_id, "received", &redact(&instruction))?;
+        self.record_event(&session_id, "received", &redact(&instruction));
+        if !image_paths.is_empty() {
+            self.record_event(
+                &session_id,
+                "attachments",
+                &format!("已附加 {} 张图片。", image_paths.len()),
+            );
+        }
         let child = Arc::new(Mutex::new(child));
         self.active
             .lock()
@@ -921,6 +1302,7 @@ impl CollaborationManager {
         let active = self.active.clone();
         let manager = self.clone();
         thread::spawn(move || {
+            let mut stderr_tail = VecDeque::new();
             if let Some(stdout) = stdout {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     if line.trim().is_empty() {
@@ -942,22 +1324,23 @@ impl CollaborationManager {
             if let Some(stderr) = stderr {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     if !line.trim().is_empty() {
+                        let redacted = redact(&line);
+                        stderr_tail.push_back(redacted.clone());
+                        while stderr_tail.len() > 12 {
+                            stderr_tail.pop_front();
+                        }
                         let _ = repository.insert_codex_session_event(&CodexSessionEvent {
                             id: Uuid::new_v4().to_string(),
                             session_id: session_id.clone(),
                             occurred_at_ms: timestamp_ms(),
                             event_type: "stderr".into(),
-                            content: redact(&line),
+                            content: redacted,
                         });
                     }
                 }
             }
-            let success = child
-                .lock()
-                .ok()
-                .and_then(|mut child| child.wait().ok())
-                .map(|status| status.success())
-                .unwrap_or(false);
+            let exit_status = child.lock().ok().and_then(|mut child| child.wait().ok());
+            let success = exit_status.as_ref().is_some_and(|status| status.success());
             if let Ok(mut active) = active.lock() {
                 active.remove(&session_id);
             }
@@ -973,16 +1356,28 @@ impl CollaborationManager {
                     }
                     .into()
                 });
+            if repository
+                .codex_session(&session_id)
+                .ok()
+                .is_some_and(|stored| stored.session.relay_status == "cancelled")
+            {
+                let _ = repository.insert_codex_session_event(&CodexSessionEvent {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.clone(),
+                    occurred_at_ms: timestamp_ms(),
+                    event_type: "cancelled_ack".into(),
+                    content: "Codex 进程已在取消后退出。".into(),
+                });
+                return;
+            }
             let status = if success { "completed" } else { "failed" };
+            let last_error = (!success)
+                .then(|| codex_failure_detail(exit_status.as_ref(), &stderr_tail, &final_summary));
             let session = repository.set_codex_session_status(
                 &session_id,
                 status,
                 Some(&truncate_chars(&final_summary, 1500)),
-                if success {
-                    None
-                } else {
-                    Some("Codex 进程返回失败状态。")
-                },
+                last_error.as_deref(),
                 Some(timestamp_ms()),
             );
             let _ = repository.insert_codex_session_event(&CodexSessionEvent {
@@ -1028,6 +1423,40 @@ impl CollaborationManager {
             .map_err(|_| AppError::ProfileRuntimeUnavailable)
     }
 
+    async fn write_gateway_session_config(
+        &self,
+        home: &Path,
+        model: &str,
+        auth_json: Option<&str>,
+    ) -> AppResult<()> {
+        let gateway = self.gateway.status()?;
+        if !gateway.running || !gateway.certificate_ready {
+            return Err(AppError::GatewayNotRunning);
+        }
+        if gateway.available_profiles == 0 {
+            return Err(AppError::UpstreamUnavailable);
+        }
+        let secret_ref =
+            codex_gateway::ensure_codex_client_key(&self.repository, self.secrets.clone()).await?;
+        write_gateway_session_files_to_home(
+            home,
+            auth_json,
+            &gateway.service_url,
+            model,
+            &secret_ref,
+            &self.data_dir,
+        )
+    }
+
+    async fn gateway_oauth_auth_json(&self) -> AppResult<Option<String>> {
+        codex_gateway::codex_oauth_profile_auth_json(
+            &self.repository,
+            &self.oauth_credentials,
+            OAuthCredentialAccess::Background,
+        )
+        .await
+    }
+
     fn session_home(&self, session_id: &str) -> PathBuf {
         self.data_dir
             .join("collaboration-sessions")
@@ -1035,8 +1464,131 @@ impl CollaborationManager {
             .join("codex-home")
     }
 
-    fn record_event(&self, session_id: &str, event_type: &str, content: &str) -> AppResult<()> {
-        self.repository
+    fn bot_system_prompt(&self, bot_id: &str) -> AppResult<Option<String>> {
+        let stored = self.repository.collaboration_bot(bot_id)?;
+        config_from_json(&stored.config_json).map(|config| config.system_prompt)
+    }
+
+    async fn download_incoming_images(
+        &self,
+        provider: &CollaborationProvider,
+        bot_id: &str,
+        session_id: &str,
+        images: &[IncomingImage],
+    ) -> Result<Vec<PathBuf>, String> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        if images.len() > MAX_INCOMING_IMAGES {
+            return Err(format!(
+                "图片数量超过上限：最多支持 {MAX_INCOMING_IMAGES} 张，本次收到 {} 张。",
+                images.len()
+            ));
+        }
+        let directory = self.session_home(session_id).join("incoming-images");
+        fs::create_dir_all(&directory).map_err(|_| "图片保存目录创建失败。".to_owned())?;
+        let mut paths = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let bytes = self
+                .download_incoming_image(provider, bot_id, image)
+                .await
+                .map_err(|reason| format!("第 {} 张图片下载失败：{reason}", index + 1))?;
+            if bytes.is_empty() {
+                return Err(format!("第 {} 张图片为空。", index + 1));
+            }
+            if bytes.len() as u64 > MAX_INCOMING_IMAGE_BYTES {
+                return Err(format!(
+                    "第 {} 张图片超过 20MB 上限（{} 字节）。",
+                    index + 1,
+                    bytes.len()
+                ));
+            }
+            let extension = image_extension_from_hint(image.filename_hint.as_deref())
+                .unwrap_or_else(|| image_extension_from_bytes(&bytes));
+            let path = directory.join(format!("image-{}.{}", index + 1, extension));
+            fs::write(&path, bytes).map_err(|_| format!("第 {} 张图片保存失败。", index + 1))?;
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
+    async fn download_incoming_image(
+        &self,
+        _provider: &CollaborationProvider,
+        bot_id: &str,
+        image: &IncomingImage,
+    ) -> Result<Vec<u8>, String> {
+        match &image.source {
+            IncomingImageSource::FeishuMessageResource {
+                message_id,
+                file_key,
+            } => {
+                let client = self
+                    .feishu_client(bot_id)
+                    .await
+                    .map_err(|error| collaboration_error_message(&error))?;
+                let file = client
+                    .im_v1_message_resource()
+                    .download(
+                        message_id.clone(),
+                        file_key.clone(),
+                        vec![("type".to_owned(), "image".to_owned())],
+                        feishu_sdk::core::RequestOptions::default(),
+                    )
+                    .await
+                    .map_err(|error| format!("飞书资源接口返回异常：{error}"))?;
+                Ok(file.bytes)
+            }
+            IncomingImageSource::TelegramFile { file_id } => {
+                let runtime = self
+                    .runtime(bot_id)
+                    .await
+                    .map_err(|error| collaboration_error_message(&error))?;
+                let token = self
+                    .secret(&runtime, "bot_token")
+                    .await
+                    .map_err(|error| collaboration_error_message(&error))?;
+                let file: Value = Client::new()
+                    .post(format!("https://api.telegram.org/bot{token}/getFile"))
+                    .json(&json!({"file_id": file_id}))
+                    .send()
+                    .await
+                    .map_err(|_| "Telegram getFile 请求失败。".to_owned())?
+                    .json()
+                    .await
+                    .map_err(|_| "Telegram getFile 响应无法解析。".to_owned())?;
+                let file_path = file
+                    .get("result")
+                    .and_then(|result| result.get("file_path"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Telegram 未返回 file_path。".to_owned())?;
+                download_url_limited(
+                    &format!("https://api.telegram.org/file/bot{token}/{file_path}"),
+                    None,
+                )
+                .await
+            }
+            IncomingImageSource::WecomMedia { media_id } => {
+                let runtime = self
+                    .runtime(bot_id)
+                    .await
+                    .map_err(|error| collaboration_error_message(&error))?;
+                let token = self
+                    .wecom_access_token(&runtime)
+                    .await
+                    .map_err(|error| collaboration_error_message(&error))?;
+                let url = format!(
+                    "https://qyapi.weixin.qq.com/cgi-bin/media/get?access_token={token}&media_id={media_id}"
+                );
+                download_url_limited(&url, None).await
+            }
+            IncomingImageSource::Url { url } => download_url_limited(url, None).await,
+        }
+    }
+
+    fn record_event(&self, session_id: &str, event_type: &str, content: &str) {
+        if let Err(error) = self
+            .repository
             .insert_codex_session_event(&CodexSessionEvent {
                 id: Uuid::new_v4().to_string(),
                 session_id: session_id.to_owned(),
@@ -1044,6 +1596,11 @@ impl CollaborationManager {
                 event_type: event_type.to_owned(),
                 content: content.to_owned(),
             })
+        {
+            eprintln!(
+                "[collaboration] failed to record codex session event {event_type} for {session_id}: {error}"
+            );
+        }
     }
 
     async fn send_or_update_session_message(&self, session: &CodexSessionSummary) -> AppResult<()> {
@@ -1063,16 +1620,27 @@ impl CollaborationManager {
             .provider_chat_id
             .as_deref()
             .ok_or(AppError::ValidationFailed)?;
-        let message_id = if session.provider == CollaborationProvider::Feishu {
-            self.send_feishu_card(bot_id, chat_id, session).await?
-        } else {
-            self.send_platform_text(
-                session.provider,
-                bot_id,
-                chat_id,
-                &format_session_status(session),
-            )
-            .await?
+        let message_id = match session.provider {
+            CollaborationProvider::Feishu => {
+                self.send_feishu_card(bot_id, chat_id, session).await?
+            }
+            CollaborationProvider::Telegram => {
+                self.send_telegram_session_message(bot_id, chat_id, session)
+                    .await?
+            }
+            CollaborationProvider::Discord => {
+                self.send_discord_session_message(bot_id, chat_id, session)
+                    .await?
+            }
+            _ => {
+                self.send_platform_text(
+                    session.provider,
+                    bot_id,
+                    chat_id,
+                    &format_session_status(session),
+                )
+                .await?
+            }
         };
         if !message_id.is_empty() {
             self.repository
@@ -1108,13 +1676,8 @@ impl CollaborationManager {
                     .provider_message_id
                     .as_deref()
                     .ok_or(AppError::ValidationFailed)?;
-                self.edit_telegram_message(
-                    bot_id,
-                    chat_id,
-                    message_id,
-                    &format_session_status(session),
-                )
-                .await
+                self.edit_telegram_session_message(bot_id, chat_id, message_id, session)
+                    .await
             }
             CollaborationProvider::Discord => {
                 let bot_id = session
@@ -1129,13 +1692,8 @@ impl CollaborationManager {
                     .provider_message_id
                     .as_deref()
                     .ok_or(AppError::ValidationFailed)?;
-                self.edit_discord_message(
-                    bot_id,
-                    chat_id,
-                    message_id,
-                    &format_session_status(session),
-                )
-                .await
+                self.edit_discord_session_message(bot_id, chat_id, message_id, session)
+                    .await
             }
             _ => {
                 let bot_id = session
@@ -1237,17 +1795,49 @@ impl CollaborationManager {
         let Some(value) = action.action.and_then(|item| item.value) else {
             return Ok(());
         };
-        let op = value.get("op").and_then(Value::as_str).unwrap_or_default();
-        let session_id = value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        if let Some((op, session_id)) = session_action_from_value(&value) {
+            self.handle_unscoped_session_action(op, session_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_unscoped_session_action(&self, op: &str, session_id: &str) -> AppResult<()> {
         match op {
-            "cancel" if !session_id.is_empty() => {
-                let _ = self.cancel_session_by_id(session_id).await?;
+            "cancel" => {
+                let session = self.cancel_session_by_id(session_id).await?;
+                self.update_session_message(&session).await?;
             }
-            "refresh" if !session_id.is_empty() => {
+            "refresh" => {
                 let session = self.repository.codex_session(session_id)?.session;
+                self.update_session_message(&session).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_scoped_session_action(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        data: &str,
+    ) -> AppResult<()> {
+        let Some((op, session_id)) = parse_session_action_data(data) else {
+            return Ok(());
+        };
+        let scope = SessionLookupScope::new(provider, bot_id, chat_id);
+        match op {
+            "cancel" => {
+                let session = self
+                    .cancel_session_by_reference(session_id, Some(&scope))
+                    .await?;
+                self.update_session_message(&session).await?;
+            }
+            "refresh" => {
+                let session = self
+                    .resolve_codex_session_reference(session_id, Some(&scope))?
+                    .session;
                 self.update_session_message(&session).await?;
             }
             _ => {}
@@ -1271,7 +1861,7 @@ impl CollaborationManager {
                 "msg_type": "interactive",
                 "content": session_card(session).to_string(),
             }))
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::UpstreamUnavailable)?
             .send()
             .await
             .map_err(|_| AppError::UpstreamUnavailable)?;
@@ -1297,7 +1887,7 @@ impl CollaborationManager {
             .operation("im.v1.message.patch")
             .path_param("message_id", message_id)
             .body_json(&json!({"content": session_card(session).to_string()}))
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::UpstreamUnavailable)?
             .send()
             .await
             .map_err(|_| AppError::UpstreamUnavailable)?;
@@ -1315,7 +1905,7 @@ impl CollaborationManager {
                 "msg_type": "text",
                 "content": json!({"text": truncate_chars(text, 3000)}).to_string(),
             }))
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::UpstreamUnavailable)?
             .send()
             .await
             .map_err(|_| AppError::UpstreamUnavailable)?;
@@ -1376,6 +1966,30 @@ impl CollaborationManager {
                             &(update_id + 1).to_string(),
                         )?;
                     }
+                    if let Some(callback) = update.get("callback_query") {
+                        let data = callback
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let chat_id = callback
+                            .get("message")
+                            .and_then(|message| message.get("chat"))
+                            .and_then(|chat| chat.get("id"))
+                            .map(value_to_id_string)
+                            .unwrap_or_default();
+                        if !chat_id.is_empty() {
+                            let _ = self.answer_telegram_callback(&token, callback).await;
+                            let _ = self
+                                .handle_scoped_session_action(
+                                    CollaborationProvider::Telegram,
+                                    &bot_id,
+                                    &chat_id,
+                                    data,
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
                     let Some(message) =
                         update.get("message").or_else(|| update.get("channel_post"))
                     else {
@@ -1383,6 +1997,7 @@ impl CollaborationManager {
                     };
                     let text = message
                         .get("text")
+                        .or_else(|| message.get("caption"))
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     let chat_id = message
@@ -1390,19 +2005,32 @@ impl CollaborationManager {
                         .and_then(|chat| chat.get("id"))
                         .map(value_to_id_string)
                         .unwrap_or_default();
+                    let chat_kind = if message
+                        .get("chat")
+                        .and_then(|chat| chat.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("private")
+                    {
+                        IncomingChatKind::Direct
+                    } else {
+                        IncomingChatKind::Group
+                    };
                     let sender = message
                         .get("from")
                         .and_then(|from| from.get("username").or_else(|| from.get("id")))
                         .map(value_to_id_string);
                     if !chat_id.is_empty() {
                         let _ = self
-                            .handle_incoming_text(
-                                CollaborationProvider::Telegram,
-                                &bot_id,
-                                &chat_id,
-                                sender.as_deref(),
-                                text,
-                            )
+                            .handle_incoming_message(IncomingMessage {
+                                provider: CollaborationProvider::Telegram,
+                                bot_id: bot_id.clone(),
+                                chat_id,
+                                sender,
+                                text: text.to_owned(),
+                                chat_kind,
+                                addressed: false,
+                                images: telegram_images(message),
+                            })
                             .await;
                     }
                 }
@@ -1411,17 +2039,63 @@ impl CollaborationManager {
         }
     }
 
+    async fn answer_telegram_callback(&self, token: &str, callback: &Value) -> AppResult<()> {
+        let Some(callback_query_id) = callback.get("id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        ensure_success(
+            Client::new()
+                .post(format!(
+                    "https://api.telegram.org/bot{token}/answerCallbackQuery"
+                ))
+                .json(&json!({"callback_query_id": callback_query_id}))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
     async fn send_telegram_message(
         &self,
         bot_id: &str,
         chat_id: &str,
         text: &str,
     ) -> AppResult<String> {
+        self.send_telegram_message_with_markup(bot_id, chat_id, text, None)
+            .await
+    }
+
+    async fn send_telegram_session_message(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        session: &CodexSessionSummary,
+    ) -> AppResult<String> {
+        self.send_telegram_message_with_markup(
+            bot_id,
+            chat_id,
+            &format_session_status(session),
+            Some(telegram_session_reply_markup(session)),
+        )
+        .await
+    }
+
+    async fn send_telegram_message_with_markup(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> AppResult<String> {
         let runtime = self.runtime(bot_id).await?;
         let token = self.secret(&runtime, "bot_token").await?;
+        let mut body = json!({"chat_id": chat_id, "text": truncate_chars(text, 3900)});
+        if let Some(reply_markup) = reply_markup {
+            body["reply_markup"] = reply_markup;
+        }
         let response: Value = Client::new()
             .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
-            .json(&json!({"chat_id": chat_id, "text": truncate_chars(text, 3900)}))
+            .json(&body)
             .send()
             .await
             .map_err(|_| AppError::UpstreamUnavailable)?
@@ -1435,6 +2109,24 @@ impl CollaborationManager {
             .unwrap_or_default())
     }
 
+    async fn edit_telegram_session_message(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        session: &CodexSessionSummary,
+    ) -> AppResult<()> {
+        self.edit_telegram_message_with_markup(
+            bot_id,
+            chat_id,
+            message_id,
+            &format_session_status(session),
+            Some(telegram_session_reply_markup(session)),
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
     async fn edit_telegram_message(
         &self,
         bot_id: &str,
@@ -1442,12 +2134,30 @@ impl CollaborationManager {
         message_id: &str,
         text: &str,
     ) -> AppResult<()> {
+        self.edit_telegram_message_with_markup(bot_id, chat_id, message_id, text, None)
+            .await
+    }
+
+    async fn edit_telegram_message_with_markup(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> AppResult<()> {
         let runtime = self.runtime(bot_id).await?;
         let token = self.secret(&runtime, "bot_token").await?;
+        let mut body = json!({"chat_id": chat_id, "message_id": message_id, "text": truncate_chars(text, 3900)});
+        if let Some(reply_markup) = reply_markup {
+            body["reply_markup"] = reply_markup;
+        }
         ensure_success(
             Client::new()
-                .post(format!("https://api.telegram.org/bot{token}/editMessageText"))
-                .json(&json!({"chat_id": chat_id, "message_id": message_id, "text": truncate_chars(text, 3900)}))
+                .post(format!(
+                    "https://api.telegram.org/bot{token}/editMessageText"
+                ))
+                .json(&body)
                 .send()
                 .await?,
         )
@@ -1459,7 +2169,7 @@ impl CollaborationManager {
         let token = self.secret(&runtime, "bot_token").await?;
         let gateway: Value = Client::new()
             .get("https://discord.com/api/v10/gateway/bot")
-            .bearer_auth(&token)
+            .header("Authorization", format!("Bot {token}"))
             .send()
             .await
             .map_err(|_| AppError::UpstreamUnavailable)?
@@ -1530,22 +2240,47 @@ impl CollaborationManager {
                     }
                     let text = d.get("content").and_then(Value::as_str).unwrap_or_default();
                     let chat_id = d.get("channel_id").and_then(Value::as_str).unwrap_or_default();
+                    let chat_kind = if d.get("guild_id").is_some_and(|value| !value.is_null()) {
+                        IncomingChatKind::Group
+                    } else {
+                        IncomingChatKind::Direct
+                    };
                     let sender = d
                         .get("author")
                         .and_then(|a| a.get("username").or_else(|| a.get("id")))
                         .map(value_to_id_string);
                     let _ = self
-                        .handle_incoming_text(
-                            CollaborationProvider::Discord,
-                            &bot_id,
-                            chat_id,
-                            sender.as_deref(),
-                            text,
-                        )
+                        .handle_incoming_message(IncomingMessage {
+                            provider: CollaborationProvider::Discord,
+                            bot_id: bot_id.clone(),
+                            chat_id: chat_id.to_owned(),
+                            sender,
+                            text: text.to_owned(),
+                            chat_kind,
+                            addressed: false,
+                            images: discord_images(d),
+                        })
                         .await;
                 }
                 "INTERACTION_CREATE" => {
                     let d = payload.get("d").unwrap_or(&Value::Null);
+                    if let Some(custom_id) = d
+                        .get("data")
+                        .and_then(|data| data.get("custom_id"))
+                        .and_then(Value::as_str)
+                    {
+                        let chat_id = d.get("channel_id").and_then(Value::as_str).unwrap_or_default();
+                        self.ack_discord_component_interaction(d).await.ok();
+                        let _ = self
+                            .handle_scoped_session_action(
+                                CollaborationProvider::Discord,
+                                &bot_id,
+                                chat_id,
+                                custom_id,
+                            )
+                            .await;
+                        continue;
+                    }
                     let name = d.get("data").and_then(|data| data.get("name")).and_then(Value::as_str).unwrap_or_default();
                     if name != "codex" {
                         continue;
@@ -1560,6 +2295,11 @@ impl CollaborationManager {
                         .unwrap_or("help");
                     let text = format!("/codex {option}");
                     let chat_id = d.get("channel_id").and_then(Value::as_str).unwrap_or_default();
+                    let chat_kind = if d.get("guild_id").is_some_and(|value| !value.is_null()) {
+                        IncomingChatKind::Group
+                    } else {
+                        IncomingChatKind::Direct
+                    };
                     let sender = d
                         .get("member")
                         .and_then(|m| m.get("user"))
@@ -1573,6 +2313,7 @@ impl CollaborationManager {
                             chat_id,
                             sender.as_deref(),
                             &text,
+                            chat_kind,
                         )
                         .await;
                 }
@@ -1602,20 +2343,71 @@ impl CollaborationManager {
         .await
     }
 
+    async fn ack_discord_component_interaction(&self, interaction: &Value) -> AppResult<()> {
+        let id = interaction
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(AppError::ValidationFailed)?;
+        let token = interaction
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or(AppError::ValidationFailed)?;
+        ensure_success(
+            Client::new()
+                .post(format!(
+                    "https://discord.com/api/v10/interactions/{id}/{token}/callback"
+                ))
+                .json(&json!({"type": 6}))
+                .send()
+                .await?,
+        )
+        .await
+    }
+
     async fn send_discord_message(
         &self,
         bot_id: &str,
         chat_id: &str,
         text: &str,
     ) -> AppResult<String> {
+        self.send_discord_message_with_components(bot_id, chat_id, text, None)
+            .await
+    }
+
+    async fn send_discord_session_message(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        session: &CodexSessionSummary,
+    ) -> AppResult<String> {
+        self.send_discord_message_with_components(
+            bot_id,
+            chat_id,
+            &format_session_status(session),
+            Some(discord_session_components(session)),
+        )
+        .await
+    }
+
+    async fn send_discord_message_with_components(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        text: &str,
+        components: Option<Value>,
+    ) -> AppResult<String> {
         let runtime = self.runtime(bot_id).await?;
         let token = self.secret(&runtime, "bot_token").await?;
+        let mut body = json!({"content": truncate_chars(text, 1900)});
+        if let Some(components) = components {
+            body["components"] = components;
+        }
         let response: Value = Client::new()
             .post(format!(
                 "https://discord.com/api/v10/channels/{chat_id}/messages"
             ))
-            .bearer_auth(token)
-            .json(&json!({"content": truncate_chars(text, 1900)}))
+            .header("Authorization", format!("Bot {token}"))
+            .json(&body)
             .send()
             .await
             .map_err(|_| AppError::UpstreamUnavailable)?
@@ -1629,6 +2421,24 @@ impl CollaborationManager {
             .to_owned())
     }
 
+    async fn edit_discord_session_message(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        session: &CodexSessionSummary,
+    ) -> AppResult<()> {
+        self.edit_discord_message_with_components(
+            bot_id,
+            chat_id,
+            message_id,
+            &format_session_status(session),
+            Some(discord_session_components(session)),
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
     async fn edit_discord_message(
         &self,
         bot_id: &str,
@@ -1636,15 +2446,31 @@ impl CollaborationManager {
         message_id: &str,
         text: &str,
     ) -> AppResult<()> {
+        self.edit_discord_message_with_components(bot_id, chat_id, message_id, text, None)
+            .await
+    }
+
+    async fn edit_discord_message_with_components(
+        &self,
+        bot_id: &str,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+        components: Option<Value>,
+    ) -> AppResult<()> {
         let runtime = self.runtime(bot_id).await?;
         let token = self.secret(&runtime, "bot_token").await?;
+        let mut body = json!({"content": truncate_chars(text, 1900)});
+        if let Some(components) = components {
+            body["components"] = components;
+        }
         ensure_success(
             Client::new()
                 .patch(format!(
                     "https://discord.com/api/v10/channels/{chat_id}/messages/{message_id}"
                 ))
-                .bearer_auth(token)
-                .json(&json!({"content": truncate_chars(text, 1900)}))
+                .header("Authorization", format!("Bot {token}"))
+                .json(&body)
                 .send()
                 .await?,
         )
@@ -1708,6 +2534,11 @@ impl CollaborationManager {
                     if matches!(event_type, "GROUP_AT_MESSAGE_CREATE" | "AT_MESSAGE_CREATE" | "MESSAGE_CREATE") {
                         let d = payload.get("d").unwrap_or(&Value::Null);
                         let text = d.get("content").and_then(Value::as_str).unwrap_or_default().trim();
+                        let chat_kind = if matches!(event_type, "GROUP_AT_MESSAGE_CREATE" | "AT_MESSAGE_CREATE") {
+                            IncomingChatKind::Group
+                        } else {
+                            IncomingChatKind::Direct
+                        };
                         let chat_id = d
                             .get("group_openid")
                             .or_else(|| d.get("channel_id"))
@@ -1719,13 +2550,16 @@ impl CollaborationManager {
                             .and_then(|a| a.get("member_openid").or_else(|| a.get("id")))
                             .map(value_to_id_string);
                         let _ = self
-                            .handle_incoming_text(
-                                CollaborationProvider::Qq,
-                                &bot_id,
-                                &chat_id,
-                                sender.as_deref(),
-                                text,
-                            )
+                            .handle_incoming_message(IncomingMessage {
+                                provider: CollaborationProvider::Qq,
+                                bot_id: bot_id.clone(),
+                                chat_id,
+                                sender,
+                                text: text.to_owned(),
+                                chat_kind,
+                                addressed: matches!(event_type, "GROUP_AT_MESSAGE_CREATE" | "AT_MESSAGE_CREATE"),
+                                images: qq_images(d),
+                            })
                             .await;
                     }
                 }
@@ -1905,19 +2739,29 @@ impl CollaborationManager {
             query.msg_signature.as_deref().unwrap_or_default(),
         )?;
         let (xml, _) = decrypt_wecom(&aes_key, &encrypt)?;
+        let msg_type = xml_tag(&xml, "MsgType").unwrap_or_else(|| "text".to_owned());
         let content = xml_tag(&xml, "Content").unwrap_or_default();
         let from = xml_tag(&xml, "FromUserName").unwrap_or_else(|| "unknown".to_owned());
-        let chat_id = xml_tag(&xml, "ChatId")
+        let chat_id_from_group = xml_tag(&xml, "ChatId");
+        let chat_kind = if chat_id_from_group.is_some() {
+            IncomingChatKind::Group
+        } else {
+            IncomingChatKind::Direct
+        };
+        let chat_id = chat_id_from_group
             .or_else(|| xml_tag(&xml, "FromUserName"))
             .unwrap_or_default();
         if !chat_id.is_empty() {
-            self.handle_incoming_text(
-                CollaborationProvider::Wecom,
-                bot_id,
-                &chat_id,
-                Some(&from),
-                &content,
-            )
+            self.handle_incoming_message(IncomingMessage {
+                provider: CollaborationProvider::Wecom,
+                bot_id: bot_id.to_owned(),
+                chat_id,
+                sender: Some(from),
+                text: content,
+                chat_kind,
+                addressed: false,
+                images: wecom_images_from_xml(&xml, &msg_type),
+            })
             .await?;
         }
         Ok(())
@@ -1991,14 +2835,30 @@ impl CollaborationManager {
             .and_then(|sender_id| sender_id.get("open_id"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let text = extract_feishu_message_text(message).unwrap_or_default();
-        self.handle_incoming_text(
-            CollaborationProvider::Feishu,
-            bot_id,
-            &chat_id,
-            sender.as_deref(),
-            &text,
-        )
+        let message_id = message
+            .get("message_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (text, images) = extract_feishu_message_parts(message, message_id);
+        let chat_kind = if message.get("chat_type").and_then(Value::as_str) == Some("p2p") {
+            IncomingChatKind::Direct
+        } else {
+            IncomingChatKind::Group
+        };
+        let addressed = message
+            .get("mentions")
+            .and_then(Value::as_array)
+            .is_some_and(|mentions| !mentions.is_empty());
+        self.handle_incoming_message(IncomingMessage {
+            provider: CollaborationProvider::Feishu,
+            bot_id: bot_id.to_owned(),
+            chat_id,
+            sender,
+            text,
+            chat_kind,
+            addressed,
+            images,
+        })
         .await
     }
 }
@@ -2100,6 +2960,211 @@ pub fn parse_codex_command(text: &str) -> AppResult<CodexCommand> {
     }
 }
 
+#[allow(dead_code)]
+fn incoming_text_intent(text: &str, chat_kind: IncomingChatKind) -> Option<IncomingTextIntent> {
+    incoming_message_intent(&IncomingMessage {
+        provider: CollaborationProvider::Feishu,
+        bot_id: String::new(),
+        chat_id: String::new(),
+        sender: None,
+        text: text.to_owned(),
+        chat_kind,
+        addressed: false,
+        images: Vec::new(),
+    })
+}
+
+fn incoming_message_intent(message: &IncomingMessage) -> Option<IncomingTextIntent> {
+    let text = &message.text;
+    let chat_kind = message.chat_kind;
+    let cleaned = text.replace("\u{a0}", " ");
+    let trimmed = cleaned.trim();
+    let has_images = !message.images.is_empty();
+    if trimmed.is_empty() && !has_images {
+        return None;
+    }
+    if trimmed.starts_with("/codex") {
+        return Some(IncomingTextIntent::Command(trimmed.to_owned()));
+    }
+
+    let (mentioned, after_mentions) = strip_leading_platform_mentions(trimmed);
+    let mentioned = mentioned || message.addressed;
+    let after_mentions = after_mentions.trim();
+    if mentioned && after_mentions.starts_with("/codex") {
+        return Some(IncomingTextIntent::Command(after_mentions.to_owned()));
+    }
+
+    let natural = match chat_kind {
+        IncomingChatKind::Direct => {
+            if mentioned && !after_mentions.is_empty() {
+                after_mentions
+            } else if trimmed.is_empty() && has_images {
+                DEFAULT_IMAGE_INSTRUCTION
+            } else {
+                trimmed
+            }
+        }
+        IncomingChatKind::Group if mentioned && !after_mentions.is_empty() => after_mentions,
+        IncomingChatKind::Group if mentioned && has_images => DEFAULT_IMAGE_INSTRUCTION,
+        IncomingChatKind::Group => return None,
+    };
+    let (force_new, instruction) = strip_force_new_prefix(natural);
+    if instruction.is_empty() {
+        None
+    } else if !force_new && is_natural_projects_query(&instruction) {
+        Some(IncomingTextIntent::Command("/codex projects".to_owned()))
+    } else {
+        Some(IncomingTextIntent::NaturalTask {
+            instruction,
+            force_new,
+        })
+    }
+}
+
+fn is_natural_projects_query(text: &str) -> bool {
+    let normalized = text
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(
+                    character,
+                    '?' | '？' | '!' | '！' | ',' | '，' | '.' | '。' | ':' | '：'
+                )
+        })
+        .collect::<String>();
+    if normalized.is_empty() {
+        return false;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "projects"
+            | "projectlist"
+            | "listprojects"
+            | "showprojects"
+            | "boundprojects"
+            | "bindings"
+            | "projectbindings"
+    ) {
+        return true;
+    }
+    if matches!(
+        normalized.as_str(),
+        "项目列表" | "项目清单" | "绑定项目" | "已绑定项目" | "当前项目" | "当前绑定项目"
+    ) {
+        return true;
+    }
+    let has_project = normalized.contains("项目");
+    let has_binding = normalized.contains("绑定") || normalized.contains('绑');
+    let has_query = [
+        "什么",
+        "哪些",
+        "哪个",
+        "几个",
+        "多少",
+        "列表",
+        "清单",
+        "看看",
+        "查看",
+        "看下",
+        "看一下",
+        "当前",
+        "现在",
+        "已",
+        "有",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    has_project && has_binding && has_query
+}
+
+fn strip_leading_platform_mentions(mut text: &str) -> (bool, &str) {
+    let mut stripped = false;
+    loop {
+        let current = text.trim_start();
+        if let Some(rest) = strip_xml_at_mention(current) {
+            text = rest;
+            stripped = true;
+            continue;
+        }
+        if let Some(rest) = strip_angle_mention(current) {
+            text = rest;
+            stripped = true;
+            continue;
+        }
+        if let Some(rest) = strip_cq_at_mention(current) {
+            text = rest;
+            stripped = true;
+            continue;
+        }
+        if let Some(rest) = strip_at_token(current) {
+            text = rest;
+            stripped = true;
+            continue;
+        }
+        return (stripped, current);
+    }
+}
+
+fn strip_xml_at_mention(text: &str) -> Option<&str> {
+    if !text.starts_with("<at") {
+        return None;
+    }
+    text.find("</at>")
+        .map(|index| &text[index + "</at>".len()..])
+}
+
+fn strip_angle_mention(text: &str) -> Option<&str> {
+    if !(text.starts_with("<@") || text.starts_with("<at:")) {
+        return None;
+    }
+    text.find('>').map(|index| &text[index + 1..])
+}
+
+fn strip_cq_at_mention(text: &str) -> Option<&str> {
+    if !text.starts_with("[CQ:at,") {
+        return None;
+    }
+    text.find(']').map(|index| &text[index + 1..])
+}
+
+fn strip_at_token(text: &str) -> Option<&str> {
+    if !text.starts_with('@') {
+        return None;
+    }
+    for (index, character) in text.char_indices().skip(1) {
+        if character.is_whitespace() {
+            return Some(&text[index..]);
+        }
+        if matches!(character, ':' | '：' | ',' | '，') {
+            return Some(&text[index + character.len_utf8()..]);
+        }
+    }
+    Some("")
+}
+
+fn strip_force_new_prefix(text: &str) -> (bool, String) {
+    let trimmed = text.trim();
+    for prefix in ["新任务", "新会话"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return (true, trim_task_prefix_separator(rest).to_owned());
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("new task") {
+        let rest = &trimmed["new task".len()..];
+        return (true, trim_task_prefix_separator(rest).to_owned());
+    }
+    (false, trimmed.to_owned())
+}
+
+fn trim_task_prefix_separator(text: &str) -> &str {
+    text.trim_start_matches(|character: char| {
+        character.is_whitespace() || matches!(character, ':' | '：' | '-' | '—' | ',' | '，')
+    })
+    .trim()
+}
+
 fn apply_config_input(config: &mut BotConfig, input: &UpsertCollaborationBotInput) {
     if let Some(value) = input
         .app_id
@@ -2142,6 +3207,13 @@ fn apply_config_input(config: &mut BotConfig, input: &UpsertCollaborationBotInpu
     }
     if let Some(value) = input.guild_id.as_deref().map(str::trim) {
         config.guild_id = if value.is_empty() {
+            None
+        } else {
+            Some(value.to_owned())
+        };
+    }
+    if let Some(value) = input.system_prompt.as_deref().map(str::trim) {
+        config.system_prompt = if value.is_empty() {
             None
         } else {
             Some(value.to_owned())
@@ -2251,6 +3323,327 @@ fn provider_label(provider: CollaborationProvider) -> &'static str {
     }
 }
 
+impl SessionLookupScope {
+    fn new(provider: CollaborationProvider, bot_id: &str, chat_id: &str) -> Self {
+        Self {
+            provider,
+            bot_id: bot_id.to_owned(),
+            chat_id: chat_id.to_owned(),
+        }
+    }
+
+    fn matches(&self, session: &CodexSessionSummary) -> bool {
+        session.provider == self.provider
+            && session.provider_bot_id.as_deref() == Some(self.bot_id.as_str())
+            && session.provider_chat_id.as_deref() == Some(self.chat_id.as_str())
+    }
+}
+
+fn session_matches_reference(session: &CodexSessionSummary, reference: &str) -> bool {
+    session.id == reference
+        || session.id.starts_with(reference)
+        || session.codex_session_id.as_deref() == Some(reference)
+        || session
+            .codex_session_id
+            .as_deref()
+            .is_some_and(|codex_id| codex_id.starts_with(reference))
+}
+
+fn session_action_from_value(value: &Value) -> Option<(&str, &str)> {
+    let op = value
+        .get("op")
+        .or_else(|| value.get("action"))
+        .and_then(Value::as_str)?;
+    let session_id = value
+        .get("session_id")
+        .or_else(|| value.get("sessionId"))
+        .and_then(Value::as_str)?;
+    if op.is_empty() || session_id.is_empty() {
+        None
+    } else {
+        Some((op, session_id))
+    }
+}
+
+fn parse_session_action_data(data: &str) -> Option<(&str, &str)> {
+    let data = data.trim();
+    let rest = data.strip_prefix("codex:")?;
+    let mut parts = rest.splitn(2, ':');
+    let op = parts.next()?.trim();
+    let session_id = parts.next()?.trim();
+    if op.is_empty() || session_id.is_empty() {
+        None
+    } else {
+        Some((op, session_id))
+    }
+}
+
+fn execution_from_binding(binding: &CollaborationProjectBinding) -> SessionExecution {
+    SessionExecution {
+        target: binding.execution_target.clone(),
+        model_id: binding.model_id.clone(),
+    }
+}
+
+fn execution_from_session(session: &CodexSessionSummary) -> SessionExecution {
+    SessionExecution {
+        target: session.execution_target.clone(),
+        model_id: session.model_id.clone(),
+    }
+}
+
+fn apply_session_profile_snapshot(
+    binding: &mut CollaborationProjectBinding,
+    session: &CodexSessionSummary,
+) {
+    binding.profile_id = session.profile_id.clone();
+    binding.profile_alias = session.profile_alias.clone();
+}
+
+fn apply_stored_session_snapshot(
+    binding: &mut CollaborationProjectBinding,
+    stored: &StoredCodexSession,
+) {
+    apply_session_profile_snapshot(binding, &stored.session);
+    binding.working_directory = stored.working_directory.clone();
+}
+
+fn write_gateway_config_to_home(
+    home: &Path,
+    service_url: &str,
+    model: &str,
+    secret_ref: &str,
+    data_dir: &Path,
+) -> AppResult<()> {
+    fs::create_dir_all(home).map_err(|_| AppError::RuntimeUnavailable)?;
+    let mut document = DocumentMut::new();
+    document["model_provider"] = toml_value(COLLABORATION_GATEWAY_PROVIDER);
+    document["model"] = toml_value(model);
+    document["model_catalog_json"] = toml_value(COLLABORATION_MODEL_CATALOG_FILENAME);
+    let providers = document["model_providers"].or_insert(Item::Table(Table::new()));
+    let providers = providers
+        .as_table_like_mut()
+        .ok_or(AppError::ValidationFailed)?;
+    let mut provider = Table::new();
+    provider["name"] = toml_value("Codex Relay API Gateway");
+    provider["base_url"] = toml_value(format!("{}/v1", service_url));
+    provider["wire_api"] = toml_value("responses");
+    let mut auth = Table::new();
+    auth["command"] = toml_value(
+        std::env::current_exe()
+            .map_err(|_| AppError::RuntimeUnavailable)?
+            .display()
+            .to_string(),
+    );
+    let mut args = Array::new();
+    args.push("--relay-gateway-token");
+    args.push(secret_ref);
+    args.push("--relay-data-dir");
+    args.push(data_dir.display().to_string());
+    auth["args"] = Item::Value(args.into());
+    provider["auth"] = Item::Table(auth);
+    providers.insert(COLLABORATION_GATEWAY_PROVIDER, Item::Table(provider));
+    fs::write(home.join("config.toml"), document.to_string())
+        .map_err(|_| AppError::RuntimeUnavailable)?;
+    write_gateway_model_catalog(home, model)
+}
+
+fn write_gateway_session_files_to_home(
+    home: &Path,
+    auth_json: Option<&str>,
+    service_url: &str,
+    model: &str,
+    secret_ref: &str,
+    data_dir: &Path,
+) -> AppResult<()> {
+    if let Some(auth_json) = auth_json {
+        write_auth_json_to_home(home, auth_json)?;
+    }
+    write_gateway_config_to_home(home, service_url, model, secret_ref, data_dir)
+}
+
+fn write_gateway_model_catalog(home: &Path, model: &str) -> AppResult<()> {
+    let catalog = json!({
+        "models": [{
+            "slug": model,
+            "display_name": model,
+            "description": model,
+            "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                {"effort": "none", "description": "Disable Thinking"},
+                {"effort": "high", "description": "Enabled Thinking"}
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1000,
+            "supports_reasoning_summaries": true,
+            "context_window": 128000
+        }]
+    });
+    let text = serde_json::to_string_pretty(&catalog).map_err(|_| AppError::Internal)?;
+    fs::write(home.join(COLLABORATION_MODEL_CATALOG_FILENAME), text)
+        .map_err(|_| AppError::RuntimeUnavailable)
+}
+
+fn codex_command_args(
+    resume: bool,
+    codex_session_id: Option<&str>,
+    output_file: &Path,
+    images: &[PathBuf],
+) -> AppResult<Vec<String>> {
+    let mut args = Vec::new();
+    if resume {
+        let codex_id = codex_session_id.ok_or(AppError::ValidationFailed)?;
+        for arg in CODEX_RESUME_ARGS {
+            match arg {
+                "__OUTPUT__" => args.push(output_file.display().to_string()),
+                "__SESSION__" => {
+                    push_image_args(&mut args, images);
+                    args.push(codex_id.to_owned());
+                }
+                other => args.push(other.to_owned()),
+            }
+        }
+    } else {
+        for arg in CODEX_SESSION_ARGS {
+            match arg {
+                "__OUTPUT__" => {
+                    args.push(output_file.display().to_string());
+                    push_image_args(&mut args, images);
+                    args.push("-".to_owned());
+                }
+                other => args.push(other.to_owned()),
+            }
+        }
+    }
+    Ok(args)
+}
+
+fn push_image_args(args: &mut Vec<String>, images: &[PathBuf]) {
+    for image in images {
+        args.push("--image".to_owned());
+        args.push(image.display().to_string());
+    }
+}
+
+fn build_codex_instruction(
+    system_prompt: Option<&str>,
+    instruction: &str,
+    image_count: usize,
+) -> String {
+    let system_prompt = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if system_prompt.is_none() && image_count == 0 {
+        return instruction.to_owned();
+    }
+    let mut parts = Vec::new();
+    if let Some(prompt) = system_prompt {
+        parts.push(format!("机器人专属提示词：\n{prompt}"));
+    }
+    parts.push(format!("用户任务：\n{}", instruction.trim()));
+    if image_count > 0 {
+        parts.push(format!(
+            "图片附件：本次消息已附加 {image_count} 张图片，请结合图片内容完成用户任务。"
+        ));
+    }
+    parts.join("\n\n")
+}
+
+async fn download_url_limited(url: &str, authorization: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut request = Client::new().get(url);
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| "网络请求失败。".to_owned())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "下载接口返回 HTTP {}。",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_INCOMING_IMAGE_BYTES)
+    {
+        return Err("图片超过 20MB 上限。".to_owned());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "图片响应读取失败。".to_owned())?;
+    if bytes.len() as u64 > MAX_INCOMING_IMAGE_BYTES {
+        return Err("图片超过 20MB 上限。".to_owned());
+    }
+    Ok(bytes.to_vec())
+}
+
+fn image_extension_from_hint(hint: Option<&str>) -> Option<String> {
+    let hint = hint?.trim().to_ascii_lowercase();
+    for extension in [
+        "png", "jpg", "jpeg", "webp", "gif", "bmp", "ico", "tiff", "heic",
+    ] {
+        if hint.ends_with(&format!(".{extension}")) || hint == extension {
+            return Some(
+                if extension == "jpeg" {
+                    "jpg"
+                } else {
+                    extension
+                }
+                .to_owned(),
+            );
+        }
+    }
+    None
+}
+
+fn image_extension_from_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png".to_owned()
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "jpg".to_owned()
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif".to_owned()
+    } else if bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        "webp".to_owned()
+    } else if bytes.starts_with(b"BM") {
+        "bmp".to_owned()
+    } else {
+        "png".to_owned()
+    }
+}
+
+fn normalize_execution_target(value: Option<&str>) -> AppResult<String> {
+    match value.unwrap_or("profile").trim() {
+        "" | "profile" => Ok("profile".to_owned()),
+        "gateway" => Ok("gateway".to_owned()),
+        _ => Err(AppError::ValidationFailed),
+    }
+}
+
+fn normalized_model_id(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_gateway_model(repository: &Repository, model: &str) -> AppResult<()> {
+    if codex_gateway::gateway_model_is_available(repository, model)? {
+        Ok(())
+    } else {
+        Err(AppError::GatewayModelUnavailable)
+    }
+}
+
+fn is_codex_runtime_profile(profile: &crate::domain::MaskedProfile) -> bool {
+    profile.kind == ProfileKind::CodexOauth && profile.enabled && profile.credential_configured
+}
+
 fn session_card(session: &CodexSessionSummary) -> Value {
     let color = match session.relay_status.as_str() {
         "completed" => "green",
@@ -2258,21 +3651,68 @@ fn session_card(session: &CodexSessionSummary) -> Value {
         "cancelled" => "grey",
         _ => "blue",
     };
+    let mut actions = vec![json!({
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "刷新状态"},
+        "type": "default",
+        "value": {"op": "refresh", "session_id": session.id},
+    })];
+    if session.relay_status == "running" {
+        actions.push(json!({
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "取消任务"},
+            "type": "danger",
+            "value": {"op": "cancel", "session_id": session.id},
+        }));
+    }
+    let mut elements = vec![
+        json!({"tag": "div", "text": {"tag": "lark_md", "content": format!("**平台**：{}\n**项目**：{} (`{}`)\n**会话**：`{}`\n**档案**：{}\n**发起人**：{}", provider_label(session.provider), session.project_name, session.project_slug, short_id(&session.id), profile_alias_label(session.profile_alias.as_deref()), session.started_by.as_deref().unwrap_or("群成员"))}}),
+        json!({"tag": "div", "text": {"tag": "lark_md", "content": format!("**摘要**：{}", session.summary.as_deref().unwrap_or("任务正在运行。"))}}),
+    ];
+    if session.relay_status == "failed" {
+        elements.push(json!({"tag": "div", "text": {"tag": "lark_md", "content": format!("**失败原因**：{}", truncate_chars(session.last_error.as_deref().unwrap_or("未记录详细原因。"), 1200))}}));
+    }
+    elements.push(json!({"tag": "action", "actions": actions}));
     json!({
         "config": {"wide_screen_mode": true},
         "header": {
             "template": color,
             "title": {"tag": "plain_text", "content": format!("Codex · {}", status_label(&session.relay_status))}
         },
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": format!("**平台**：{}\n**项目**：{} (`{}`)\n**会话**：`{}`\n**档案**：{}\n**发起人**：{}", provider_label(session.provider), session.project_name, session.project_slug, short_id(&session.id), session.profile_alias, session.started_by.as_deref().unwrap_or("群成员"))}},
-            {"tag": "div", "text": {"tag": "lark_md", "content": format!("**摘要**：{}", session.summary.as_deref().unwrap_or("任务正在运行。"))}},
-            {"tag": "action", "actions": [
-                {"tag": "button", "text": {"tag": "plain_text", "content": "刷新状态"}, "type": "default", "value": {"op": "refresh", "session_id": session.id}},
-                {"tag": "button", "text": {"tag": "plain_text", "content": "取消任务"}, "type": "danger", "value": {"op": "cancel", "session_id": session.id}}
-            ]}
-        ]
+        "elements": elements
     })
+}
+
+fn telegram_session_reply_markup(session: &CodexSessionSummary) -> Value {
+    let mut buttons = vec![json!({
+        "text": "刷新状态",
+        "callback_data": format!("codex:refresh:{}", session.id),
+    })];
+    if session.relay_status == "running" {
+        buttons.push(json!({
+            "text": "取消任务",
+            "callback_data": format!("codex:cancel:{}", session.id),
+        }));
+    }
+    json!({"inline_keyboard": [buttons]})
+}
+
+fn discord_session_components(session: &CodexSessionSummary) -> Value {
+    let mut components = vec![json!({
+        "type": 2,
+        "style": 2,
+        "label": "刷新状态",
+        "custom_id": format!("codex:refresh:{}", session.id),
+    })];
+    if session.relay_status == "running" {
+        components.push(json!({
+            "type": 2,
+            "style": 4,
+            "label": "取消任务",
+            "custom_id": format!("codex:cancel:{}", session.id),
+        }));
+    }
+    json!([{"type": 1, "components": components}])
 }
 
 fn status_label(status: &str) -> &'static str {
@@ -2304,26 +3744,208 @@ fn help_text(provider: CollaborationProvider) -> String {
     .join("\n")
 }
 
-fn format_session_status(session: &CodexSessionSummary) -> String {
+fn collaboration_error_message(error: &AppError) -> String {
+    let action = match error {
+        AppError::ProfileRuntimeUnavailable => {
+            "档案暂不能用于 Codex 会话，请完成 OAuth 授权或重新选择执行档案。"
+        }
+        AppError::GatewayNotRunning => "网关尚未运行，请先启动 Relay 网关并确认 HTTPS 证书就绪。",
+        AppError::GatewayModelUnavailable => {
+            "选择的网关模型当前不可用，请刷新模型并确认账号已加入网关账号池。"
+        }
+        AppError::RuntimeUnavailable => {
+            "本机运行时或项目目录不可用，请确认工作目录存在且 Codex CLI 可启动。"
+        }
+        AppError::LocalStateUnavailable => {
+            "本机会话状态暂不可读，请在 Codex Relay 客户端协作页刷新机器人连接；若仍出现，请重启 Codex Relay 并保留该错误码。"
+        }
+        AppError::UpstreamUnavailable => "上游服务当前不可用，请检查网关账号池、网络与凭据。",
+        AppError::Conflict => "会话短 ID 出现冲突，请使用完整会话 ID 后重试。",
+        AppError::NotFound => "未找到匹配的项目或会话，请检查绑定状态与会话 ID。",
+        AppError::ValidationFailed => "命令参数不完整，请检查 /codex 命令格式。",
+        _ => return format!("{}（错误码：{}）", error, error.code()),
+    };
     format!(
-        "Codex · {}\n平台：{}\n项目：{} (`{}`)\n会话：{}\n档案：{}\n摘要：{}",
+        "{action}
+错误码：{}",
+        error.code()
+    )
+}
+
+fn format_session_status(session: &CodexSessionSummary) -> String {
+    let mut message = format!(
+        "Codex · {}\n平台：{}\n项目：{} (`{}`)\n会话：{}\n执行：{}\n档案：{}\n摘要：{}",
         status_label(&session.relay_status),
         provider_label(session.provider),
         session.project_name,
         session.project_slug,
         short_id(&session.id),
-        session.profile_alias,
+        execution_label(session),
+        profile_alias_label(session.profile_alias.as_deref()),
         session.summary.as_deref().unwrap_or("任务正在运行。")
-    )
+    );
+    if session.relay_status == "failed" {
+        message.push_str("\n失败原因：");
+        message.push_str(&truncate_chars(
+            session.last_error.as_deref().unwrap_or("未记录详细原因。"),
+            1200,
+        ));
+    }
+    if session.relay_status == "running" {
+        message.push_str(&format!(
+            "\n操作：/codex status {} · /codex cancel {}",
+            short_id(&session.id),
+            short_id(&session.id)
+        ));
+    } else {
+        message.push_str(&format!("\n操作：/codex status {}", short_id(&session.id)));
+    }
+    message
 }
 
-fn extract_feishu_message_text(message: &Value) -> Option<String> {
-    let content = message.get("content")?.as_str()?;
-    let parsed: Value = serde_json::from_str(content).ok()?;
-    parsed
-        .get("text")
+fn execution_label(session: &CodexSessionSummary) -> String {
+    match session.execution_target.as_str() {
+        "gateway" => session
+            .model_id
+            .as_deref()
+            .map(|model| format!("API 网关 · {model}"))
+            .unwrap_or_else(|| "API 网关".to_owned()),
+        _ => "档案直连".to_owned(),
+    }
+}
+
+fn profile_alias_label(alias: Option<&str>) -> &str {
+    alias
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("网关全局设置")
+}
+
+fn extract_feishu_message_parts(message: &Value, message_id: &str) -> (String, Vec<IncomingImage>) {
+    let content = message
+        .get("content")
         .and_then(Value::as_str)
+        .unwrap_or_default();
+    let parsed: Value = serde_json::from_str(content).unwrap_or(Value::Null);
+    let mut texts = Vec::new();
+    let mut image_keys = Vec::new();
+    collect_feishu_text_and_images(&parsed, &mut texts, &mut image_keys);
+    let text = texts
+        .into_iter()
         .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned();
+    let images = image_keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty() && !message_id.is_empty())
+        .map(|file_key| IncomingImage {
+            source: IncomingImageSource::FeishuMessageResource {
+                message_id: message_id.to_owned(),
+                file_key,
+            },
+            filename_hint: Some("feishu-image.png".to_owned()),
+        })
+        .collect();
+    (text, images)
+}
+
+fn collect_feishu_text_and_images(
+    value: &Value,
+    texts: &mut Vec<String>,
+    image_keys: &mut Vec<String>,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                match (key.as_str(), value) {
+                    ("text" | "un_escape_text", Value::String(text)) => texts.push(text.clone()),
+                    ("image_key" | "file_key", Value::String(image_key)) => {
+                        image_keys.push(image_key.clone())
+                    }
+                    _ => collect_feishu_text_and_images(value, texts, image_keys),
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_feishu_text_and_images(value, texts, image_keys);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn telegram_images(message: &Value) -> Vec<IncomingImage> {
+    let Some(photo) = message.get("photo").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    photo
+        .iter()
+        .max_by_key(|item| item.get("file_size").and_then(Value::as_i64).unwrap_or(0))
+        .and_then(|item| item.get("file_id").and_then(Value::as_str))
+        .map(|file_id| {
+            vec![IncomingImage {
+                source: IncomingImageSource::TelegramFile {
+                    file_id: file_id.to_owned(),
+                },
+                filename_hint: Some("telegram-photo.jpg".to_owned()),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn discord_images(message: &Value) -> Vec<IncomingImage> {
+    url_attachment_images(message)
+}
+
+fn qq_images(message: &Value) -> Vec<IncomingImage> {
+    url_attachment_images(message)
+}
+
+fn url_attachment_images(message: &Value) -> Vec<IncomingImage> {
+    message
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|attachment| {
+            let url = attachment.get("url").and_then(Value::as_str)?;
+            let content_type = attachment
+                .get("content_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let filename = attachment
+                .get("filename")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if !content_type.is_empty() && !content_type.starts_with("image/") {
+                return None;
+            }
+            Some(IncomingImage {
+                source: IncomingImageSource::Url {
+                    url: url.to_owned(),
+                },
+                filename_hint: filename,
+            })
+        })
+        .collect()
+}
+
+fn wecom_images_from_xml(xml: &str, msg_type: &str) -> Vec<IncomingImage> {
+    if msg_type != "image" {
+        return Vec::new();
+    }
+    xml_tag(xml, "MediaId")
+        .map(|media_id| {
+            vec![IncomingImage {
+                source: IncomingImageSource::WecomMedia { media_id },
+                filename_hint: Some("wecom-image.jpg".to_owned()),
+            }]
+        })
+        .unwrap_or_default()
 }
 
 fn normalize_slug(value: &str) -> AppResult<String> {
@@ -2476,6 +4098,35 @@ fn redact(value: &str) -> String {
     result
 }
 
+fn codex_failure_detail(
+    status: Option<&std::process::ExitStatus>,
+    stderr_tail: &VecDeque<String>,
+    final_summary: &str,
+) -> String {
+    let exit = match status.and_then(std::process::ExitStatus::code) {
+        Some(code) => format!("退出码 {code}"),
+        None if status.is_some() => "进程被信号终止或未返回退出码".to_owned(),
+        None => "进程退出状态未读取".to_owned(),
+    };
+    let stderr = stderr_tail
+        .iter()
+        .map(String::as_str)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut detail = format!("Codex 进程返回失败状态（{exit}）。");
+    if !stderr.trim().is_empty() {
+        detail.push_str("\nstderr 尾部：\n");
+        detail.push_str(&truncate_chars(&stderr, 1600));
+    }
+    let summary = final_summary.trim();
+    if !summary.is_empty() && summary != "任务未成功完成。" {
+        detail.push_str("\n最后输出：\n");
+        detail.push_str(&truncate_chars(summary, 800));
+    }
+    detail
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
@@ -2507,14 +4158,155 @@ impl From<reqwest::Error> for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_codex_command, required_secret_keys, CodexCommand, CollaborationManager};
+    use super::{
+        build_codex_instruction, codex_command_args, codex_failure_detail,
+        collaboration_error_message, discord_images, discord_session_components,
+        extract_feishu_message_parts, format_session_status, incoming_message_intent,
+        incoming_text_intent, parse_codex_command, parse_session_action_data, qq_images,
+        required_secret_keys, session_action_from_value, session_card, telegram_images,
+        telegram_session_reply_markup, timestamp_ms, validate_gateway_model, wecom_images_from_xml,
+        write_gateway_config_to_home, write_gateway_session_files_to_home, CodexCommand,
+        CollaborationManager, IncomingChatKind, IncomingImage, IncomingImageSource,
+        IncomingMessage, IncomingTextIntent, NaturalRunResolution, SessionLookupScope,
+        COLLABORATION_MODEL_CATALOG_FILENAME,
+    };
     use crate::{
-        database::Repository,
-        domain::{CollaborationProvider, UpsertCollaborationBotInput},
+        database::{Repository, StoredCodexSession, StoredCollaborationBot, StoredProfile},
+        domain::{
+            CodexAuthMode, CodexSessionSummary, CollaborationProjectBinding, CollaborationProvider,
+            MaskedCollaborationBot, MaskedProfile, ProfileKind, UpsertCollaborationBotInput,
+            UpsertCollaborationProjectBindingInput,
+        },
+        error::AppError,
+        gateway::GatewayManager,
         oauth_credentials::OAuthCredentialStore,
         secrets::{MemorySecretStore, SecretStore},
     };
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn gateway_execution_writes_session_scoped_codex_config() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-relay-collab-gateway-config-{}",
+            Uuid::new_v4()
+        ));
+        write_gateway_config_to_home(
+            &root,
+            "https://127.0.0.1:53765",
+            "third-party-coder",
+            "client-key:test",
+            Path::new("/tmp/codex-relay-data"),
+        )
+        .unwrap();
+        let config = fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(config.contains(r#"model = "third-party-coder""#));
+        assert!(config.contains(r#"base_url = "https://127.0.0.1:53765/v1""#));
+        assert!(config.contains("--relay-gateway-token"));
+        let catalog = fs::read_to_string(root.join(COLLABORATION_MODEL_CATALOG_FILENAME)).unwrap();
+        assert!(catalog.contains("third-party-coder"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gateway_execution_writes_oauth_auth_and_session_scoped_config() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-relay-collab-gateway-session-{}",
+            Uuid::new_v4()
+        ));
+        let auth_json = r#"{"OPENAI_API_KEY":null,"tokens":{"access_token":"at-test"}}"#;
+
+        write_gateway_session_files_to_home(
+            &root,
+            Some(auth_json),
+            "https://127.0.0.1:53765",
+            "third-party-coder",
+            "client-key:test",
+            Path::new("/tmp/codex-relay-data"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("auth.json")).unwrap(),
+            auth_json
+        );
+        let config = fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(config.contains(r#"model_provider = "codex_relay""#));
+        assert!(config.contains(r#"model = "third-party-coder""#));
+        assert!(config.contains(r#"base_url = "https://127.0.0.1:53765/v1""#));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gateway_model_validation_uses_backend_candidate_rules() {
+        let repository = Arc::new(Repository::memory());
+        insert_gateway_model_profile(&repository, "api-healthy", "third-party-coder", true);
+        insert_gateway_model_profile(&repository, "api-unhealthy", "hidden-coder", false);
+
+        validate_gateway_model(&repository, "third-party-coder").unwrap();
+        let error = validate_gateway_model(&repository, "hidden-coder").unwrap_err();
+        assert!(matches!(error, AppError::GatewayModelUnavailable));
+    }
+
+    #[test]
+    fn gateway_binding_accepts_pool_model_without_project_oauth_profile() {
+        let repository = Arc::new(Repository::memory());
+        insert_profile(&repository);
+        insert_gateway_model_profile(&repository, "api-healthy", "third-party-coder", true);
+        insert_bot(&repository);
+        let manager = manager(repository.clone());
+
+        let binding = manager
+            .upsert_binding(UpsertCollaborationProjectBindingInput {
+                id: Some("binding-gateway".into()),
+                bot_id: "bot-1".into(),
+                project_name: "Relay".into(),
+                project_slug: "relay".into(),
+                working_directory: std::env::temp_dir().display().to_string(),
+                profile_id: None,
+                enabled: true,
+                concurrency_limit: 2,
+                execution_target: Some("gateway".into()),
+                model_id: Some("third-party-coder".into()),
+                confirmed: true,
+            })
+            .unwrap();
+
+        assert_eq!(binding.execution_target, "gateway");
+        assert_eq!(binding.profile_id, None);
+        assert_eq!(binding.model_id.as_deref(), Some("third-party-coder"));
+    }
+
+    #[test]
+    fn profile_binding_still_requires_a_runtime_profile() {
+        let repository = Arc::new(Repository::memory());
+        insert_gateway_model_profile(&repository, "api-healthy", "third-party-coder", true);
+        insert_bot(&repository);
+        let manager = manager(repository);
+
+        let error = manager
+            .upsert_binding(UpsertCollaborationProjectBindingInput {
+                id: Some("binding-gateway".into()),
+                bot_id: "bot-1".into(),
+                project_name: "Relay".into(),
+                project_slug: "relay".into(),
+                working_directory: std::env::temp_dir().display().to_string(),
+                profile_id: Some("api-healthy".into()),
+                enabled: true,
+                concurrency_limit: 2,
+                execution_target: Some("profile".into()),
+                model_id: None,
+                confirmed: true,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::ProfileRuntimeUnavailable));
+    }
 
     #[test]
     fn parses_run_command() {
@@ -2543,16 +4335,671 @@ mod tests {
         assert!(parse_codex_command("/codex run relay").is_err());
     }
 
+    #[test]
+    fn parses_private_natural_text_and_group_mentions() {
+        assert_eq!(
+            incoming_text_intent("修复当前失败测试", IncomingChatKind::Direct),
+            Some(IncomingTextIntent::NaturalTask {
+                instruction: "修复当前失败测试".into(),
+                force_new: false,
+            })
+        );
+        assert_eq!(
+            incoming_text_intent("修复当前失败测试", IncomingChatKind::Group),
+            None
+        );
+        assert_eq!(
+            incoming_text_intent("<@123> 新任务：修复当前失败测试", IncomingChatKind::Group),
+            Some(IncomingTextIntent::NaturalTask {
+                instruction: "修复当前失败测试".into(),
+                force_new: true,
+            })
+        );
+        assert_eq!(
+            incoming_text_intent("@Codex /codex projects", IncomingChatKind::Group),
+            Some(IncomingTextIntent::Command("/codex projects".into()))
+        );
+        assert_eq!(
+            incoming_text_intent("@Codex 看看现在绑定的什么项目", IncomingChatKind::Group),
+            Some(IncomingTextIntent::Command("/codex projects".into()))
+        );
+        assert_eq!(
+            incoming_text_intent("看看现在绑定的什么项目", IncomingChatKind::Direct),
+            Some(IncomingTextIntent::Command("/codex projects".into()))
+        );
+        assert_eq!(
+            incoming_text_intent("看看现在绑定的什么项目", IncomingChatKind::Group),
+            None
+        );
+        assert_eq!(
+            incoming_text_intent(
+                "@Codex 新任务：看看现在绑定的什么项目",
+                IncomingChatKind::Group
+            ),
+            Some(IncomingTextIntent::NaturalTask {
+                instruction: "看看现在绑定的什么项目".into(),
+                force_new: true,
+            })
+        );
+    }
+
+    #[test]
+    fn image_only_messages_become_natural_tasks_when_addressed() {
+        let image = IncomingImage {
+            source: IncomingImageSource::Url {
+                url: "https://example.test/image.png".into(),
+            },
+            filename_hint: Some("image.png".into()),
+        };
+        let direct = IncomingMessage {
+            provider: CollaborationProvider::Telegram,
+            bot_id: "bot-1".into(),
+            chat_id: "chat-1".into(),
+            sender: Some("sender-1".into()),
+            text: String::new(),
+            chat_kind: IncomingChatKind::Direct,
+            addressed: false,
+            images: vec![image.clone()],
+        };
+        assert_eq!(
+            incoming_message_intent(&direct),
+            Some(IncomingTextIntent::NaturalTask {
+                instruction: "请分析这张图片。".into(),
+                force_new: false,
+            })
+        );
+
+        let ignored_group = IncomingMessage {
+            chat_kind: IncomingChatKind::Group,
+            ..direct.clone()
+        };
+        assert_eq!(incoming_message_intent(&ignored_group), None);
+
+        let addressed_group = IncomingMessage {
+            chat_kind: IncomingChatKind::Group,
+            addressed: true,
+            ..direct
+        };
+        assert_eq!(
+            incoming_message_intent(&addressed_group),
+            Some(IncomingTextIntent::NaturalTask {
+                instruction: "请分析这张图片。".into(),
+                force_new: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_platform_image_attachments() {
+        let feishu_message = serde_json::json!({
+            "content": serde_json::json!({
+                "text": "理解一下这张图",
+                "image_key": "img_v2_abc"
+            }).to_string(),
+        });
+        let (feishu_text, feishu_images) =
+            extract_feishu_message_parts(&feishu_message, "om_message");
+        assert_eq!(feishu_text, "理解一下这张图");
+        assert_eq!(feishu_images.len(), 1);
+        assert_eq!(
+            feishu_images[0].source,
+            IncomingImageSource::FeishuMessageResource {
+                message_id: "om_message".into(),
+                file_key: "img_v2_abc".into(),
+            }
+        );
+
+        let telegram_message = serde_json::json!({
+            "photo": [
+                {"file_id": "small", "file_size": 10},
+                {"file_id": "large", "file_size": 100}
+            ]
+        });
+        assert_eq!(
+            telegram_images(&telegram_message)[0].source,
+            IncomingImageSource::TelegramFile {
+                file_id: "large".into()
+            }
+        );
+
+        let discord_message = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.test/a.png", "content_type": "image/png", "filename": "a.png"},
+                {"url": "https://cdn.example.test/a.txt", "content_type": "text/plain", "filename": "a.txt"}
+            ]
+        });
+        assert_eq!(discord_images(&discord_message).len(), 1);
+
+        let qq_message = serde_json::json!({
+            "attachments": [
+                {"url": "https://cdn.example.test/qq-image.jpg", "filename": "qq-image.jpg"}
+            ]
+        });
+        assert_eq!(
+            qq_images(&qq_message)[0].source,
+            IncomingImageSource::Url {
+                url: "https://cdn.example.test/qq-image.jpg".into()
+            }
+        );
+
+        let wecom_images = wecom_images_from_xml(
+            "<xml><MsgType><![CDATA[image]]></MsgType><MediaId><![CDATA[MEDIA123]]></MediaId></xml>",
+            "image",
+        );
+        assert_eq!(
+            wecom_images[0].source,
+            IncomingImageSource::WecomMedia {
+                media_id: "MEDIA123".into()
+            }
+        );
+    }
+
+    #[test]
+    fn codex_exec_args_include_images_for_new_and_resume_sessions() {
+        let output = PathBuf::from("/tmp/last-message.txt");
+        let images = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.jpg")];
+
+        assert_eq!(
+            codex_command_args(false, None, &output, &images).unwrap(),
+            vec![
+                "exec",
+                "--json",
+                "--sandbox",
+                "workspace-write",
+                "--output-last-message",
+                "/tmp/last-message.txt",
+                "--image",
+                "/tmp/a.png",
+                "--image",
+                "/tmp/b.jpg",
+                "-",
+            ]
+        );
+        assert_eq!(
+            codex_command_args(true, Some("codex-session-1"), &output, &images).unwrap(),
+            vec![
+                "exec",
+                "resume",
+                "--json",
+                "--output-last-message",
+                "/tmp/last-message.txt",
+                "--image",
+                "/tmp/a.png",
+                "--image",
+                "/tmp/b.jpg",
+                "codex-session-1",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn bot_prompt_and_image_notice_are_prepended_to_codex_instruction() {
+        let prompt = build_codex_instruction(Some("请用审查员口吻回复。"), "修复失败测试", 2);
+
+        assert!(prompt.contains("机器人专属提示词：\n请用审查员口吻回复。"));
+        assert!(prompt.contains("用户任务：\n修复失败测试"));
+        assert!(prompt.contains("图片附件：本次消息已附加 2 张图片"));
+        assert_eq!(build_codex_instruction(None, "只处理文本", 0), "只处理文本");
+    }
+
+    #[test]
+    fn failure_detail_status_and_button_payloads_include_session_context() {
+        let mut stderr_tail = VecDeque::new();
+        stderr_tail.push_back("error: first failure".to_owned());
+        stderr_tail.push_back("error: second failure".to_owned());
+        let detail = codex_failure_detail(None, &stderr_tail, "最后一条模型输出");
+        assert!(detail.contains("进程退出状态未读取"));
+        assert!(detail.contains("stderr 尾部"));
+        assert!(detail.contains("error: second failure"));
+        assert!(detail.contains("最后输出"));
+
+        let repository = Repository::memory();
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        insert_session(
+            &repository,
+            "button-session",
+            "binding-1",
+            Some("sender-1"),
+            timestamp_ms(),
+            "failed",
+            None,
+        );
+        repository
+            .set_codex_session_status(
+                "button-session",
+                "failed",
+                Some("摘要"),
+                Some(&detail),
+                Some(timestamp_ms()),
+            )
+            .unwrap();
+        let session = repository.codex_session("button-session").unwrap().session;
+        assert!(format_session_status(&session).contains("失败原因："));
+        assert_eq!(
+            session_action_from_value(&serde_json::json!({
+                "op": "refresh",
+                "session_id": "button-session",
+            })),
+            Some(("refresh", "button-session"))
+        );
+        assert_eq!(
+            parse_session_action_data("codex:cancel:button-session"),
+            Some(("cancel", "button-session"))
+        );
+        assert!(telegram_session_reply_markup(&session)
+            .to_string()
+            .contains("codex:refresh:button-session"));
+        assert!(!telegram_session_reply_markup(&session)
+            .to_string()
+            .contains("codex:cancel:button-session"));
+        assert!(discord_session_components(&session)
+            .to_string()
+            .contains("codex:refresh:button-session"));
+        assert!(session_card(&session).to_string().contains("失败原因"));
+    }
+
+    #[test]
+    fn natural_tasks_auto_select_single_binding_and_prompt_for_multiple_bindings() {
+        let repository = Arc::new(Repository::memory());
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        let manager = manager(repository.clone());
+
+        match manager
+            .resolve_natural_run(
+                CollaborationProvider::Feishu,
+                "bot-1",
+                "chat-1",
+                Some("sender-1"),
+                "修复测试".into(),
+                false,
+            )
+            .unwrap()
+        {
+            NaturalRunResolution::Ready {
+                binding,
+                instruction,
+                resume_session,
+            } => {
+                assert_eq!(binding.id, "binding-1");
+                assert_eq!(instruction, "修复测试");
+                assert!(resume_session.is_none());
+            }
+            NaturalRunResolution::Message(message) => {
+                panic!("single binding should resolve, got {message}");
+            }
+        }
+
+        insert_binding(&repository, "binding-2", "Relay Docs", "relay-docs");
+        match manager
+            .resolve_natural_run(
+                CollaborationProvider::Feishu,
+                "bot-1",
+                "chat-1",
+                Some("sender-1"),
+                "继续整理".into(),
+                false,
+            )
+            .unwrap()
+        {
+            NaturalRunResolution::Message(message) => {
+                assert!(message.contains("多个项目"));
+                assert!(message.contains("Relay (relay)"));
+                assert!(message.contains("/codex run <project>"));
+            }
+            NaturalRunResolution::Ready { .. } => {
+                panic!("multiple bindings should request a project name");
+            }
+        }
+    }
+
+    #[test]
+    fn natural_tasks_ignore_broken_resume_history_and_start_new_session() {
+        let db_path = std::env::temp_dir().join(format!(
+            "codex-relay-natural-resume-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let repository = Arc::new(Repository::open(&db_path).unwrap());
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("DROP TABLE codex_sessions", [])
+            .unwrap();
+        let manager = manager(repository);
+
+        match manager
+            .resolve_natural_run(
+                CollaborationProvider::Feishu,
+                "bot-1",
+                "chat-1",
+                Some("sender-1"),
+                "概述一下项目".into(),
+                false,
+            )
+            .unwrap()
+        {
+            NaturalRunResolution::Ready {
+                binding,
+                instruction,
+                resume_session,
+            } => {
+                assert_eq!(binding.id, "binding-1");
+                assert_eq!(instruction, "概述一下项目");
+                assert!(resume_session.is_none());
+            }
+            NaturalRunResolution::Message(message) => {
+                panic!("broken resume history should not block natural task, got {message}");
+            }
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn natural_tasks_resume_recent_same_sender_session_and_force_new_skips_resume() {
+        let repository = Arc::new(Repository::memory());
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        insert_session(
+            &repository,
+            "session-recent",
+            "binding-1",
+            Some("sender-1"),
+            timestamp_ms() - 10_000,
+            "completed",
+            Some("codex-existing"),
+        );
+        let manager = manager(repository);
+
+        match manager
+            .resolve_natural_run(
+                CollaborationProvider::Feishu,
+                "bot-1",
+                "chat-1",
+                Some("sender-1"),
+                "继续修复".into(),
+                false,
+            )
+            .unwrap()
+        {
+            NaturalRunResolution::Ready { resume_session, .. } => assert_eq!(
+                resume_session
+                    .and_then(|session| session.codex_session_id.clone())
+                    .as_deref(),
+                Some("codex-existing")
+            ),
+            NaturalRunResolution::Message(message) => {
+                panic!("recent session should resolve, got {message}");
+            }
+        }
+
+        match manager
+            .resolve_natural_run(
+                CollaborationProvider::Feishu,
+                "bot-1",
+                "chat-1",
+                Some("sender-1"),
+                "重新做".into(),
+                true,
+            )
+            .unwrap()
+        {
+            NaturalRunResolution::Ready { resume_session, .. } => {
+                assert!(resume_session.is_none())
+            }
+            NaturalRunResolution::Message(message) => {
+                panic!("force-new task should still resolve binding, got {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn collaboration_error_messages_include_actionable_codes() {
+        let profile_message = collaboration_error_message(&AppError::ProfileRuntimeUnavailable);
+        assert!(profile_message.contains("OAuth"));
+        assert!(profile_message.contains("profile_runtime_unavailable"));
+
+        let gateway_message = collaboration_error_message(&AppError::GatewayModelUnavailable);
+        assert!(gateway_message.contains("网关模型"));
+        assert!(gateway_message.contains("gateway_model_unavailable"));
+
+        let local_state_message = collaboration_error_message(&AppError::LocalStateUnavailable);
+        assert!(local_state_message.contains("本机会话状态暂不可读"));
+        assert!(local_state_message.contains("local_state_unavailable"));
+        assert!(!local_state_message.contains("internal"));
+
+        let upstream_message = collaboration_error_message(&AppError::UpstreamUnavailable);
+        assert!(upstream_message.contains("上游服务"));
+        assert!(upstream_message.contains("upstream_unavailable"));
+        assert!(!upstream_message.contains("internal"));
+    }
+
+    #[tokio::test]
+    async fn scoped_short_id_cancels_current_chat_session() {
+        let repository = Arc::new(Repository::memory());
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        insert_session_for_chat(
+            &repository,
+            TestSessionSeed {
+                id: "12345678-current",
+                binding_id: "binding-1",
+                chat_id: "chat-1",
+                sender: Some("sender-1"),
+                started_at_ms: timestamp_ms(),
+                status: "running",
+                codex_session_id: None,
+            },
+        );
+        insert_session_for_chat(
+            &repository,
+            TestSessionSeed {
+                id: "12345678-other",
+                binding_id: "binding-1",
+                chat_id: "chat-2",
+                sender: Some("sender-2"),
+                started_at_ms: timestamp_ms(),
+                status: "running",
+                codex_session_id: None,
+            },
+        );
+        let manager = manager(repository.clone());
+        let scope = SessionLookupScope::new(CollaborationProvider::Feishu, "bot-1", "chat-1");
+
+        let session = manager
+            .cancel_session_by_reference("12345678", Some(&scope))
+            .await
+            .unwrap();
+
+        assert_eq!(session.id, "12345678-current");
+        assert_eq!(session.relay_status, "cancelled");
+        assert_eq!(
+            repository
+                .codex_session("12345678-current")
+                .unwrap()
+                .session
+                .relay_status,
+            "cancelled"
+        );
+        assert_eq!(
+            repository
+                .codex_session("12345678-other")
+                .unwrap()
+                .session
+                .relay_status,
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_session_ignores_unreadable_event_log_after_status_update() {
+        let db_path = std::env::temp_dir().join(format!(
+            "codex-relay-cancel-event-log-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let repository = Arc::new(Repository::open(&db_path).unwrap());
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        insert_session_for_chat(
+            &repository,
+            TestSessionSeed {
+                id: "event-log-session",
+                binding_id: "binding-1",
+                chat_id: "chat-1",
+                sender: Some("sender-1"),
+                started_at_ms: timestamp_ms(),
+                status: "running",
+                codex_session_id: None,
+            },
+        );
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("DROP TABLE codex_session_events", [])
+            .unwrap();
+        let manager = manager(repository.clone());
+
+        let session = manager
+            .cancel_session_by_reference("event-log-session", None)
+            .await
+            .unwrap();
+
+        assert_eq!(session.relay_status, "cancelled");
+        assert_eq!(
+            repository
+                .codex_session("event-log-session")
+                .unwrap()
+                .session
+                .relay_status,
+            "cancelled"
+        );
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn scoped_short_id_cancel_reports_unreadable_local_state() {
+        let db_path = std::env::temp_dir().join(format!(
+            "codex-relay-cancel-local-state-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let repository = Arc::new(Repository::open(&db_path).unwrap());
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("DROP TABLE codex_sessions", [])
+            .unwrap();
+        let manager = manager(repository);
+        let scope = SessionLookupScope::new(CollaborationProvider::Feishu, "bot-1", "chat-1");
+
+        let error = manager
+            .cancel_session_by_reference("12345678", Some(&scope))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::LocalStateUnavailable));
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn scoped_short_id_conflict_returns_conflict() {
+        let repository = Arc::new(Repository::memory());
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        insert_session(
+            &repository,
+            "87654321-alpha",
+            "binding-1",
+            Some("sender-1"),
+            timestamp_ms(),
+            "running",
+            None,
+        );
+        insert_session(
+            &repository,
+            "87654321-beta",
+            "binding-1",
+            Some("sender-2"),
+            timestamp_ms(),
+            "running",
+            None,
+        );
+        let manager = manager(repository);
+        let scope = SessionLookupScope::new(CollaborationProvider::Feishu, "bot-1", "chat-1");
+
+        let error = manager
+            .resolve_codex_session_reference("87654321", Some(&scope))
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict));
+    }
+
+    #[test]
+    fn feishu_session_card_hides_cancel_action_after_terminal_status() {
+        let repository = Repository::memory();
+        insert_profile(&repository);
+        insert_bot(&repository);
+        insert_binding(&repository, "binding-1", "Relay", "relay");
+        insert_session(
+            &repository,
+            "card-running",
+            "binding-1",
+            Some("sender-1"),
+            timestamp_ms(),
+            "running",
+            None,
+        );
+        let running = repository.codex_session("card-running").unwrap().session;
+        let running_card = session_card(&running).to_string();
+        assert!(running_card.contains("刷新状态"));
+        assert!(running_card.contains("取消任务"));
+
+        for status in ["completed", "failed", "cancelled"] {
+            insert_session(
+                &repository,
+                &format!("card-{status}"),
+                "binding-1",
+                Some("sender-1"),
+                timestamp_ms(),
+                status,
+                None,
+            );
+            let session = repository
+                .codex_session(&format!("card-{status}"))
+                .unwrap()
+                .session;
+            let card = session_card(&session).to_string();
+            assert!(card.contains("刷新状态"));
+            assert!(!card.contains("取消任务"));
+        }
+    }
+
     #[tokio::test]
     async fn upserts_all_provider_bots_with_masked_metadata() {
         let repository = Arc::new(Repository::memory());
         let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let oauth_credentials = Arc::new(OAuthCredentialStore::new(secrets.clone()));
+        let gateway = Arc::new(GatewayManager::new(
+            repository.clone(),
+            secrets.clone(),
+            oauth_credentials.clone(),
+            PathBuf::from("/tmp/codex-relay-collaboration-certs"),
+        ));
         let manager = CollaborationManager::new(
             repository,
             secrets,
-            Arc::new(OAuthCredentialStore::new(
-                Arc::new(MemorySecretStore::new()),
-            )),
+            oauth_credentials,
+            gateway,
             PathBuf::from("/tmp/codex-relay-collaboration-test"),
         );
         let inputs = vec![
@@ -2574,6 +5021,7 @@ mod tests {
                 application_id: None,
                 bot_token: None,
                 guild_id: None,
+                system_prompt: None,
             },
             UpsertCollaborationBotInput {
                 id: Some("qq".into()),
@@ -2593,6 +5041,7 @@ mod tests {
                 application_id: None,
                 bot_token: None,
                 guild_id: None,
+                system_prompt: None,
             },
             UpsertCollaborationBotInput {
                 id: Some("wecom".into()),
@@ -2612,6 +5061,7 @@ mod tests {
                 application_id: None,
                 bot_token: None,
                 guild_id: None,
+                system_prompt: None,
             },
             UpsertCollaborationBotInput {
                 id: Some("discord".into()),
@@ -2631,6 +5081,7 @@ mod tests {
                 application_id: Some("123456789".into()),
                 bot_token: Some("discord-token".into()),
                 guild_id: Some("guild".into()),
+                system_prompt: None,
             },
             UpsertCollaborationBotInput {
                 id: Some("telegram".into()),
@@ -2650,6 +5101,7 @@ mod tests {
                 application_id: None,
                 bot_token: Some("123456:telegram-token".into()),
                 guild_id: None,
+                system_prompt: None,
             },
         ];
 
@@ -2664,6 +5116,82 @@ mod tests {
         }
 
         assert_eq!(manager.list_bots().await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn bot_system_prompt_persists_and_updates_without_secret_resubmit() {
+        let repository = Arc::new(Repository::memory());
+        let manager = manager(repository.clone());
+
+        let created = manager
+            .upsert_bot(UpsertCollaborationBotInput {
+                id: Some("prompt-bot".into()),
+                provider: CollaborationProvider::Feishu,
+                name: "Prompt Bot".into(),
+                enabled: false,
+                confirmed: true,
+                app_id: Some("cli_prompt".into()),
+                app_secret: Some("original-secret".into()),
+                client_secret: None,
+                corp_id: None,
+                agent_id: None,
+                secret: None,
+                token: None,
+                encoding_aes_key: None,
+                callback_public_url: None,
+                application_id: None,
+                bot_token: None,
+                guild_id: None,
+                system_prompt: Some("旧提示词".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.system_prompt.as_deref(), Some("旧提示词"));
+
+        let updated = manager
+            .upsert_bot(UpsertCollaborationBotInput {
+                id: Some("prompt-bot".into()),
+                provider: CollaborationProvider::Feishu,
+                name: "Prompt Bot".into(),
+                enabled: false,
+                confirmed: true,
+                app_id: Some("cli_prompt".into()),
+                app_secret: None,
+                client_secret: None,
+                corp_id: None,
+                agent_id: None,
+                secret: None,
+                token: None,
+                encoding_aes_key: None,
+                callback_public_url: None,
+                application_id: None,
+                bot_token: None,
+                guild_id: None,
+                system_prompt: Some("新的专属提示词".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(updated.system_prompt.as_deref(), Some("新的专属提示词"));
+        assert_eq!(
+            repository
+                .list_collaboration_bots()
+                .unwrap()
+                .into_iter()
+                .find(|bot| bot.bot.id == "prompt-bot")
+                .and_then(|bot| bot.bot.system_prompt)
+                .as_deref(),
+            Some("新的专属提示词")
+        );
+        assert_eq!(
+            manager.bot_system_prompt("prompt-bot").unwrap().as_deref(),
+            Some("新的专属提示词")
+        );
+        let runtime = manager.runtime("prompt-bot").await.unwrap();
+        assert_eq!(
+            manager.secret(&runtime, "app_secret").await.unwrap(),
+            "original-secret"
+        );
     }
 
     #[test]
@@ -2688,5 +5216,193 @@ mod tests {
             required_secret_keys(CollaborationProvider::Wecom),
             &["secret", "token", "encoding_aes_key"]
         );
+    }
+
+    fn manager(repository: Arc<Repository>) -> CollaborationManager {
+        let secrets = Arc::new(MemorySecretStore::new());
+        let oauth_credentials = Arc::new(OAuthCredentialStore::new(secrets.clone()));
+        let gateway = Arc::new(GatewayManager::new(
+            repository.clone(),
+            secrets.clone(),
+            oauth_credentials.clone(),
+            PathBuf::from("/tmp/codex-relay-collaboration-certs"),
+        ));
+        CollaborationManager::new(
+            repository,
+            secrets,
+            oauth_credentials,
+            gateway,
+            PathBuf::from("/tmp/codex-relay-collaboration-test"),
+        )
+    }
+
+    fn insert_profile(repository: &Repository) {
+        repository
+            .insert_profile(&StoredProfile {
+                profile: MaskedProfile {
+                    id: "profile-1".into(),
+                    alias: "工作账号".into(),
+                    kind: ProfileKind::CodexOauth,
+                    base_url: None,
+                    provider: Default::default(),
+                    wire_api: Default::default(),
+                    enabled: true,
+                    in_pool: false,
+                    priority: 0,
+                    weight: 1,
+                    models: Vec::new(),
+                    model_mappings: Vec::new(),
+                    health: "healthy".into(),
+                    cooldown_until_ms: None,
+                    credential_configured: true,
+                    auth_mode: CodexAuthMode::OAuth,
+                    is_current: false,
+                    account: None,
+                },
+                secret_ref: Some("profile:profile-1:oauth".into()),
+                credential_fingerprint: None,
+            })
+            .unwrap();
+    }
+
+    fn insert_gateway_model_profile(repository: &Repository, id: &str, model: &str, healthy: bool) {
+        repository
+            .insert_profile(&StoredProfile {
+                profile: MaskedProfile {
+                    id: id.into(),
+                    alias: format!("API {id}"),
+                    kind: ProfileKind::ApiKey,
+                    base_url: Some("https://gateway.example.test".into()),
+                    provider: Default::default(),
+                    wire_api: Default::default(),
+                    enabled: true,
+                    in_pool: true,
+                    priority: 0,
+                    weight: 1,
+                    models: vec![model.into()],
+                    model_mappings: Vec::new(),
+                    health: if healthy { "healthy" } else { "unhealthy" }.into(),
+                    cooldown_until_ms: None,
+                    credential_configured: true,
+                    auth_mode: CodexAuthMode::OAuth,
+                    is_current: false,
+                    account: None,
+                },
+                secret_ref: Some(format!("profile:{id}:api-key")),
+                credential_fingerprint: None,
+            })
+            .unwrap();
+    }
+
+    fn insert_bot(repository: &Repository) {
+        repository
+            .upsert_collaboration_bot(&StoredCollaborationBot {
+                bot: MaskedCollaborationBot {
+                    id: "bot-1".into(),
+                    provider: CollaborationProvider::Feishu,
+                    name: "Codex Bot".into(),
+                    enabled: true,
+                    connection_status: "connected".into(),
+                    credential_mask: "cli_••••test".into(),
+                    config_summary: "App ID cli_••••test".into(),
+                    callback_public_url: None,
+                    system_prompt: None,
+                    last_error: None,
+                    updated_at_ms: timestamp_ms(),
+                },
+                config_json: "{}".into(),
+                secret_refs_json: "{}".into(),
+            })
+            .unwrap();
+    }
+
+    fn insert_binding(repository: &Repository, id: &str, name: &str, slug: &str) {
+        let now = timestamp_ms();
+        repository
+            .upsert_collaboration_project_binding(&CollaborationProjectBinding {
+                id: id.into(),
+                provider: CollaborationProvider::Feishu,
+                bot_id: "bot-1".into(),
+                bot_name: "Codex Bot".into(),
+                project_name: name.into(),
+                project_slug: slug.into(),
+                working_directory: "/tmp".into(),
+                profile_id: Some("profile-1".into()),
+                profile_alias: Some("工作账号".into()),
+                chat_id: Some("chat-1".into()),
+                bind_code: format!("CODE-{id}"),
+                enabled: true,
+                concurrency_limit: 2,
+                execution_target: "profile".into(),
+                model_id: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            })
+            .unwrap();
+    }
+
+    fn insert_session(
+        repository: &Repository,
+        id: &str,
+        binding_id: &str,
+        sender: Option<&str>,
+        started_at_ms: i64,
+        status: &str,
+        codex_session_id: Option<&str>,
+    ) {
+        insert_session_for_chat(
+            repository,
+            TestSessionSeed {
+                id,
+                binding_id,
+                chat_id: "chat-1",
+                sender,
+                started_at_ms,
+                status,
+                codex_session_id,
+            },
+        );
+    }
+
+    struct TestSessionSeed<'a> {
+        id: &'a str,
+        binding_id: &'a str,
+        chat_id: &'a str,
+        sender: Option<&'a str>,
+        started_at_ms: i64,
+        status: &'a str,
+        codex_session_id: Option<&'a str>,
+    }
+
+    fn insert_session_for_chat(repository: &Repository, seed: TestSessionSeed<'_>) {
+        repository
+            .insert_codex_session(&StoredCodexSession {
+                session: CodexSessionSummary {
+                    id: seed.id.into(),
+                    binding_id: seed.binding_id.into(),
+                    provider: CollaborationProvider::Feishu,
+                    provider_bot_id: Some("bot-1".into()),
+                    provider_chat_id: Some(seed.chat_id.into()),
+                    provider_message_id: None,
+                    project_name: "Relay".into(),
+                    project_slug: "relay".into(),
+                    profile_id: Some("profile-1".into()),
+                    profile_alias: Some("工作账号".into()),
+                    relay_status: seed.status.into(),
+                    codex_session_id: seed.codex_session_id.map(ToOwned::to_owned),
+                    feishu_message_id: None,
+                    feishu_chat_id: Some(seed.chat_id.into()),
+                    started_by: seed.sender.map(ToOwned::to_owned),
+                    started_at_ms: seed.started_at_ms,
+                    updated_at_ms: seed.started_at_ms,
+                    finished_at_ms: Some(seed.started_at_ms + 1_000),
+                    summary: Some("done".into()),
+                    last_error: None,
+                    execution_target: "profile".into(),
+                    model_id: None,
+                },
+                working_directory: "/tmp".into(),
+            })
+            .unwrap();
     }
 }

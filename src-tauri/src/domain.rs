@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 pub const GATEWAY_CODEX_CLIENT_KEY_REF_SETTING: &str = "gateway_codex_client_key_ref";
+pub const GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING: &str = "gateway_codex_oauth_profile_id";
+pub const APP_UPDATE_STABLE_ENDPOINT: &str =
+    "https://github.com/RayZh0ng/codex-reply/releases/download/updater/stable.json";
+pub const APP_UPDATE_BETA_ENDPOINT: &str =
+    "https://github.com/RayZh0ng/codex-reply/releases/download/updater/beta.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -13,14 +18,41 @@ pub enum ProfileKind {
 /// use the OpenAI Responses-compatible adapter while API-key profiles retain
 /// their configured provider protocol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum GatewayProvider {
+    #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
     #[default]
+    #[serde(rename = "openai_compatible", alias = "open_ai_compatible")]
     OpenAiCompatible,
+    #[serde(rename = "anthropic")]
     Anthropic,
+    #[serde(rename = "gemini")]
     Gemini,
+    #[serde(rename = "ollama")]
     Ollama,
+}
+
+/// The upstream API shape used by an API-key profile. Codex always talks to
+/// Relay through an OpenAI Responses-compatible surface; chat-completions
+/// upstreams are converted by the local Relay gateway before dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayWireApi {
+    #[default]
+    Responses,
+    ChatCompletions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayModelMapping {
+    /// Model id exposed by Relay and shown to Codex/client callers.
+    pub model: String,
+    /// Real model id sent to the upstream provider.
+    pub upstream_model: String,
+    /// Optional display name for generated Codex model catalogs.
+    pub display_name: Option<String>,
+    /// Optional context window for generated Codex model catalogs.
+    pub context_window: Option<i64>,
 }
 
 /// The non-secret authentication material used by a Codex profile. The actual
@@ -31,6 +63,62 @@ pub enum CodexAuthMode {
     OAuth,
     AgentIdentity,
     PersonalAccessToken,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppUpdateChannel {
+    Stable,
+    Beta,
+}
+
+impl AppUpdateChannel {
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Self::Stable => APP_UPDATE_STABLE_ENDPOINT,
+            Self::Beta => APP_UPDATE_BETA_ENDPOINT,
+        }
+    }
+
+    pub fn as_setting_value(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AppUpdateSettings {
+    pub channel: AppUpdateChannel,
+    pub auto_check: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateAppUpdateSettingsInput {
+    pub channel: AppUpdateChannel,
+    pub auto_check: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckAppUpdateInput {
+    #[serde(default)]
+    pub channel: Option<AppUpdateChannel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallAppUpdateInput {
+    #[serde(default)]
+    pub channel: Option<AppUpdateChannel>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppUpdateInfo {
+    pub version: String,
+    pub current_version: String,
+    pub body: Option<String>,
+    pub date: Option<String>,
+    pub channel: AppUpdateChannel,
 }
 
 impl Default for CodexAuthMode {
@@ -47,11 +135,15 @@ pub struct MaskedProfile {
     pub base_url: Option<String>,
     #[serde(default)]
     pub provider: GatewayProvider,
+    #[serde(default)]
+    pub wire_api: GatewayWireApi,
     pub enabled: bool,
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_mappings: Vec<GatewayModelMapping>,
     pub health: String,
     pub cooldown_until_ms: Option<i64>,
     pub credential_configured: bool,
@@ -118,6 +210,8 @@ pub struct JsonProfileImportResultItem {
     pub alias: String,
     pub action: String,
     pub message: String,
+    pub profile_id: Option<String>,
+    pub auth_mode: Option<CodexAuthMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,11 +281,38 @@ pub struct CreateProfileInput {
     pub base_url: Option<String>,
     #[serde(default)]
     pub provider: GatewayProvider,
+    #[serde(default)]
+    pub wire_api: GatewayWireApi,
     pub api_key: Option<String>,
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_mappings: Vec<GatewayModelMapping>,
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateApiServiceProfileInput {
+    pub alias: String,
+    #[serde(default)]
+    pub provider: GatewayProvider,
+    #[serde(default)]
+    pub wire_api: GatewayWireApi,
+    pub base_url: String,
+    pub api_key: String,
+    #[serde(default)]
+    pub model_mappings: Vec<GatewayModelMapping>,
+    #[serde(default)]
+    pub in_pool: bool,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default = "default_profile_weight")]
+    pub weight: i64,
+}
+
+fn default_profile_weight() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +343,8 @@ pub struct UpdateProfileInput {
     pub priority: i64,
     pub weight: i64,
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_mappings: Option<Vec<GatewayModelMapping>>,
     pub api_key: Option<String>,
 }
 
@@ -283,6 +406,18 @@ pub struct GatewayCodexConfigStatus {
     pub message: String,
     pub auth_status: String,
     pub needs_repair: bool,
+    pub oauth_profile_id: Option<String>,
+    pub oauth_profile_alias: Option<String>,
+    pub oauth_profile_available: bool,
+    pub oauth_profile_options: Vec<GatewayOAuthProfileOption>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GatewayOAuthProfileOption {
+    pub id: String,
+    pub alias: String,
+    pub available: bool,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,6 +455,12 @@ pub struct CreateClientKeyInput {
     pub confirmed: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetCodexGatewayOAuthProfileInput {
+    pub profile_id: Option<String>,
+    pub confirmed: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationProvider {
@@ -340,6 +481,7 @@ pub struct MaskedCollaborationBot {
     pub credential_mask: String,
     pub config_summary: String,
     pub callback_public_url: Option<String>,
+    pub system_prompt: Option<String>,
     pub last_error: Option<String>,
     pub updated_at_ms: i64,
 }
@@ -363,6 +505,8 @@ pub struct UpsertCollaborationBotInput {
     pub application_id: Option<String>,
     pub bot_token: Option<String>,
     pub guild_id: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -380,12 +524,14 @@ pub struct CollaborationProjectBinding {
     pub project_name: String,
     pub project_slug: String,
     pub working_directory: String,
-    pub profile_id: String,
-    pub profile_alias: String,
+    pub profile_id: Option<String>,
+    pub profile_alias: Option<String>,
     pub chat_id: Option<String>,
     pub bind_code: String,
     pub enabled: bool,
     pub concurrency_limit: i64,
+    pub execution_target: String,
+    pub model_id: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -397,9 +543,13 @@ pub struct UpsertCollaborationProjectBindingInput {
     pub project_name: String,
     pub project_slug: String,
     pub working_directory: String,
-    pub profile_id: String,
+    pub profile_id: Option<String>,
     pub enabled: bool,
     pub concurrency_limit: i64,
+    #[serde(default)]
+    pub execution_target: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub confirmed: bool,
 }
 
@@ -498,8 +648,8 @@ pub struct CodexSessionSummary {
     pub provider_message_id: Option<String>,
     pub project_name: String,
     pub project_slug: String,
-    pub profile_id: String,
-    pub profile_alias: String,
+    pub profile_id: Option<String>,
+    pub profile_alias: Option<String>,
     pub relay_status: String,
     pub codex_session_id: Option<String>,
     pub feishu_message_id: Option<String>,
@@ -510,6 +660,8 @@ pub struct CodexSessionSummary {
     pub finished_at_ms: Option<i64>,
     pub summary: Option<String>,
     pub last_error: Option<String>,
+    pub execution_target: String,
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -639,4 +791,39 @@ pub struct ManagedTaskStatus {
     pub phase: String,
     pub profile_id: Option<String>,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppUpdateChannel, GatewayProvider, APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT,
+    };
+
+    #[test]
+    fn gateway_provider_accepts_legacy_and_frontend_spellings() {
+        assert_eq!(
+            serde_json::from_str::<GatewayProvider>("\"openai_compatible\"").unwrap(),
+            GatewayProvider::OpenAiCompatible
+        );
+        assert_eq!(
+            serde_json::from_str::<GatewayProvider>("\"open_ai_compatible\"").unwrap(),
+            GatewayProvider::OpenAiCompatible
+        );
+        assert_eq!(
+            serde_json::to_string(&GatewayProvider::OpenAiCompatible).unwrap(),
+            "\"openai_compatible\""
+        );
+    }
+
+    #[test]
+    fn app_update_channels_map_to_fixed_github_manifest_endpoints() {
+        assert_eq!(
+            AppUpdateChannel::Stable.endpoint(),
+            APP_UPDATE_STABLE_ENDPOINT
+        );
+        assert_eq!(AppUpdateChannel::Beta.endpoint(), APP_UPDATE_BETA_ENDPOINT);
+        assert!(APP_UPDATE_STABLE_ENDPOINT.ends_with("/stable.json"));
+        assert!(APP_UPDATE_BETA_ENDPOINT.ends_with("/beta.json"));
+        assert!(serde_json::from_str::<AppUpdateChannel>("\"nightly\"").is_err());
+    }
 }

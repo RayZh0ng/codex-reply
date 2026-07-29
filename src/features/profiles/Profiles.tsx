@@ -10,6 +10,7 @@ import { Plus } from "@phosphor-icons/react/Plus";
 import { Trash } from "@phosphor-icons/react/Trash";
 import { UserSwitch } from "@phosphor-icons/react/UserSwitch";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   FormEvent,
   KeyboardEvent,
@@ -24,7 +25,9 @@ import {
 import type {
   DesktopWorkspaceMode,
   ApiServiceTestReport,
+  GatewayModelMapping,
   GatewayProvider,
+  GatewayWireApi,
   JsonProfileImportPreview,
   JsonProfileImportResult,
   MaskedProfile,
@@ -196,17 +199,16 @@ export function Profiles({
     setImportError(null);
     setJsonResult(null);
   }, []);
-  const beginJsonImport = async () => {
+
+  const beginJsonImportWithPaths = useCallback(async (paths: string[]) => {
     setImportError(null);
+    if (!paths.length) {
+      setImportError("未检测到可导入的 JSON 文件。");
+      setFlow({ step: "picker" });
+      return;
+    }
+    setJsonBusy(true);
     try {
-      const selected = await open({
-        title: "选择要导入的账号 JSON 文件",
-        multiple: true,
-        filters: [{ name: "JSON", extensions: ["json"] }],
-      });
-      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-      if (!paths.length) return;
-      setJsonBusy(true);
       const preview = await api.previewJsonProfileImport(paths);
       setJsonResult(null);
       setSelectedJsonItems(
@@ -224,6 +226,25 @@ export function Profiles({
       setFlow({ step: "picker" });
     } finally {
       setJsonBusy(false);
+    }
+  }, []);
+
+  const beginJsonImport = async () => {
+    setImportError(null);
+    try {
+      const selected = await open({
+        title: "选择要导入的账号 JSON 文件",
+        multiple: true,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      if (!paths.length) return;
+      await beginJsonImportWithPaths(paths);
+    } catch {
+      setImportError(
+        "无法解析或验证所选 JSON。请确认文件格式、Codex CLI 和网络连接后重试。",
+      );
+      setFlow({ step: "picker" });
     }
   };
   const discardJsonPreview = async (previewId: string) => {
@@ -262,6 +283,25 @@ export function Profiles({
       setJsonBusy(false);
     }
   };
+  const refreshImportedProfiles = async (result: JsonProfileImportResult) => {
+    let failed = false;
+    const imported = result.items.filter(
+      (item) =>
+        (item.action === "created" || item.action === "updated") && item.profile_id,
+    );
+    for (const item of imported) {
+      const profileId = item.profile_id;
+      if (!profileId) continue;
+      try {
+        await api.syncProfileAccountInfo(profileId);
+        if (item.auth_mode === "oauth") await api.refreshProfileModels(profileId);
+      } catch {
+        failed = true;
+      }
+    }
+    return failed;
+  };
+
   const commitJsonPreview = async (preview: JsonProfileImportPreview) => {
     if (!selectedJsonItems.size) return;
     setJsonBusy(true);
@@ -270,8 +310,14 @@ export function Profiles({
         preview.preview_id,
         [...selectedJsonItems],
       );
+      const refreshFailed = await refreshImportedProfiles(result);
       await onJsonImportComplete();
       setJsonResult(result);
+      if (refreshFailed) {
+        setImportError(
+          "导入已完成，但部分账号资料或可用模型刷新未完成，可稍后手动刷新。",
+        );
+      }
     } catch {
       setImportError("导入未完成。预览已失效时请重新选择文件。");
     } finally {
@@ -325,6 +371,40 @@ export function Profiles({
     }, 1000);
     return () => window.clearInterval(timer);
   }, [flow, handleStatus, onOAuthStatus]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    try {
+      void getCurrentWebview()
+        .onDragDropEvent((event) => {
+          if (event.payload.type !== "drop") return;
+          const jsonPaths = event.payload.paths.filter((path) =>
+            path.toLowerCase().endsWith(".json"),
+          );
+          if (!jsonPaths.length) {
+            setImportError("拖入的文件不是 JSON；请拖入 .json 账号文件。");
+            setFlow({ step: "picker" });
+            return;
+          }
+          void beginJsonImportWithPaths(jsonPaths);
+        })
+        .then((dispose) => {
+          if (disposed) dispose();
+          else unlisten = dispose;
+        })
+        .catch(() => {
+          // Native drag/drop is optional in browser-only tests and preview builds.
+        });
+    } catch {
+      // Tauri globals may exist without the webview API in unit tests.
+    }
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [beginJsonImportWithPaths]);
 
   const refreshAccount = async (id: string) => {
     if (refreshingProfileId) return;
@@ -910,8 +990,10 @@ function OAuthImportSheet({
               <CloudArrowUp size={20} weight="duotone" />
             </span>
             <div>
-              <strong>连接 API 上游</strong>
-              <p>添加 OpenAI、Anthropic、Gemini、Ollama 或兼容服务，并自动发现模型。</p>
+              <strong>添加第三方模型提供商</strong>
+              <p>
+                配置 Responses 或 Chat Completions 上游，测试后生成 Codex 可见模型映射。
+              </p>
             </div>
             <button
               className="quiet-button"
@@ -919,7 +1001,7 @@ function OAuthImportSheet({
               disabled={busy}
               onClick={onOpenApi}
             >
-              配置 API
+              添加提供商
             </button>
           </article>
         </div>
@@ -958,6 +1040,89 @@ function OAuthImportSheet({
   );
 }
 
+interface ApiProviderPreset {
+  id: string;
+  label: string;
+  provider: GatewayProvider;
+  wireApi: GatewayWireApi;
+  baseUrl: string;
+}
+
+const API_PROVIDER_PRESETS: ApiProviderPreset[] = [
+  {
+    id: "custom_responses",
+    label: "Custom Responses",
+    provider: "openai_compatible",
+    wireApi: "responses",
+    baseUrl: "",
+  },
+  {
+    id: "custom_chat",
+    label: "Custom Chat Completions",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "https://api.deepseek.com/v1",
+  },
+  {
+    id: "kimi",
+    label: "Kimi / Moonshot",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "https://api.moonshot.cn/v1",
+  },
+  {
+    id: "glm",
+    label: "GLM / BigModel",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+  },
+  {
+    id: "minimax",
+    label: "MiniMax",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "https://api.minimax.io/v1",
+  },
+  {
+    id: "qwen_bailian",
+    label: "Qwen / Bailian",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  },
+  {
+    id: "siliconflow",
+    label: "SiliconFlow",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "https://api.siliconflow.cn/v1",
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    provider: "openai_compatible",
+    wireApi: "chat_completions",
+    baseUrl: "https://openrouter.ai/api/v1",
+  },
+];
+
+function identityMappings(models: string[]): GatewayModelMapping[] {
+  return models.map((model) => ({
+    model,
+    upstream_model: model,
+    display_name: model,
+    context_window: null,
+  }));
+}
+
 function ApiProfileSheet({
   busy,
   onClose,
@@ -968,45 +1133,115 @@ function ApiProfileSheet({
   onSubmit: (input: Record<string, unknown>) => Promise<void>;
 }) {
   const [alias, setAlias] = useState("");
-  const [provider, setProvider] = useState<GatewayProvider>("openai");
-  const [baseUrl, setBaseUrl] = useState("https://api.openai.com");
+  const [presetId, setPresetId] = useState(API_PROVIDER_PRESETS[0].id);
+  const [provider, setProvider] = useState<GatewayProvider>("openai_compatible");
+  const [wireApi, setWireApi] = useState<GatewayWireApi>("responses");
+  const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [mappings, setMappings] = useState<GatewayModelMapping[]>([]);
   const [report, setReport] = useState<ApiServiceTestReport | null>(null);
   const [testing, setTesting] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const applyPreset = (id: string) => {
+    const preset = API_PROVIDER_PRESETS.find((candidate) => candidate.id === id);
+    if (!preset) return;
+    setPresetId(id);
+    setProvider(preset.provider);
+    setWireApi(preset.wireApi);
+    setBaseUrl(preset.baseUrl);
+    setReport(null);
+    setMappings([]);
+    setLocalError(null);
+  };
+
   const test = async () => {
     setTesting(true);
+    setLocalError(null);
     try {
-      setReport(
-        await api.testApiServiceProfile({
-          provider,
-          base_url: baseUrl,
-          api_key: apiKey,
-        }),
-      );
+      const nextReport = await api.testApiServiceProfile({
+        provider,
+        base_url: baseUrl,
+        api_key: apiKey,
+      });
+      setReport(nextReport);
+      if (nextReport.status === "verified") {
+        setMappings(identityMappings(nextReport.models));
+      }
+    } catch (error) {
+      setReport(null);
+      setLocalError(error instanceof Error ? error.message : "连接测试未完成。");
     } finally {
       setTesting(false);
     }
   };
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    void onSubmit({
-      alias,
-      kind: "api_key",
-      provider,
-      base_url: baseUrl,
-      api_key: apiKey,
-      models: report?.status === "verified" ? report.models : [],
-      in_pool: false,
-      priority: 0,
-      weight: 1,
-    });
+
+  const updateMapping = (index: number, patch: Partial<GatewayModelMapping>) => {
+    setMappings((current) =>
+      current.map((mapping, candidateIndex) =>
+        candidateIndex === index ? { ...mapping, ...patch } : mapping,
+      ),
+    );
   };
+
+  const addMapping = () => {
+    setMappings((current) => [
+      ...current,
+      { model: "", upstream_model: "", display_name: null, context_window: null },
+    ]);
+  };
+
+  const removeMapping = (index: number) => {
+    setMappings((current) =>
+      current.filter((_, candidateIndex) => candidateIndex !== index),
+    );
+  };
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setLocalError(null);
+    const normalizedMappings = mappings
+      .map((mapping) => ({
+        model: mapping.model.trim(),
+        upstream_model: mapping.upstream_model.trim(),
+        display_name: mapping.display_name?.trim() || null,
+        context_window: mapping.context_window,
+      }))
+      .filter((mapping) => mapping.model && mapping.upstream_model);
+    if (!normalizedMappings.length) {
+      setLocalError("请先测试连接并保留至少一个模型映射。");
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSubmit({
+        alias,
+        provider,
+        wire_api: wireApi,
+        base_url: baseUrl,
+        api_key: apiKey,
+        model_mappings: normalizedMappings,
+        in_pool: false,
+        priority: 0,
+        weight: 1,
+      });
+      onClose();
+    } catch (error) {
+      setLocalError(
+        error instanceof Error ? error.message : "第三方模型提供商保存未完成。",
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <section className="form-sheet" aria-labelledby="api-profile-title">
       <div className="form-sheet-heading">
         <div>
-          <p className="section-kicker">Gateway upstream</p>
-          <h2 id="api-profile-title">连接 API 上游</h2>
+          <p className="section-kicker">Third-party provider</p>
+          <h2 id="api-profile-title">添加第三方模型提供商</h2>
         </div>
         <button className="text-button" type="button" onClick={onClose}>
           取消
@@ -1019,6 +1254,19 @@ function ApiProfileSheet({
             required
             value={alias}
             onChange={(event) => setAlias(event.target.value)}
+            placeholder="例如：DeepSeek Coding"
+          />
+        </label>
+        <label>
+          供应商预设
+          <Select
+            ariaLabel="供应商预设"
+            onValueChange={applyPreset}
+            options={API_PROVIDER_PRESETS.map((preset) => ({
+              value: preset.id,
+              label: preset.label,
+            }))}
+            value={presetId}
           />
         </label>
         <label>
@@ -1026,24 +1274,36 @@ function ApiProfileSheet({
           <Select
             ariaLabel="上游协议"
             onValueChange={(value) => {
-              const next = value as GatewayProvider;
-              setProvider(next);
-              setBaseUrl(
-                {
-                  openai: "https://api.openai.com",
-                  openai_compatible: "",
-                  anthropic: "https://api.anthropic.com",
-                  gemini: "https://generativelanguage.googleapis.com",
-                  ollama: "http://127.0.0.1:11434",
-                }[next],
-              );
+              const next = value as GatewayWireApi;
+              setWireApi(next);
+              setReport(null);
+              setMappings([]);
             }}
             options={[
-              { value: "openai", label: "OpenAI · Responses / Chat" },
-              { value: "openai_compatible", label: "OpenAI 兼容服务" },
-              { value: "anthropic", label: "Anthropic · Messages" },
-              { value: "gemini", label: "Gemini · GenerateContent" },
-              { value: "ollama", label: "Ollama · 本地模型" },
+              { value: "responses", label: "OpenAI Responses · 可直连" },
+              {
+                value: "chat_completions",
+                label: "Chat Completions · 需要 Relay 本地路由",
+              },
+            ]}
+            value={wireApi}
+          />
+        </label>
+        <label>
+          Provider 类型
+          <Select
+            ariaLabel="Provider 类型"
+            onValueChange={(value) => {
+              setProvider(value as GatewayProvider);
+              setReport(null);
+              setMappings([]);
+            }}
+            options={[
+              { value: "openai", label: "OpenAI" },
+              { value: "openai_compatible", label: "OpenAI 兼容" },
+              { value: "anthropic", label: "Anthropic" },
+              { value: "gemini", label: "Gemini" },
+              { value: "ollama", label: "Ollama" },
             ]}
             value={provider}
           />
@@ -1053,7 +1313,12 @@ function ApiProfileSheet({
           <input
             required
             value={baseUrl}
-            onChange={(event) => setBaseUrl(event.target.value)}
+            onChange={(event) => {
+              setBaseUrl(event.target.value);
+              setReport(null);
+              setMappings([]);
+            }}
+            placeholder="https://api.example.com/v1"
           />
         </label>
         <label>
@@ -1062,10 +1327,18 @@ function ApiProfileSheet({
             required
             type="password"
             value={apiKey}
-            onChange={(event) => setApiKey(event.target.value)}
+            onChange={(event) => {
+              setApiKey(event.target.value);
+              setReport(null);
+            }}
           />
         </label>
-        <p className="form-note">保存后先刷新模型；检测到模型后即可加入网关账号池。</p>
+        <p className="form-note">
+          Chat Completions 提供商会通过 Relay 本地路由转换为 Codex
+          Responses；模型映射会生成 Codex model_catalog_json，修改后需重启 Codex 刷新
+          /model 列表。
+        </p>
+        {localError && <p className="form-note error-note">{localError}</p>}
         {report && (
           <div
             className={`profile-test-report ${
@@ -1082,20 +1355,105 @@ function ApiProfileSheet({
             </p>
           </div>
         )}
+        <div className="model-mapping-editor" aria-label="模型映射">
+          <div className="model-mapping-heading">
+            <div>
+              <strong>模型映射</strong>
+              <p>
+                Model ID 是 Codex 可见名称；Upstream Model 是发送给第三方的真实模型。
+              </p>
+            </div>
+            <button className="quiet-button" type="button" onClick={addMapping}>
+              添加模型
+            </button>
+          </div>
+          {mappings.length ? (
+            <div className="model-mapping-list">
+              {mappings.map((mapping, index) => (
+                <div className="model-mapping-row" key={`${mapping.model}-${index}`}>
+                  <label>
+                    Model ID
+                    <input
+                      value={mapping.model}
+                      onChange={(event) =>
+                        updateMapping(index, { model: event.target.value })
+                      }
+                      placeholder="Codex 显示的模型名"
+                    />
+                  </label>
+                  <label>
+                    Upstream Model
+                    <input
+                      value={mapping.upstream_model}
+                      onChange={(event) =>
+                        updateMapping(index, { upstream_model: event.target.value })
+                      }
+                      placeholder="第三方真实模型名"
+                    />
+                  </label>
+                  <label>
+                    Display Name
+                    <input
+                      value={mapping.display_name ?? ""}
+                      onChange={(event) =>
+                        updateMapping(index, {
+                          display_name: event.target.value || null,
+                        })
+                      }
+                      placeholder="可选"
+                    />
+                  </label>
+                  <label>
+                    Context Window
+                    <input
+                      min={1}
+                      type="number"
+                      value={mapping.context_window ?? ""}
+                      onChange={(event) =>
+                        updateMapping(index, {
+                          context_window: event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        })
+                      }
+                      placeholder="例如：128000"
+                    />
+                  </label>
+                  <button
+                    aria-label={`删除模型映射 ${index + 1}`}
+                    className="icon-button danger"
+                    type="button"
+                    onClick={() => removeMapping(index)}
+                  >
+                    <Trash size={17} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="form-note">
+              测试连接后会按上游返回模型自动生成 identity mapping。
+            </p>
+          )}
+        </div>
         <div className="form-actions">
           <button className="quiet-button" type="button" onClick={onClose}>
             取消
           </button>
-          <button className="primary-button" disabled={busy} type="submit">
-            保存并发现模型
-          </button>
           <button
             className="quiet-button"
-            disabled={busy || testing || !baseUrl || !apiKey}
+            disabled={busy || testing || saving || !baseUrl || !apiKey}
             type="button"
             onClick={() => void test()}
           >
-            {testing ? "正在测试…" : "测试连接"}
+            {testing ? "正在发现…" : "测试连接并发现模型"}
+          </button>
+          <button
+            className="primary-button"
+            disabled={busy || testing || saving || !mappings.length}
+            type="submit"
+          >
+            {saving ? "正在保存…" : "测试并保存"}
           </button>
         </div>
       </form>
@@ -1550,6 +1908,8 @@ function subscriptionPlanLabel(planType?: string | null) {
       enterprise_cbp_usage_based: "ChatGPT Enterprise",
       enterprise: "ChatGPT Enterprise",
       edu: "ChatGPT Edu",
+      k12: "ChatGPT K-12 / Edu",
+      unknown: "套餐尚未同步",
     }[planType ?? ""] ?? (planType ? `未知套餐（${planType}）` : "套餐尚未同步")
   );
 }

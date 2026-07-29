@@ -56,4 +56,13 @@ jobs:
       - run: pnpm rust:format
       - run: pnpm rust:lint
       - run: pnpm rust:test
+      - name: Generate temporary updater signing key
+        run: |
+          pnpm tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key"
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY<<EOF"
+            cat "$RUNNER_TEMP/updater.key"
+            echo "EOF"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
+          } >> "$GITHUB_ENV"
       - run: pnpm tauri:build

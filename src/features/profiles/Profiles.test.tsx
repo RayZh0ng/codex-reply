@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -8,6 +9,13 @@ import {
 } from "@testing-library/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const webview = vi.hoisted(() => ({
+  dragHandler: null as
+    ((event: { payload: { type: string; paths: string[] } }) => void) | null,
+  onDragDropEvent: vi.fn(),
+  unlisten: vi.fn(),
+}));
 
 import type {
   JsonProfileImportPreview,
@@ -19,6 +27,9 @@ import { api } from "../../shared/ipc";
 import { Profiles } from "./Profiles";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({ onDragDropEvent: webview.onDragDropEvent }),
+}));
 
 const status = {
   attempt_id: "attempt-1",
@@ -31,6 +42,9 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  webview.dragHandler = null;
+  delete (window as typeof window & { __TAURI_INTERNALS__?: unknown })
+    .__TAURI_INTERNALS__;
 });
 
 function renderProfiles(profiles: MaskedProfile[] = []) {
@@ -195,7 +209,56 @@ describe("Profiles OAuth import", () => {
     expect(screen.getByRole("button", { name: "选择 JSON 文件" })).toBeInTheDocument();
     expect(view.container.querySelectorAll(".import-method-card")).toHaveLength(3);
     expect(view.container.querySelector(".import-method-grid")).toBeInTheDocument();
-    expect(screen.getByText("连接 API 上游")).toBeInTheDocument();
+    expect(screen.getByText("添加第三方模型提供商")).toBeInTheDocument();
+  });
+
+  it("previews dropped JSON files without opening the picker", async () => {
+    const preview: JsonProfileImportPreview = {
+      preview_id: "drop-preview",
+      expires_at_ms: 1_900_000_000_000,
+      items: [
+        {
+          id: "drop-valid",
+          file_name: "dropped.json",
+          alias: "Dropped account",
+          auth_mode: "oauth",
+          source: "拖入文件",
+          status: "valid",
+          message: "已验证，可导入。",
+          email: "drop@example.com",
+          account_id: null,
+          existing_profile_alias: null,
+        },
+      ],
+    };
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    webview.onDragDropEvent.mockImplementation((handler) => {
+      webview.dragHandler = handler as typeof webview.dragHandler;
+      return Promise.resolve(webview.unlisten);
+    });
+    const previewImport = vi
+      .spyOn(api, "previewJsonProfileImport")
+      .mockResolvedValue(preview);
+
+    renderProfiles();
+    await waitFor(() => expect(webview.onDragDropEvent).toHaveBeenCalledOnce());
+    await act(async () => {
+      webview.dragHandler?.({
+        payload: { type: "drop", paths: ["/tmp/dropped.json", "/tmp/readme.txt"] },
+      });
+    });
+
+    await waitFor(() =>
+      expect(previewImport).toHaveBeenCalledWith(["/tmp/dropped.json"]),
+    );
+    expect(vi.mocked(open)).not.toHaveBeenCalled();
+    expect(
+      await screen.findByRole("heading", { name: "选择要导入的账号" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /Dropped account/ })).toBeChecked();
   });
 
   it("previews selected JSON files, defaults to verified accounts, and commits only checked items", async () => {
@@ -238,8 +301,28 @@ describe("Profiles OAuth import", () => {
       updated: 0,
       skipped: 1,
       failed: 0,
-      items: [],
+      items: [
+        {
+          id: "valid",
+          alias: "Verified OAuth",
+          action: "created",
+          message: "档案已创建。",
+          profile_id: "profile-valid",
+          auth_mode: "oauth",
+        },
+      ],
     });
+    const syncImported = vi
+      .spyOn(api, "syncProfileAccountInfo")
+      .mockResolvedValue(
+        profileFixture({ id: "profile-valid", alias: "Verified OAuth" }),
+      );
+    const refreshImportedModels = vi
+      .spyOn(api, "refreshProfileModels")
+      .mockResolvedValue({
+        ...profileFixture({ id: "profile-valid", alias: "Verified OAuth" }),
+        models: ["gpt-5"],
+      });
     const onJsonImportComplete = vi.fn().mockResolvedValue(undefined);
     render(
       <Profiles
@@ -275,6 +358,8 @@ describe("Profiles OAuth import", () => {
     await waitFor(() =>
       expect(commitImport).toHaveBeenCalledWith("json-preview", ["valid"]),
     );
+    expect(syncImported).toHaveBeenCalledWith("profile-valid");
+    expect(refreshImportedModels).toHaveBeenCalledWith("profile-valid");
     expect(onJsonImportComplete).toHaveBeenCalledOnce();
     expect(
       screen.getByText("导入完成：创建 1，更新 0，跳过 1，失败 0。"),
@@ -333,6 +418,123 @@ describe("Profiles OAuth import", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[1]);
 
     expect(screen.getByRole("heading", { name: "选择导入方式" })).toBeInTheDocument();
+  });
+
+  it("tests and saves a third-party provider with editable identity mappings", async () => {
+    const onCreateApiProfile = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(api, "testApiServiceProfile").mockResolvedValue({
+      status: "verified",
+      message: "已发现 1 个模型。",
+      endpoint: "https://api.example.test/v1/models",
+      latency_ms: 24,
+      http_status: 200,
+      category: "ok",
+      model_count: 1,
+      models: ["third-party-coder"],
+    });
+    render(
+      <Profiles
+        profiles={[]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onCreateApiProfile={onCreateApiProfile}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "添加提供商" }));
+    const sheet = screen
+      .getByRole("heading", { name: "添加第三方模型提供商" })
+      .closest("section") as HTMLElement;
+    const form = within(sheet);
+    fireEvent.change(form.getByLabelText("档案名称"), {
+      target: { value: "Third Party" },
+    });
+    fireEvent.change(form.getByLabelText("Base URL"), {
+      target: { value: "https://api.example.test/v1" },
+    });
+    fireEvent.change(form.getByLabelText("API Key"), {
+      target: { value: "sk-test" },
+    });
+    fireEvent.click(form.getByRole("button", { name: "测试连接并发现模型" }));
+
+    expect(await screen.findByText("连接已验证")).toBeInTheDocument();
+    expect(form.getByLabelText("Model ID")).toHaveValue("third-party-coder");
+    fireEvent.change(form.getByLabelText("Model ID"), {
+      target: { value: "codex-visible-coder" },
+    });
+    fireEvent.click(form.getByRole("button", { name: "测试并保存" }));
+
+    await waitFor(() =>
+      expect(onCreateApiProfile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          alias: "Third Party",
+          provider: "openai_compatible",
+          wire_api: "responses",
+          base_url: "https://api.example.test/v1",
+          api_key: "sk-test",
+          model_mappings: [
+            {
+              model: "codex-visible-coder",
+              upstream_model: "third-party-coder",
+              display_name: "third-party-coder",
+              context_window: null,
+            },
+          ],
+        }),
+      ),
+    );
+  });
+
+  it("shows the structured provider test failure report instead of a generic internal error", async () => {
+    vi.spyOn(api, "testApiServiceProfile").mockResolvedValue({
+      status: "failed",
+      message: "上游返回的模型目录不是有效 JSON。",
+      endpoint: "https://api.example.test/v1/models",
+      latency_ms: 18,
+      http_status: 200,
+      category: "json",
+      model_count: 0,
+      models: [],
+    });
+    render(
+      <Profiles
+        profiles={[]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onCreateApiProfile={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "添加提供商" }));
+    const sheet = screen
+      .getByRole("heading", { name: "添加第三方模型提供商" })
+      .closest("section") as HTMLElement;
+    const form = within(sheet);
+    fireEvent.change(form.getByLabelText("Base URL"), {
+      target: { value: "https://api.example.test/v1" },
+    });
+    fireEvent.change(form.getByLabelText("API Key"), {
+      target: { value: "sk-test" },
+    });
+    fireEvent.click(form.getByRole("button", { name: "测试连接并发现模型" }));
+
+    expect(await screen.findByText("连接未验证")).toBeInTheDocument();
+    expect(screen.getByText("上游返回的模型目录不是有效 JSON。")).toBeInTheDocument();
+    expect(screen.queryByText(/internal/)).not.toBeInTheDocument();
   });
 
   it("marks API Key profiles as unavailable for the managed Codex current profile", () => {
@@ -1089,5 +1291,23 @@ describe("Profiles OAuth import", () => {
 
     expect(profileAliases()).toEqual(["Pro account"]);
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  });
+  it("renders K-12 and suppresses stale unknown subscription labels", () => {
+    renderProfiles([
+      profileFixture({
+        id: "k12",
+        alias: "K12 account",
+        account: accountSummary({ email: "k12@example.com", planType: "k12" }),
+      }),
+      profileFixture({
+        id: "unknown",
+        alias: "Unknown account",
+        account: accountSummary({ email: "unknown@example.com", planType: "unknown" }),
+      }),
+    ]);
+
+    expect(screen.getByText("ChatGPT K-12 / Edu")).toBeInTheDocument();
+    expect(screen.getByText("套餐尚未同步")).toBeInTheDocument();
+    expect(screen.queryByText(/未知套餐/)).not.toBeInTheDocument();
   });
 });

@@ -118,6 +118,13 @@ describe("App", () => {
       if (command === "list_collaboration_bots") return Promise.resolve([]);
       if (command === "list_collaboration_project_bindings") return Promise.resolve([]);
       if (command === "list_codex_sessions") return Promise.resolve([]);
+      if (command === "list_gateway_model_options") return Promise.resolve([]);
+      if (command === "collaboration_callback_status")
+        return Promise.resolve({
+          local_url: "http://127.0.0.1:35817",
+          public_urls: [],
+          running: false,
+        });
       return Promise.reject(new Error(`unexpected command: ${command}`));
     });
 
@@ -133,6 +140,179 @@ describe("App", () => {
     expect(screen.getByRole("tab", { name: /QQ/ })).toBeInTheDocument();
     expect(screen.queryByText("即将支持")).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /企业微信/ })).toBeInTheDocument();
+  });
+
+  it("checks the selected update channel on startup and prompts before installing", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    native.invoke.mockImplementation(
+      (command: string, args?: Record<string, unknown>) => {
+        if (command === "dashboard_snapshot") return Promise.resolve(snapshot);
+        if (command === "managed_task_status")
+          return Promise.resolve(idleTaskStatusForTest());
+        if (command === "app_update_settings")
+          return Promise.resolve({ channel: "beta", auto_check: true });
+        if (command === "check_app_update") {
+          expect(args).toEqual({ input: { channel: "beta" } });
+          return Promise.resolve({
+            version: "0.2.0-beta.1",
+            current_version: "0.1.0",
+            body: "Beta 更新说明",
+            date: null,
+            channel: "beta",
+          });
+        }
+        if (command === "install_app_update") {
+          expect(args).toEqual({ input: { channel: "beta" } });
+          return Promise.resolve();
+        }
+        return Promise.reject(new Error(`unexpected command: ${command}`));
+      },
+    );
+
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("安装 Codex Relay 0.2.0-beta.1");
+    fireEvent.click(screen.getByRole("button", { name: "安装并重启" }));
+
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("install_app_update", {
+        input: { channel: "beta" },
+      }),
+    );
+  });
+
+  it("refreshes app and collaboration state after collaboration operations", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const bot = {
+      id: "bot-1",
+      provider: "feishu" as const,
+      name: "Relay Bot",
+      enabled: true,
+      connection_status: "connected",
+      credential_mask: "cli_••••test",
+      config_summary: "App ID cli_••••test",
+      callback_public_url: null,
+      last_error: null,
+      system_prompt: null,
+      updated_at_ms: 1,
+    };
+    const binding = {
+      id: "binding-1",
+      provider: "feishu" as const,
+      bot_id: "bot-1",
+      bot_name: "Relay Bot",
+      project_name: "Relay",
+      project_slug: "relay",
+      working_directory: "/tmp",
+      profile_id: "current",
+      profile_alias: "当前账号",
+      chat_id: "chat-1",
+      bind_code: "ABCD12",
+      enabled: true,
+      concurrency_limit: 2,
+      execution_target: "profile" as const,
+      model_id: null,
+      created_at_ms: 1,
+      updated_at_ms: 1,
+    };
+    const session = {
+      id: "12345678-session",
+      binding_id: "binding-1",
+      provider: "feishu" as const,
+      provider_bot_id: "bot-1",
+      provider_chat_id: "chat-1",
+      provider_message_id: null,
+      project_name: "Relay",
+      project_slug: "relay",
+      profile_id: "current",
+      profile_alias: "当前账号",
+      relay_status: "running",
+      codex_session_id: "codex-session-1",
+      feishu_message_id: null,
+      feishu_chat_id: "chat-1",
+      execution_target: "profile" as const,
+      model_id: null,
+      started_by: "sender-1",
+      started_at_ms: 1,
+      updated_at_ms: 1,
+      finished_at_ms: null,
+      summary: "任务运行中。",
+      last_error: null,
+    };
+    native.invoke.mockImplementation((command: string) => {
+      if (command === "dashboard_snapshot") return Promise.resolve(snapshot);
+      if (command === "managed_task_status")
+        return Promise.resolve(idleTaskStatusForTest());
+      if (command === "list_collaboration_bots") return Promise.resolve([bot]);
+      if (command === "list_collaboration_project_bindings")
+        return Promise.resolve([binding]);
+      if (command === "list_codex_sessions") return Promise.resolve([session]);
+      if (command === "list_gateway_model_options") return Promise.resolve(["gpt-5"]);
+      if (command === "collaboration_callback_status")
+        return Promise.resolve({
+          local_url: "http://127.0.0.1:35817",
+          public_urls: [],
+          running: false,
+        });
+      if (command === "test_collaboration_bot") return Promise.resolve(bot);
+      if (command === "continue_codex_session") return Promise.resolve(session);
+      if (command === "cancel_codex_session")
+        return Promise.resolve({ ...session, relay_status: "cancelled" });
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "协作" }));
+    await screen.findByRole("heading", { name: "Relay Bot" });
+    await waitFor(() => expect(commandCalls("list_codex_sessions")).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: /测试/ }));
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("test_collaboration_bot", {
+        id: "bot-1",
+      }),
+    );
+    await waitFor(() => {
+      expect(commandCalls("dashboard_snapshot").length).toBeGreaterThanOrEqual(2);
+      expect(commandCalls("list_codex_sessions").length).toBeGreaterThanOrEqual(2);
+      expect(commandCalls("list_gateway_model_options").length).toBeGreaterThanOrEqual(
+        2,
+      );
+    });
+
+    fireEvent.change(screen.getByPlaceholderText("追加说明后继续会话"), {
+      target: { value: "继续处理" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("continue_codex_session", {
+        input: {
+          session_id: "12345678-session",
+          instruction: "继续处理",
+          confirmed: true,
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(commandCalls("list_codex_sessions").length).toBeGreaterThanOrEqual(3),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /取消/ }));
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("cancel_codex_session", {
+        input: { session_id: "12345678-session", confirmed: true },
+      }),
+    );
+    await waitFor(() =>
+      expect(commandCalls("list_codex_sessions").length).toBeGreaterThanOrEqual(4),
+    );
   });
 
   it("loads only first-screen data before a page is opened", async () => {
@@ -218,6 +398,8 @@ describe("App", () => {
     });
     const { container } = render(<App />);
     await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+
+    expect(container.querySelectorAll(".nav-icon").length).toBeGreaterThan(0);
 
     const toggle = screen.getByRole("button", { name: "展开侧边栏" });
     fireEvent.click(toggle);
@@ -617,6 +799,10 @@ describe("App", () => {
     expect(screen.queryByText("keychain interaction required")).not.toBeInTheDocument();
   });
 });
+
+function commandCalls(command: string) {
+  return native.invoke.mock.calls.filter(([name]) => name === command);
+}
 
 function idleTaskStatusForTest() {
   return {

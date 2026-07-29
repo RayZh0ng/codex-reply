@@ -30,11 +30,13 @@ pub fn run() {
 
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| initialise(app))
         .invoke_handler(tauri::generate_handler![
             commands::dashboard_snapshot,
             commands::list_profiles,
             commands::create_profile,
+            commands::create_api_service_profile,
             commands::update_profile,
             commands::sync_profile_account_info,
             commands::refresh_profile_quotas,
@@ -42,6 +44,10 @@ pub fn run() {
             commands::select_current_profile,
             commands::desktop_workspace_settings,
             commands::update_desktop_workspace_settings,
+            commands::app_update_settings,
+            commands::update_app_update_settings,
+            commands::check_app_update,
+            commands::install_app_update,
             commands::list_desktop_workspaces,
             commands::restore_desktop_workspace,
             commands::delete_desktop_workspace,
@@ -60,6 +66,8 @@ pub fn run() {
             commands::codex_gateway_config_status,
             commands::enable_codex_gateway,
             commands::disable_codex_gateway,
+            commands::set_codex_gateway_oauth_profile,
+            commands::list_gateway_model_options,
             commands::activate_api_service_profile,
             commands::list_client_keys,
             commands::create_client_key,
@@ -136,6 +144,7 @@ fn initialise(app: &tauri::App) -> Result<(), Box<dyn Error>> {
         repository.clone(),
         secrets.clone(),
         oauth_credentials.clone(),
+        gateway.clone(),
         data_dir.clone(),
     ));
     app.manage(AppState {
@@ -225,6 +234,7 @@ mod tests {
     use crate::{
         collaboration::CollaborationManager,
         database::Repository,
+        gateway::GatewayManager,
         oauth_credentials::OAuthCredentialStore,
         secrets::{LocalEncryptedSecretStore, MemorySecretStore, SecretStore},
     };
@@ -257,10 +267,17 @@ mod tests {
         let repository = Arc::new(Repository::memory());
         let secrets = Arc::new(MemorySecretStore::new());
         let oauth_credentials = Arc::new(OAuthCredentialStore::new(secrets.clone()));
+        let gateway = Arc::new(GatewayManager::new(
+            repository.clone(),
+            secrets.clone(),
+            oauth_credentials.clone(),
+            PathBuf::from("/tmp/codex-relay-post-startup-certs"),
+        ));
         let collaboration = Arc::new(CollaborationManager::new(
             repository.clone(),
             secrets.clone(),
             oauth_credentials,
+            gateway,
             PathBuf::from("/tmp/codex-relay-post-startup-test"),
         ));
 

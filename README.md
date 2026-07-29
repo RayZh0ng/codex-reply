@@ -28,6 +28,18 @@ pnpm tauri:dev
 | `pnpm check`         | 执行格式、Lint、类型、前端测试与 Rust 质量检查 |
 | `pnpm format`        | 格式化可编辑文件                               |
 
+## 软件更新与发布
+
+- 应用内更新使用 Tauri updater 与 GitHub Release 静态 manifest。设置页可选择 `stable` 或 `beta` 通道；默认启动时自动检查，发现更新后由用户确认安装并重启。
+- 固定 manifest 位于 `updater` Release：`stable.json` 指向最新正式版，`beta.json` 指向最新预发布版。
+- 发布 tag 规则：`v1.2.3` 发布 stable，`v1.2.3-beta.1` 发布 beta。GitHub Actions 会构建各平台安装包并覆盖对应 manifest。
+- GitHub Secrets 需配置 `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`、`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`。本机验证构建可使用：
+
+```bash
+pnpm tauri signer generate --ci -p "" -w ~/.tauri/codex-relay-updater.key
+TAURI_SIGNING_PRIVATE_KEY_PATH=~/.tauri/codex-relay-updater.key pnpm tauri:build
+```
+
 ## 目录
 
 ```text
@@ -81,7 +93,7 @@ Codex Relay 的“协作”页用于把手机通讯软件连接到本机 Codex�
 - 所有已配置 Codex 档案的“刷新资料”都会优先通过本机 `codex app-server` 读取账户资料、ChatGPT/Codex 套餐与额度窗口（剩余百分比、窗口时长和重置时间）。档案页首次进入、回到前台、任务结束及页面可见期间每 30 秒都会后台更新；结果作为非敏感摘要缓存到本机数据库，单个账号失败会保留最近成功数据并标记过期。OAuth 凭据仍只保存在本地加密凭据库，不会通过 IPC 返回。
 - 后台同步直接读取本地加密凭据库，并优先复用 OAuth 的进程内缓存；不会触发 macOS 登录钥匙串授权弹窗。刷新后的 OAuth 凭据会写回本地加密凭据库。
 - 当官方响应未包含额度或订阅周期结束时间时，Relay 会仅向 OpenAI 的 `chatgpt.com` 兼容接口发送该档案的 OAuth access token，以读取额度或 entitlement 摘要；不会读取浏览器 Cookie 或聊天内容。该后备接口不是稳定公开 API，字段缺失或失败时会显示“上游未提供”而不会推算数据。
-- OAuth 档案默认不加入网关账号池。用户刷新可用模型并显式加入后，Relay 可通过 Codex Responses 上游代发 `/v1/responses`，并为 `/v1/chat/completions` 转换文本与 function tools；凭据仍只在本地加密凭据库和短生命周期内存中出现。路由先按优先级与额度可用性分层，再执行平滑加权轮换；401 会刷新一次凭据，429、5xx 和网络错误会触发冷却与首字节前故障切换。该适配依赖当前 Codex 产品协议，与 OpenAI Platform API Key 认证相互独立。
+- OAuth 档案默认不加入网关账号池。用户刷新可用模型并显式加入后，Relay 可通过 Codex Responses 上游代发 `/v1/responses`，并为 `/v1/chat/completions` 转换文本与 function tools；凭据仍只在本地加密凭据库和短生命周期内存中出现。Codex 网关切换中的“OAuth 登录档案”只允许绑定通过 OAuth 授权流程创建或更新的档案；JSON 导入账号即使是 OAuth token，也仅用于反代账号池，不用于登录态解锁。路由先按优先级与额度可用性分层，再执行平滑加权轮换；401 会刷新一次凭据，429、5xx 和网络错误会触发冷却与首字节前故障切换。该适配依赖当前 Codex 产品协议，与 OpenAI Platform API Key 认证相互独立。
 
 ## 质量与协作
 

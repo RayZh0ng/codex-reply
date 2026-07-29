@@ -523,6 +523,7 @@ pub struct ImportAuthVerification {
     pub email: Option<String>,
     pub account_id: Option<String>,
     pub plan_type: Option<String>,
+    pub source: ImportAuthVerificationSource,
 }
 
 impl std::fmt::Debug for ImportAuthVerification {
@@ -533,8 +534,16 @@ impl std::fmt::Debug for ImportAuthVerification {
             .field("email", &self.email)
             .field("account_id", &self.account_id)
             .field("plan_type", &self.plan_type)
+            .field("source", &self.source)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportAuthVerificationSource {
+    AppServer,
+    DirectApi,
+    PersonalAccessToken,
 }
 
 fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSnapshot> {
@@ -852,7 +861,7 @@ fn rate_limit_bucket(fallback_id: Option<String>, limits: RateLimits) -> Profile
     ProfileQuotaBucket {
         id: limits.limit_id.or(fallback_id),
         name: limits.limit_name,
-        plan_type: limits.plan_type,
+        plan_type: normalize_plan_type(limits.plan_type),
         primary: limits.primary.map(rate_limit_window),
         secondary: limits.secondary.map(rate_limit_window),
     }
@@ -874,10 +883,12 @@ fn parse_app_server_account(
             .and_then(|account| account.get("accountId").or_else(|| account.get("id")))
             .and_then(|value| value.as_str())
             .map(ToOwned::to_owned),
-        account
-            .and_then(|account| account.get("planType"))
-            .and_then(|value| value.as_str())
-            .map(ToOwned::to_owned),
+        normalize_plan_type(
+            account
+                .and_then(|account| account.get("planType"))
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
+        ),
     )
 }
 
@@ -909,7 +920,7 @@ struct UsageRateWindow {
     reset_at: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatgptApiError {
     Unauthorized,
     Unavailable,
@@ -990,6 +1001,13 @@ struct AccountCheckSnapshot {
     subscription: ProfileSubscription,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectImportVerification {
+    email: Option<String>,
+    account_id: Option<String>,
+    plan_type: Option<String>,
+}
+
 async fn read_subscription_from_account_api(
     credential: &CodexOAuthCredential,
 ) -> Result<AccountCheckSnapshot, ChatgptApiError> {
@@ -1038,6 +1056,111 @@ fn account_check_snapshot(response: AccountCheckResponse) -> AccountCheckSnapsho
             last_error: None,
         },
     }
+}
+
+async fn verify_import_auth_direct(
+    credential: &CodexOAuthCredential,
+) -> Result<DirectImportVerification, ChatgptApiError> {
+    let usage_result = read_rate_limits_from_usage_api(credential).await;
+    let account_result = read_subscription_from_account_api(credential).await;
+    direct_import_verification_from_results(credential, usage_result, account_result)
+}
+
+fn direct_import_verification_from_results(
+    credential: &CodexOAuthCredential,
+    usage_result: Result<ProfileQuota, ChatgptApiError>,
+    account_result: Result<AccountCheckSnapshot, ChatgptApiError>,
+) -> Result<DirectImportVerification, ChatgptApiError> {
+    let usage_verified = usage_result.is_ok();
+    let usage_unauthorized = matches!(usage_result.as_ref(), Err(ChatgptApiError::Unauthorized));
+    let account_snapshot = account_result.as_ref().ok();
+    let account_verified = account_snapshot.is_some();
+    let account_unauthorized =
+        matches!(account_result.as_ref(), Err(ChatgptApiError::Unauthorized));
+
+    if usage_verified || account_verified {
+        return Ok(DirectImportVerification {
+            email: oauth_credential_email(credential),
+            account_id: account_snapshot
+                .and_then(|snapshot| snapshot.account_id.clone())
+                .or_else(|| oauth_credential_account_id(credential)),
+            plan_type: account_snapshot.and_then(|snapshot| {
+                snapshot
+                    .subscription
+                    .plan_type
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+            }),
+        });
+    }
+
+    if usage_unauthorized || account_unauthorized {
+        Err(ChatgptApiError::Unauthorized)
+    } else {
+        Err(ChatgptApiError::Unavailable)
+    }
+}
+
+fn oauth_credential_email(credential: &CodexOAuthCredential) -> Option<String> {
+    [
+        credential.id_token.as_str(),
+        credential.access_token.as_str(),
+    ]
+    .into_iter()
+    .find_map(|token| {
+        jwt_claim_string(token, &["email"])
+            .or_else(|| jwt_claim_string(token, &["https://api.openai.com/profile", "email"]))
+    })
+}
+
+fn oauth_credential_account_id(credential: &CodexOAuthCredential) -> Option<String> {
+    credential
+        .account_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            [
+                credential.id_token.as_str(),
+                credential.access_token.as_str(),
+            ]
+            .into_iter()
+            .find_map(|token| {
+                jwt_claim_string(
+                    token,
+                    &["https://api.openai.com/auth", "chatgpt_account_id"],
+                )
+                .or_else(|| jwt_claim_string(token, &["chatgpt_account_id"]))
+                .or_else(|| jwt_claim_string(token, &["chatgptAccountId"]))
+            })
+        })
+}
+
+fn jwt_claim_string(token: &str, path: &[&str]) -> Option<String> {
+    let mut value = jwt_claims_value(token)?;
+    for key in path {
+        value = value.get(*key)?.clone();
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn jwt_claims_value(token: &str) -> Option<serde_json::Value> {
+    token
+        .split('.')
+        .nth(1)
+        .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+        .and_then(|payload| serde_json::from_slice(&payload).ok())
+}
+
+fn jwt_is_expired(token: &str) -> bool {
+    jwt_claims_value(token)
+        .and_then(|value| value.get("exp").and_then(serde_json::Value::as_i64))
+        .is_some_and(|expiry| expiry * 1000 <= now_ms())
 }
 
 async fn chatgpt_get_json<T: serde::de::DeserializeOwned>(
@@ -1097,6 +1220,7 @@ fn parse_period_end_ms(value: &serde_json::Value) -> Option<i64> {
 }
 
 fn subscription_from_app_server(plan_type: Option<String>) -> ProfileSubscription {
+    let plan_type = normalize_plan_type(plan_type);
     let available = plan_type.is_some();
     ProfileSubscription {
         status: if available {
@@ -1159,15 +1283,17 @@ fn normalize_plan_type(plan_type: Option<String>) -> Option<String> {
             return None;
         }
         let normalized = match normalized.as_str() {
-            "chatgptfreeplan" => "free",
-            "chatgptgoplan" => "go",
-            "chatgptplusplan" => "plus",
-            "chatgptproplan" => "pro",
-            "chatgptproliteplan" => "prolite",
-            "chatgptteamplan" => "team",
-            "chatgptbusinessplan" => "business",
-            "chatgptenterpriseplan" => "enterprise",
-            "chatgpteduplan" => "edu",
+            "unknown" | "none" | "null" => return None,
+            "chatgptfreeplan" | "freeplan" | "chatgpt_free" => "free",
+            "chatgptgoplan" | "goplan" | "chatgpt_go" => "go",
+            "chatgptplusplan" | "plusplan" | "chatgpt_plus" => "plus",
+            "chatgptproplan" | "proplan" | "chatgpt_pro" => "pro",
+            "chatgptproliteplan" | "proliteplan" | "chatgpt_pro_lite" => "prolite",
+            "chatgptteamplan" | "teamplan" | "chatgpt_team" => "team",
+            "chatgptbusinessplan" | "businessplan" | "chatgpt_business" => "business",
+            "chatgptenterpriseplan" | "enterpriseplan" | "chatgpt_enterprise" => "enterprise",
+            "chatgpteduplan" | "eduplan" | "chatgpt_edu" => "edu",
+            "chatgptk12plan" | "k12plan" | "chatgpt_k12" | "k-12" => "k12",
             value => value,
         };
         Some(normalized.to_owned())
@@ -1380,22 +1506,54 @@ impl CodexRuntime {
                 email: identity.email,
                 account_id: identity.account_id,
                 plan_type: identity.plan_type,
+                source: ImportAuthVerificationSource::PersonalAccessToken,
             });
         }
-        let auth_json = hydrate_refresh_only_auth_json(auth_json).await?;
+        let prepared = prepare_import_auth_json(auth_json).await?;
+        let auth_json = prepared.auth_json;
         let home = self.root.join("import-previews").join(item_id);
         self.write_auth_json_to_home(&home, &auth_json)?;
-        let result =
-            self.read_app_server_account(&home)
-                .await
-                .map(|snapshot| ImportAuthVerification {
-                    auth_json,
-                    email: snapshot.email,
-                    account_id: snapshot.account_id,
-                    plan_type: snapshot.plan_type,
-                });
+        let app_result = self.read_app_server_account(&home).await;
         let _ = fs::remove_dir_all(&home);
-        result
+        match app_result {
+            Ok(snapshot) => Ok(ImportAuthVerification {
+                auth_json,
+                email: snapshot.email,
+                account_id: snapshot.account_id,
+                plan_type: snapshot.plan_type,
+                source: ImportAuthVerificationSource::AppServer,
+            }),
+            Err(AppError::ProfileRuntimeUnavailable) => {
+                let Some(credential) = prepared.credential.as_ref().filter(|credential| {
+                    !credential.access_token.trim().is_empty()
+                        && !credential_needs_refresh(credential)
+                }) else {
+                    return Err(AppError::ProfileRuntimeUnavailable);
+                };
+                match verify_import_auth_direct(credential).await {
+                    Ok(identity) => {
+                        let auth_json = match identity.account_id.as_deref() {
+                            Some(account_id) => {
+                                let mut credential = credential.clone();
+                                credential.account_id = Some(account_id.to_owned());
+                                credential.auth_json()?
+                            }
+                            None => auth_json,
+                        };
+                        Ok(ImportAuthVerification {
+                            auth_json,
+                            email: identity.email,
+                            account_id: identity.account_id,
+                            plan_type: identity.plan_type,
+                            source: ImportAuthVerificationSource::DirectApi,
+                        })
+                    }
+                    Err(ChatgptApiError::Unauthorized) => Err(AppError::ProfileRuntimeUnavailable),
+                    Err(ChatgptApiError::Unavailable) => Err(AppError::RuntimeUnavailable),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn read_profile_models(
@@ -2208,11 +2366,32 @@ async fn exchange_code(code: &str, verifier: &str) -> AppResult<CodexOAuthCreden
         last_refresh_ms: now_ms(),
     })
 }
-async fn hydrate_refresh_only_auth_json(auth_json: &str) -> AppResult<String> {
-    let Some(credential) = refresh_only_credential_from_auth_json(auth_json)? else {
-        return Ok(auth_json.to_owned());
+struct PreparedImportAuthJson {
+    auth_json: String,
+    credential: Option<CodexOAuthCredential>,
+}
+
+async fn prepare_import_auth_json(auth_json: &str) -> AppResult<PreparedImportAuthJson> {
+    let Some(credential) = import_oauth_credential_from_auth_json(auth_json)? else {
+        return Ok(PreparedImportAuthJson {
+            auth_json: auth_json.to_owned(),
+            credential: None,
+        });
     };
-    refresh_credential(&credential).await?.auth_json()
+    if import_oauth_should_refresh(&credential) {
+        let refreshed = normalize_refreshed_import_credential(
+            &credential,
+            refresh_credential(&credential).await?,
+        );
+        return Ok(PreparedImportAuthJson {
+            auth_json: refreshed.auth_json()?,
+            credential: Some(refreshed),
+        });
+    }
+    Ok(PreparedImportAuthJson {
+        auth_json: auth_json.to_owned(),
+        credential: Some(credential),
+    })
 }
 
 fn personal_access_token_from_auth_json(auth_json: &str) -> AppResult<Option<String>> {
@@ -2273,23 +2452,30 @@ fn personal_access_token_identity(
     }
 }
 
-fn refresh_only_credential_from_auth_json(
+fn import_oauth_credential_from_auth_json(
     auth_json: &str,
 ) -> AppResult<Option<CodexOAuthCredential>> {
     let value: serde_json::Value =
         serde_json::from_str(auth_json).map_err(|_| AppError::ValidationFailed)?;
     let tokens = value.get("tokens").and_then(serde_json::Value::as_object);
+    let id_token = tokens
+        .and_then(|tokens| tokens.get("id_token"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let access_token = tokens
         .and_then(|tokens| tokens.get("access_token"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let refresh_token = tokens
         .and_then(|tokens| tokens.get("refresh_token"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if access_token.is_some() || refresh_token.is_none() {
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if access_token.is_none() && refresh_token.is_none() {
         return Ok(None);
     }
     let account_id = tokens
@@ -2297,12 +2483,29 @@ fn refresh_only_credential_from_auth_json(
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     Ok(Some(CodexOAuthCredential {
-        id_token: String::new(),
-        access_token: String::new(),
-        refresh_token: refresh_token.map(ToOwned::to_owned),
+        id_token,
+        access_token: access_token.unwrap_or_default(),
+        refresh_token,
         account_id,
         last_refresh_ms: now_ms(),
     }))
+}
+
+fn import_oauth_should_refresh(credential: &CodexOAuthCredential) -> bool {
+    credential
+        .refresh_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn normalize_refreshed_import_credential(
+    original: &CodexOAuthCredential,
+    mut refreshed: CodexOAuthCredential,
+) -> CodexOAuthCredential {
+    if refreshed.id_token == original.id_token && jwt_is_expired(&refreshed.id_token) {
+        refreshed.id_token.clear();
+    }
+    refreshed
 }
 
 fn random_token() -> String {
@@ -2458,6 +2661,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
 
+    fn test_jwt(claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        format!("{header}.{payload}.signature")
+    }
+
+    fn direct_usage_quota() -> ProfileQuota {
+        parse_rate_limits_response(serde_json::json!({
+            "result": {
+                "rateLimits": {
+                    "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1_735_689_600},
+                    "secondary": null,
+                    "rateLimitReachedType": null
+                }
+            }
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn parses_rate_limit_windows_without_exposing_credentials() {
         let quota = parse_rate_limits_response(serde_json::json!({
@@ -2508,6 +2730,31 @@ mod tests {
             })),
             AppError::RuntimeUnavailable
         ));
+    }
+
+    #[test]
+    fn normalizes_unknown_free_and_k12_plan_types() {
+        assert_eq!(normalize_plan_type(Some("unknown".into())), None);
+        assert_eq!(
+            normalize_plan_type(Some("chatgptfreeplan".into())).as_deref(),
+            Some("free")
+        );
+        assert_eq!(
+            normalize_plan_type(Some("ChatGPTK12Plan".into())).as_deref(),
+            Some("k12")
+        );
+
+        let response: AccountCheckResponse = serde_json::from_value(serde_json::json!({
+            "accounts": {
+                "default": {
+                    "account": {"account_id": "account_free"},
+                    "entitlement": {"subscription_plan": "chatgptfreeplan"}
+                }
+            }
+        }))
+        .unwrap();
+        let snapshot = account_check_snapshot(response);
+        assert_eq!(snapshot.subscription.plan_type.as_deref(), Some("free"));
     }
 
     #[test]
@@ -2600,6 +2847,7 @@ mod tests {
             email,
             account_id,
             plan_type,
+            source: ImportAuthVerificationSource::PersonalAccessToken,
         };
         let debug = format!("{verification:?}");
         assert!(debug.contains("agent@example.com"));
@@ -2631,6 +2879,94 @@ mod tests {
         assert_eq!(subscription.subscription.will_renew, Some(true));
 
         assert!(parse_period_end_ms(&serde_json::json!("not-a-date")).is_none());
+    }
+
+    #[test]
+    fn direct_import_check_accepts_access_only_when_chatgpt_api_succeeds() {
+        let credential = CodexOAuthCredential {
+            id_token: test_jwt(serde_json::json!({"email": "direct@example.com"})),
+            access_token: test_jwt(serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "account-token"}
+            })),
+            refresh_token: None,
+            account_id: None,
+            last_refresh_ms: now_ms(),
+        };
+        let account = AccountCheckSnapshot {
+            account_id: Some("account-direct".to_owned()),
+            subscription: ProfileSubscription {
+                status: "available".to_owned(),
+                plan_type: Some("pro".to_owned()),
+                period_ends_at_ms: None,
+                will_renew: None,
+                source: Some("account_check".to_owned()),
+                synced_at_ms: Some(now_ms()),
+                last_attempt_at_ms: now_ms(),
+                last_error: None,
+            },
+        };
+
+        let result = direct_import_verification_from_results(
+            &credential,
+            Err(ChatgptApiError::Unavailable),
+            Ok(account),
+        )
+        .unwrap();
+
+        assert_eq!(result.email.as_deref(), Some("direct@example.com"));
+        assert_eq!(result.account_id.as_deref(), Some("account-direct"));
+        assert_eq!(result.plan_type.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn direct_import_check_uses_any_successful_chatgpt_endpoint() {
+        let credential = CodexOAuthCredential {
+            id_token: String::new(),
+            access_token: test_jwt(serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "account-token"}
+            })),
+            refresh_token: None,
+            account_id: None,
+            last_refresh_ms: now_ms(),
+        };
+
+        let result = direct_import_verification_from_results(
+            &credential,
+            Ok(direct_usage_quota()),
+            Err(ChatgptApiError::Unauthorized),
+        )
+        .unwrap();
+
+        assert_eq!(result.account_id.as_deref(), Some("account-token"));
+        assert!(result.plan_type.is_none());
+    }
+
+    #[test]
+    fn direct_import_check_rejects_only_on_direct_unauthorized() {
+        let credential = CodexOAuthCredential {
+            id_token: String::new(),
+            access_token: "access".to_owned(),
+            refresh_token: None,
+            account_id: None,
+            last_refresh_ms: now_ms(),
+        };
+
+        assert_eq!(
+            direct_import_verification_from_results(
+                &credential,
+                Err(ChatgptApiError::Unauthorized),
+                Err(ChatgptApiError::Unavailable),
+            ),
+            Err(ChatgptApiError::Unauthorized)
+        );
+        assert_eq!(
+            direct_import_verification_from_results(
+                &credential,
+                Err(ChatgptApiError::Unavailable),
+                Err(ChatgptApiError::Unavailable),
+            ),
+            Err(ChatgptApiError::Unavailable)
+        );
     }
 
     static OAUTH_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2755,24 +3091,65 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_refresh_only_auth_json_for_hydration() {
+    fn refreshes_import_oauth_json_when_refresh_token_is_present() {
+        let expired_id_token = test_jwt(serde_json::json!({
+            "email": "sub2api@example.com",
+            "exp": 1_000
+        }));
+        let access_token = test_jwt(serde_json::json!({
+            "exp": 4_000_000_000_i64,
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account-access"}
+        }));
+        let sub2api = serde_json::json!({
+            "tokens": {
+                "id_token": expired_id_token,
+                "access_token": access_token,
+                "refresh_token": "refresh",
+                "account_id": "account-import"
+            }
+        })
+        .to_string();
+        let credential = import_oauth_credential_from_auth_json(&sub2api)
+            .unwrap()
+            .unwrap();
+        assert!(import_oauth_should_refresh(&credential));
+        assert_eq!(credential.refresh_token.as_deref(), Some("refresh"));
+        assert_eq!(credential.account_id.as_deref(), Some("account-import"));
+        assert_eq!(
+            oauth_credential_email(&credential).as_deref(),
+            Some("sub2api@example.com")
+        );
+        let normalized = normalize_refreshed_import_credential(
+            &credential,
+            CodexOAuthCredential {
+                id_token: credential.id_token.clone(),
+                access_token: "refreshed-access".to_owned(),
+                refresh_token: Some("refresh".to_owned()),
+                account_id: credential.account_id.clone(),
+                last_refresh_ms: now_ms(),
+            },
+        );
+        assert!(normalized.id_token.is_empty());
+
+        let access_only = serde_json::json!({
+            "tokens": {"access_token": "access"}
+        })
+        .to_string();
+        let credential = import_oauth_credential_from_auth_json(&access_only)
+            .unwrap()
+            .unwrap();
+        assert!(!import_oauth_should_refresh(&credential));
+
         let refresh_only = serde_json::json!({
             "tokens": {"refresh_token": "refresh", "account_id": "account"}
         })
         .to_string();
-        let credential = refresh_only_credential_from_auth_json(&refresh_only)
+        let credential = import_oauth_credential_from_auth_json(&refresh_only)
             .unwrap()
             .unwrap();
+        assert!(import_oauth_should_refresh(&credential));
         assert_eq!(credential.refresh_token.as_deref(), Some("refresh"));
         assert_eq!(credential.account_id.as_deref(), Some("account"));
-
-        let complete = serde_json::json!({
-            "tokens": {"access_token": "access", "refresh_token": "refresh"}
-        })
-        .to_string();
-        assert!(refresh_only_credential_from_auth_json(&complete)
-            .unwrap()
-            .is_none());
 
         let pat = serde_json::json!({"personal_access_token": "at-redacted"}).to_string();
         assert_eq!(

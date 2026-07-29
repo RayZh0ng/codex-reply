@@ -28,6 +28,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "macOS": {
       "signingIdentity": "Apple Development: Maynor Zhong (8A42TPPVGX)"
     },
@@ -38,5 +39,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFCMEVEM0VDQTE3MzkyNwpSV1FuT1JmS1B1MndDaERpTE5uQ091eVlKYkgxcjZRTkIrbXVoZDBwaHBJRmFwaU5CdEVuaFdhbQo=",
+      "endpoints": [
+        "https://github.com/RayZh0ng/codex-reply/releases/download/updater/stable.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
