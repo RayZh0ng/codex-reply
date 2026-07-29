@@ -2,7 +2,7 @@
 
 Codex Relay 是一个本机优先的 Tauri 2 桌面应用，用来管理 Codex 档案、聚合多账号 API 网关，并把群聊/频道中的协作请求转发到本机 Codex CLI。
 
-当前版本：`v0.2.0-beta.2`。本仓库采用 MIT License 开源。
+当前版本：`v0.2.0-beta.3`。本仓库采用 MIT License 开源。
 
 ## 功能概览
 
@@ -68,7 +68,7 @@ Discord 使用已注册的 `/codex command` slash command，例如 `command: "me
 
 ## 长期记忆与上下文模型
 
-`v0.2.0-beta.2` 引入两个本地表：
+`v0.2.0-beta.3` 引入两个本地表：
 
 - `collaboration_contexts`：记录项目全局 scope、稳定 `CODEX_HOME`、active Codex session、memory、goal、model 与 permissions 快照。
 - `collaboration_chat_state`：记录每个群/频道/私聊当前使用的项目上下文。
@@ -149,9 +149,9 @@ git commit -m "feat: add collaboration memory contexts"
 本仓库的 release workflow 监听 `v*` tag：
 
 ```bash
-git tag v0.2.0-beta.2
+git tag v0.2.0-beta.3
 git push origin codex/collaboration-memory-beta
-git push origin v0.2.0-beta.2
+git push origin v0.2.0-beta.3
 ```
 
 `vX.Y.Z-beta.N` 会生成 GitHub prerelease，并覆盖 updater Release 中的 `beta.json` manifest；正式版 `vX.Y.Z` 覆盖 `stable.json`。
