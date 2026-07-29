@@ -28,6 +28,7 @@ import {
   type DesktopWorkspaceMode,
   type DesktopWorkspaceSettings,
   type CodexSessionSummary,
+  type CollaborationContextSummary,
   type CollaborationProjectBinding,
   type DashboardSnapshot,
   type ManagedTaskStatus,
@@ -106,6 +107,9 @@ function App() {
     CollaborationProjectBinding[]
   >([]);
   const [codexSessions, setCodexSessions] = useState<CodexSessionSummary[]>([]);
+  const [collaborationContexts, setCollaborationContexts] = useState<
+    CollaborationContextSummary[]
+  >([]);
   const [gatewayModelOptions, setGatewayModelOptions] = useState<string[]>([]);
   const [taskStatus, setTaskStatus] = useState<ManagedTaskStatus>(idleTaskStatus);
   const [error, setError] = useState<string | null>(null);
@@ -154,15 +158,17 @@ function App() {
   }, []);
   const refreshCollaboration = useCallback(async () => {
     try {
-      const [bots, bindings, sessions, models] = await Promise.all([
+      const [bots, bindings, sessions, contexts, models] = await Promise.all([
         api.listCollaborationBots(),
         api.listCollaborationProjectBindings(),
         api.listCodexSessions(),
+        api.listCollaborationContexts(),
         api.listGatewayModelOptions(),
       ]);
       setCollaborationBots(bots);
       setCollaborationBindings(bindings);
       setCodexSessions(sessions);
+      setCollaborationContexts(contexts);
       setGatewayModelOptions(models);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -557,6 +563,7 @@ function App() {
       collaborationBots={collaborationBots}
       collaborationBindings={collaborationBindings}
       codexSessions={codexSessions}
+      collaborationContexts={collaborationContexts}
       gatewayModelOptions={gatewayModelOptions}
       onChangeWorkspaceMode={async (mode) => {
         await execute(
@@ -777,6 +784,7 @@ function PageContent({
   collaborationBots,
   collaborationBindings,
   codexSessions,
+  collaborationContexts,
   gatewayModelOptions,
   onChangeWorkspaceMode,
   onChangeAppUpdateSettings,
@@ -819,6 +827,7 @@ function PageContent({
   collaborationBots: MaskedCollaborationBot[];
   collaborationBindings: CollaborationProjectBinding[];
   codexSessions: CodexSessionSummary[];
+  collaborationContexts: CollaborationContextSummary[];
   gatewayModelOptions: string[];
   onChangeWorkspaceMode: (mode: DesktopWorkspaceMode) => Promise<void>;
   onChangeAppUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
@@ -959,6 +968,7 @@ function PageContent({
         bots={collaborationBots}
         bindings={collaborationBindings}
         sessions={codexSessions}
+        contexts={collaborationContexts}
         profiles={snapshot.profiles}
         gatewayModelOptions={gatewayModelOptions}
         busy={busy}
@@ -1000,6 +1010,12 @@ function PageContent({
         }
         onContinueSession={async (id, instruction) =>
           execute(() => api.continueCodexSession(id, instruction), "Codex 会话已继续。")
+        }
+        onUpdateContext={async (input) =>
+          execute(() => api.updateCollaborationContext(input), "协作上下文已保存。")
+        }
+        onResetContext={async (id) =>
+          execute(() => api.resetCollaborationContext(id), "协作上下文已重置。")
         }
       />
     );

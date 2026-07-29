@@ -26,21 +26,22 @@ use crate::{
     database::Repository,
     domain::{
         AppUpdateChannel, AppUpdateInfo, AppUpdateSettings, CancelCodexSessionInput,
-        CancelManagedTaskInput, CheckAppUpdateInput, CodexAuthMode, CodexSessionSummary,
-        CollaborationCallbackStatus, CollaborationProjectBinding, CollaborationProvider,
-        CommitJsonProfileImportInput, CompleteOAuthImportInput, ContinueCodexSessionInput,
-        CreateApiServiceProfileInput, CreateClientKeyInput, CreateProfileInput, CreatedClientKey,
-        CurrentProfileActivation, CurrentProfileActivationStatusInput, DashboardSnapshot,
-        DeleteCollaborationBotInput, DeleteCollaborationProjectBindingInput,
-        DeleteDesktopWorkspaceInput, DeleteFeishuBotInput, DeleteFeishuProjectBindingInput,
-        DesktopWorkspaceHistoryItem, DesktopWorkspaceMode, DesktopWorkspaceSettings,
-        DiscardJsonProfileImportInput, FeishuProjectBinding, GatewayCodexConfigStatus,
-        GatewayStatus, InstallAppUpdateInput, JsonProfileImportPreview, JsonProfileImportResult,
-        ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey, MaskedCollaborationBot,
-        MaskedFeishuBot, MaskedProfile, OAuthImportStatus, PreviewJsonProfileImportInput,
-        ProfileQuotaRefreshReport, RestoreDesktopWorkspaceInput, RetryJsonProfileImportInput,
-        SelectCurrentProfileInput, SetCodexGatewayOAuthProfileInput, StartManagedTaskInput,
-        StartOAuthImportInput, TestApiServiceInput, UpdateAppUpdateSettingsInput,
+        CancelManagedTaskInput, CheckAppUpdateInput, ClientKeySecretInput, CodexAuthMode,
+        CodexSessionSummary, CollaborationCallbackStatus, CollaborationContextSummary,
+        CollaborationProjectBinding, CollaborationProvider, CommitJsonProfileImportInput,
+        CompleteOAuthImportInput, ContinueCodexSessionInput, CreateApiServiceProfileInput,
+        CreateClientKeyInput, CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
+        CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCollaborationBotInput,
+        DeleteCollaborationProjectBindingInput, DeleteDesktopWorkspaceInput, DeleteFeishuBotInput,
+        DeleteFeishuProjectBindingInput, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
+        DesktopWorkspaceSettings, DiscardJsonProfileImportInput, FeishuProjectBinding,
+        GatewayCodexConfigStatus, GatewayStatus, InstallAppUpdateInput, JsonProfileImportPreview,
+        JsonProfileImportResult, ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey,
+        MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile, OAuthImportStatus,
+        PreviewJsonProfileImportInput, ProfileQuotaRefreshReport, ResetCollaborationContextInput,
+        RestoreDesktopWorkspaceInput, RetryJsonProfileImportInput, SelectCurrentProfileInput,
+        SetCodexGatewayOAuthProfileInput, StartManagedTaskInput, StartOAuthImportInput,
+        TestApiServiceInput, UpdateAppUpdateSettingsInput, UpdateCollaborationContextInput,
         UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput, UpdateProfileInput,
         UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput, UpsertFeishuBotInput,
         UpsertFeishuProjectBindingInput,
@@ -551,20 +552,33 @@ pub async fn update_gateway(
     input: UpdateGatewayInput,
     state: State<'_, AppState>,
 ) -> AppResult<GatewayStatus> {
-    if input.bind_mode != "lan" || !input.confirmed_lan {
-        return Err(AppError::ConfirmationRequired);
-    }
-    let address = input
-        .bind_address
+    let (bind_mode, bind_address, cidrs) = match input.bind_mode.as_str() {
+        "loopback" => ("loopback".to_owned(), "127.0.0.1".to_owned(), Vec::new()),
+        "lan" if input.confirmed_lan => {
+            let address = input
+                .bind_address
+                .parse()
+                .map_err(|_| AppError::ValidationFailed)?;
+            validate_binding(&input.bind_mode, address, &input.cidrs)?;
+            if !available_lan_addresses()
+                .iter()
+                .any(|candidate| candidate.address == input.bind_address)
+            {
+                return Err(AppError::ForbiddenNetworkTarget);
+            }
+            (
+                input.bind_mode.clone(),
+                input.bind_address.clone(),
+                input.cidrs.clone(),
+            )
+        }
+        "lan" => return Err(AppError::ConfirmationRequired),
+        _ => return Err(AppError::ValidationFailed),
+    };
+    let address = bind_address
         .parse()
         .map_err(|_| AppError::ValidationFailed)?;
-    validate_binding(&input.bind_mode, address, &input.cidrs)?;
-    if !available_lan_addresses()
-        .iter()
-        .any(|candidate| candidate.address == input.bind_address)
-    {
-        return Err(AppError::ForbiddenNetworkTarget);
-    }
+    validate_binding(&bind_mode, address, &cidrs)?;
     if state.gateway.is_running() {
         return Err(AppError::Conflict);
     }
@@ -575,12 +589,9 @@ pub async fn update_gateway(
         input.upstream_proxy_url.as_deref(),
     )
     .await?;
-    state.repository.update_gateway_settings(
-        &input.bind_mode,
-        &input.bind_address,
-        input.port,
-        &input.cidrs,
-    )?;
+    state
+        .repository
+        .update_gateway_settings(&bind_mode, &bind_address, input.port, &cidrs)?;
     state.gateway.status()
 }
 
@@ -705,18 +716,7 @@ pub fn list_client_keys(state: State<'_, AppState>) -> AppResult<Vec<MaskedClien
     state.repository.list_client_keys()
 }
 
-#[tauri::command]
-pub async fn create_client_key(
-    input: CreateClientKeyInput,
-    state: State<'_, AppState>,
-) -> AppResult<CreatedClientKey> {
-    if !input.confirmed {
-        return Err(AppError::ConfirmationRequired);
-    }
-    if input.name.trim().is_empty() {
-        return Err(AppError::ValidationFailed);
-    }
-    let id = Uuid::new_v4().to_string();
+fn generated_client_key_material() -> AppResult<(String, String, String)> {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
     let plaintext_once = format!("crl_{}", URL_SAFE_NO_PAD.encode(bytes));
@@ -729,6 +729,67 @@ pub async fn create_client_key(
         "crl_••••{}",
         &plaintext_once[plaintext_once.len().saturating_sub(4)..]
     );
+    Ok((plaintext_once, hash, masked_value))
+}
+
+#[tauri::command]
+pub async fn reveal_client_key(
+    input: ClientKeySecretInput,
+    state: State<'_, AppState>,
+) -> AppResult<String> {
+    if !input.confirmed {
+        return Err(AppError::ConfirmationRequired);
+    }
+    let secret_ref = state.repository.user_client_key_secret_ref(&input.id)?;
+    state.secrets.get(&secret_ref).await
+}
+
+#[tauri::command]
+pub async fn rotate_client_key(
+    input: ClientKeySecretInput,
+    state: State<'_, AppState>,
+) -> AppResult<CreatedClientKey> {
+    if !input.confirmed {
+        return Err(AppError::ConfirmationRequired);
+    }
+    let (plaintext_once, hash, masked_value) = generated_client_key_material()?;
+    let secret_ref = state.repository.user_client_key_secret_ref(&input.id)?;
+    let previous_secret = state.secrets.get(&secret_ref).await.ok();
+    state.secrets.set(&secret_ref, &plaintext_once).await?;
+    if let Err(error) = state
+        .repository
+        .update_client_key_material(&input.id, &hash, &masked_value)
+    {
+        if let Some(previous_secret) = previous_secret {
+            let _ = state.secrets.set(&secret_ref, &previous_secret).await;
+        }
+        return Err(error);
+    }
+    let key = state
+        .repository
+        .list_client_keys()?
+        .into_iter()
+        .find(|key| key.id == input.id)
+        .ok_or(AppError::NotFound)?;
+    Ok(CreatedClientKey {
+        key,
+        plaintext_once,
+    })
+}
+
+#[tauri::command]
+pub async fn create_client_key(
+    input: CreateClientKeyInput,
+    state: State<'_, AppState>,
+) -> AppResult<CreatedClientKey> {
+    if !input.confirmed {
+        return Err(AppError::ConfirmationRequired);
+    }
+    if input.name.trim().is_empty() {
+        return Err(AppError::ValidationFailed);
+    }
+    let id = Uuid::new_v4().to_string();
+    let (plaintext_once, hash, masked_value) = generated_client_key_material()?;
     let secret_ref = format!("client-key:{id}");
     state.secrets.set(&secret_ref, &plaintext_once).await?;
     let key = MaskedClientKey {
@@ -948,6 +1009,29 @@ pub fn delete_feishu_project_binding(
             id: input.id,
             confirmed: input.confirmed,
         })
+}
+
+#[tauri::command]
+pub fn list_collaboration_contexts(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<CollaborationContextSummary>> {
+    state.collaboration.list_contexts()
+}
+
+#[tauri::command]
+pub fn update_collaboration_context(
+    input: UpdateCollaborationContextInput,
+    state: State<'_, AppState>,
+) -> AppResult<CollaborationContextSummary> {
+    state.collaboration.update_context(input)
+}
+
+#[tauri::command]
+pub fn reset_collaboration_context(
+    input: ResetCollaborationContextInput,
+    state: State<'_, AppState>,
+) -> AppResult<CollaborationContextSummary> {
+    state.collaboration.reset_context(input)
 }
 
 #[tauri::command]

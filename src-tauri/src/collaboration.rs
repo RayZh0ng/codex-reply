@@ -32,6 +32,7 @@ use reqwest::{Client, StatusCode as HttpStatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha1::{Digest as Sha1Digest, Sha1};
+use sha2::Sha256;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use toml_edit::{value as toml_value, Array, DocumentMut, Item, Table};
@@ -42,10 +43,12 @@ use crate::{
     database::{Repository, StoredCodexSession, StoredCollaborationBot},
     domain::{
         CancelCodexSessionInput, CodexAuthMode, CodexSessionEvent, CodexSessionSummary,
-        CollaborationCallbackStatus, CollaborationCommandResult, CollaborationProjectBinding,
-        CollaborationProvider, ContinueCodexSessionInput, DeleteCollaborationBotInput,
-        DeleteCollaborationProjectBindingInput, ListCodexSessionsInput, MaskedCollaborationBot,
-        ProfileKind, UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput,
+        CollaborationCallbackStatus, CollaborationCommandResult, CollaborationContextSummary,
+        CollaborationProjectBinding, CollaborationProvider, ContinueCodexSessionInput,
+        DeleteCollaborationBotInput, DeleteCollaborationProjectBindingInput,
+        ListCodexSessionsInput, MaskedCollaborationBot, ProfileKind,
+        ResetCollaborationContextInput, UpdateCollaborationContextInput,
+        UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput,
     },
     error::{AppError, AppResult},
     gateway::GatewayManager,
@@ -57,24 +60,6 @@ use crate::{
 const GLOBAL_CONCURRENCY_LIMIT: i64 = 4;
 const DEFAULT_PROJECT_CONCURRENCY_LIMIT: i64 = 2;
 const CALLBACK_PORT: u16 = 53821;
-const CODEX_SESSION_ARGS: [&str; 6] = [
-    "exec",
-    "--json",
-    "--sandbox",
-    "workspace-write",
-    "--output-last-message",
-    "__OUTPUT__",
-];
-const CODEX_RESUME_ARGS: [&str; 7] = [
-    "exec",
-    "resume",
-    "--json",
-    "--output-last-message",
-    "__OUTPUT__",
-    "__SESSION__",
-    "-",
-];
-const NATURAL_TASK_RESUME_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const COLLABORATION_GATEWAY_PROVIDER: &str = "codex_relay";
 const COLLABORATION_MODEL_CATALOG_FILENAME: &str = "codex-relay-model-catalog.json";
 const MAX_INCOMING_IMAGES: usize = 5;
@@ -139,7 +124,16 @@ enum NaturalRunResolution {
     Ready {
         binding: Box<CollaborationProjectBinding>,
         instruction: String,
-        resume_session: Option<Box<CodexSessionSummary>>,
+        force_new: bool,
+    },
+    Message(String),
+}
+
+#[derive(Debug, Clone)]
+enum CommandContextResolution {
+    Ready {
+        binding: Box<CollaborationProjectBinding>,
+        context: Box<CollaborationContextSummary>,
     },
     Message(String),
 }
@@ -470,6 +464,82 @@ impl CollaborationManager {
             .collect())
     }
 
+    pub fn list_contexts(&self) -> AppResult<Vec<CollaborationContextSummary>> {
+        self.repository.list_collaboration_contexts()
+    }
+
+    pub fn update_context(
+        &self,
+        input: UpdateCollaborationContextInput,
+    ) -> AppResult<CollaborationContextSummary> {
+        if !input.confirmed || input.context_id.trim().is_empty() {
+            return Err(AppError::ValidationFailed);
+        }
+        let mut context = self.repository.collaboration_context(&input.context_id)?;
+        if let Some(enabled) = input.memory_enabled {
+            context = self
+                .repository
+                .set_collaboration_context_memory(&context.id, enabled)?;
+        }
+        if let Some(mode) = input
+            .conversation_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context = self
+                .repository
+                .set_collaboration_context_mode(&context.id, mode)?;
+        }
+        if let Some(policy) = input.permissions_policy.as_deref() {
+            context = self.repository.set_collaboration_context_permissions(
+                &context.id,
+                normalize_permissions_policy(policy)?,
+            )?;
+        }
+        if input.goal_status.is_some() || input.goal_text.is_some() {
+            let status = input
+                .goal_status
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(context.goal_status.as_str());
+            let text = input
+                .goal_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            context = self
+                .repository
+                .set_collaboration_context_goal(&context.id, status, text)?;
+        }
+        if let Some(model) = input
+            .model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            context = self
+                .repository
+                .set_collaboration_context_model(&context.id, Some(model))?;
+        }
+        Ok(context)
+    }
+
+    pub fn reset_context(
+        &self,
+        input: ResetCollaborationContextInput,
+    ) -> AppResult<CollaborationContextSummary> {
+        if !input.confirmed || input.context_id.trim().is_empty() {
+            return Err(AppError::ValidationFailed);
+        }
+        let context = self
+            .repository
+            .clear_collaboration_context_active(&input.context_id)?;
+        self.repository
+            .set_collaboration_context_goal(&context.id, "none", None)
+    }
+
     pub async fn cancel_session(
         &self,
         input: CancelCodexSessionInput,
@@ -732,6 +802,7 @@ impl CollaborationManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_natural_task(
         &self,
         provider: CollaborationProvider,
@@ -742,29 +813,28 @@ impl CollaborationManager {
         force_new: bool,
         images: Vec<IncomingImage>,
     ) -> AppResult<CollaborationCommandResult> {
-        match self.resolve_natural_run(provider, bot_id, chat_id, sender, instruction, force_new)? {
+        match self.resolve_natural_run(provider, bot_id, chat_id, instruction, force_new)? {
             NaturalRunResolution::Ready {
                 binding,
                 instruction,
-                resume_session,
+                force_new,
             } => {
-                let execution = resume_session
-                    .as_ref()
-                    .map(|session| execution_from_session(session));
-                let codex_session_id = resume_session
-                    .as_ref()
-                    .and_then(|session| session.codex_session_id.clone());
-                let mut binding = *binding;
-                if let Some(session) = resume_session.as_ref() {
-                    apply_session_profile_snapshot(&mut binding, session);
-                }
-                self.start_codex_session(
+                let binding = *binding;
+                let context = self.ensure_context_for_binding(&binding)?;
+                self.repository.set_collaboration_chat_context(
+                    provider,
+                    bot_id,
+                    chat_id,
+                    &context.id,
+                )?;
+                self.start_context_turn(
                     binding,
+                    context,
                     instruction,
                     sender.map(ToOwned::to_owned),
-                    codex_session_id.is_some(),
-                    codex_session_id,
-                    execution,
+                    force_new,
+                    "natural",
+                    "default",
                     images,
                 )
                 .await
@@ -813,9 +883,19 @@ impl CollaborationManager {
                 let binding = self
                     .repository
                     .bind_collaboration_project_chat(&binding.id, chat_id)?;
+                let context = self.ensure_context_for_binding(&binding)?;
+                self.repository.set_collaboration_chat_context(
+                    provider,
+                    bot_id,
+                    chat_id,
+                    &context.id,
+                )?;
                 Ok(CollaborationCommandResult {
                     status: "ok".into(),
-                    message: format!("项目“{}”已绑定到当前会话。", binding.project_name),
+                    message: format!(
+                        "项目“{}”已绑定到当前会话，并已准备项目全局上下文。",
+                        binding.project_name
+                    ),
                     session: None,
                 })
             }
@@ -831,8 +911,10 @@ impl CollaborationManager {
                         bindings
                             .into_iter()
                             .map(|binding| format!(
-                                "- {} ({})",
-                                binding.project_name, binding.project_slug
+                                "- {} ({}) · {}",
+                                binding.project_name,
+                                binding.project_slug,
+                                binding_execution_label(&binding)
                             ))
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -844,22 +926,72 @@ impl CollaborationManager {
                     session: None,
                 })
             }
-            CodexCommand::Run {
-                project,
-                instruction,
-            } => {
+            CodexCommand::Run { project, instruction } => {
                 let binding = self.binding_for_project(provider, bot_id, chat_id, &project)?;
-                self.start_codex_session(
+                let context = self.ensure_context_for_binding(&binding)?;
+                self.repository.set_collaboration_chat_context(provider, bot_id, chat_id, &context.id)?;
+                self.start_context_turn(
                     binding,
+                    context,
                     instruction,
                     sender.map(ToOwned::to_owned),
                     false,
-                    None,
-                    None,
+                    "run",
+                    "default",
                     images,
                 )
                 .await
             }
+            CodexCommand::New { project, instruction } => {
+                match self.resolve_command_context(provider, bot_id, chat_id, project.as_deref())? {
+                    CommandContextResolution::Ready { binding, context } => {
+                        self.start_context_turn(
+                            *binding,
+                            *context,
+                            instruction,
+                            sender.map(ToOwned::to_owned),
+                            true,
+                            "new",
+                            "default",
+                            images,
+                        )
+                        .await
+                    }
+                    CommandContextResolution::Message(message) => Ok(CollaborationCommandResult {
+                        status: "needs_project".into(),
+                        message,
+                        session: None,
+                    }),
+                }
+            }
+            CodexCommand::Plan { instruction } => {
+                match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+                    CommandContextResolution::Ready { binding, context } => {
+                        self.start_context_turn(
+                            *binding,
+                            *context,
+                            plan_mode_instruction(&instruction),
+                            sender.map(ToOwned::to_owned),
+                            false,
+                            "plan",
+                            "plan",
+                            images,
+                        )
+                        .await
+                    }
+                    CommandContextResolution::Message(message) => Ok(CollaborationCommandResult {
+                        status: "needs_project".into(),
+                        message,
+                        session: None,
+                    }),
+                }
+            }
+            CodexCommand::Goal { action } => self.handle_goal_command(
+                provider,
+                bot_id,
+                chat_id,
+                action,
+            ),
             CodexCommand::Sessions { project } => {
                 let binding_id = match project {
                     Some(project) => Some(
@@ -879,9 +1011,10 @@ impl CollaborationManager {
                     .take(10)
                     .map(|stored| {
                         format!(
-                            "- {} [{}] {}",
+                            "- {} [{} · {}] {}",
                             short_id(&stored.session.id),
                             stored.session.relay_status,
+                            stored.session.turn_kind,
                             stored.session.summary.unwrap_or_default()
                         )
                     })
@@ -897,15 +1030,29 @@ impl CollaborationManager {
                 })
             }
             CodexCommand::Status { session_id } => {
-                let scope = SessionLookupScope::new(provider, bot_id, chat_id);
-                let session = self
-                    .resolve_codex_session_reference(&session_id, Some(&scope))?
-                    .session;
-                Ok(CollaborationCommandResult {
-                    status: "ok".into(),
-                    message: format_session_status(&session),
-                    session: None,
-                })
+                if let Some(session_id) = session_id {
+                    let scope = SessionLookupScope::new(provider, bot_id, chat_id);
+                    let session = self
+                        .resolve_codex_session_reference(&session_id, Some(&scope))?
+                        .session;
+                    Ok(CollaborationCommandResult {
+                        status: "ok".into(),
+                        message: format_session_status(&session),
+                        session: None,
+                    })
+                } else {
+                    let message = match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+                        CommandContextResolution::Ready { context, .. } => {
+                            format_context_status(&context)
+                        }
+                        CommandContextResolution::Message(message) => message,
+                    };
+                    Ok(CollaborationCommandResult {
+                        status: "ok".into(),
+                        message,
+                        session: None,
+                    })
+                }
             }
             CodexCommand::Cancel { session_id } => {
                 let scope = SessionLookupScope::new(provider, bot_id, chat_id);
@@ -917,10 +1064,7 @@ impl CollaborationManager {
                         session: Some(session),
                     })
             }
-            CodexCommand::Continue {
-                session_id,
-                instruction,
-            } => {
+            CodexCommand::Continue { session_id, instruction } => {
                 let scope = SessionLookupScope::new(provider, bot_id, chat_id);
                 let stored = self.resolve_codex_session_reference(&session_id, Some(&scope))?;
                 self.continue_resolved_session(
@@ -935,6 +1079,51 @@ impl CollaborationManager {
                     message: "Codex 会话已继续。".into(),
                     session: Some(session),
                 })
+            }
+            CodexCommand::Resume { session_id } => self.resume_context_session(
+                provider,
+                bot_id,
+                chat_id,
+                &session_id,
+            ),
+            CodexCommand::Compact => match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+                CommandContextResolution::Ready { binding, context } => {
+                    self.start_context_turn(
+                        *binding,
+                        *context,
+                        "请压缩当前协作上下文，保留关键目标、决策、已完成步骤、待办、风险和验证结果，后续继续基于压缩后的上下文工作。".into(),
+                        sender.map(ToOwned::to_owned),
+                        false,
+                        "compact",
+                        "compact",
+                        images,
+                    )
+                    .await
+                }
+                CommandContextResolution::Message(message) => Ok(CollaborationCommandResult { status: "needs_project".into(), message, session: None }),
+            },
+            CodexCommand::Review => match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+                CommandContextResolution::Ready { binding, context } => {
+                    self.start_context_turn(
+                        *binding,
+                        *context,
+                        "请审查当前工作区改动，指出风险、缺陷、遗漏的测试和发布阻塞项；不要修改文件。".into(),
+                        sender.map(ToOwned::to_owned),
+                        false,
+                        "review",
+                        "review",
+                        images,
+                    )
+                    .await
+                }
+                CommandContextResolution::Message(message) => Ok(CollaborationCommandResult { status: "needs_project".into(), message, session: None }),
+            },
+            CodexCommand::Model { model } => self.handle_model_command(provider, bot_id, chat_id, model),
+            CodexCommand::Permissions { policy } => {
+                self.handle_permissions_command(provider, bot_id, chat_id, policy)
+            }
+            CodexCommand::Memories { action } => {
+                self.handle_memories_command(provider, bot_id, chat_id, action)
             }
         }
     }
@@ -996,19 +1185,25 @@ impl CollaborationManager {
             .codex_session_id
             .clone()
             .ok_or(AppError::Conflict)?;
-        let binding = self
+        let mut binding = self
             .repository
             .collaboration_project_binding(&stored.session.binding_id)?;
-        let mut binding = binding;
         apply_stored_session_snapshot(&mut binding, &stored);
-        let execution = execution_from_session(&stored.session);
-        self.start_codex_session(
+        let context = if let Some(context_id) = stored.session.context_id.as_deref() {
+            self.repository.collaboration_context(context_id)?
+        } else {
+            self.ensure_context_for_binding(&binding)?
+        };
+        self.repository
+            .set_collaboration_context_codex_id(&context.id, &codex_session_id)?;
+        self.start_context_turn(
             binding,
+            context,
             instruction,
             started_by.or(stored.session.started_by),
-            true,
-            Some(codex_session_id),
-            Some(execution),
+            false,
+            "continue",
+            "default",
             images,
         )
         .await
@@ -1029,44 +1224,58 @@ impl CollaborationManager {
             .ok_or(AppError::NotFound)
     }
 
-    fn resolve_natural_run(
+    fn resolve_command_context(
         &self,
         provider: CollaborationProvider,
         bot_id: &str,
         chat_id: &str,
-        sender: Option<&str>,
-        instruction: String,
-        force_new: bool,
-    ) -> AppResult<NaturalRunResolution> {
+        project: Option<&str>,
+    ) -> AppResult<CommandContextResolution> {
+        if let Some(project) = project.map(str::trim).filter(|value| !value.is_empty()) {
+            let binding = self.binding_for_project(provider, bot_id, chat_id, project)?;
+            let context = self.ensure_context_for_binding(&binding)?;
+            self.repository.set_collaboration_chat_context(
+                provider,
+                bot_id,
+                chat_id,
+                &context.id,
+            )?;
+            return Ok(CommandContextResolution::Ready {
+                binding: Box::new(binding),
+                context: Box::new(context),
+            });
+        }
+        if let Some(context) = self
+            .repository
+            .collaboration_chat_context(provider, bot_id, chat_id)?
+        {
+            let mut binding = self
+                .repository
+                .collaboration_project_binding(&context.binding_id)?;
+            apply_context_snapshot(&mut binding, &context);
+            return Ok(CommandContextResolution::Ready {
+                binding: Box::new(binding),
+                context: Box::new(context),
+            });
+        }
         let bindings = self
             .repository
             .collaboration_bindings_for_chat(provider, bot_id, chat_id)?;
         match bindings.as_slice() {
-            [] => Ok(NaturalRunResolution::Message(
+            [] => Ok(CommandContextResolution::Message(
                 "当前会话还没有绑定项目。请先在 Codex Relay 客户端创建项目绑定，再发送 /codex bind <code>。"
                     .to_owned(),
             )),
             [binding] => {
-                let resume_session = if force_new {
-                    None
-                } else {
-                    match self.recent_resumable_session(binding, sender) {
-                        Ok(session) => session.map(Box::new),
-                        Err(
-                            AppError::LocalStateUnavailable
-                            | AppError::Internal
-                            | AppError::NotFound,
-                        ) => None,
-                        Err(error) => return Err(error),
-                    }
-                };
-                Ok(NaturalRunResolution::Ready {
+                let context = self.ensure_context_for_binding(binding)?;
+                self.repository
+                    .set_collaboration_chat_context(provider, bot_id, chat_id, &context.id)?;
+                Ok(CommandContextResolution::Ready {
                     binding: Box::new(binding.clone()),
-                    instruction,
-                    resume_session,
+                    context: Box::new(context),
                 })
             }
-            _ => Ok(NaturalRunResolution::Message(format!(
+            _ => Ok(CommandContextResolution::Message(format!(
                 "当前会话绑定了多个项目，请补项目名：\n{}\n可发送 /codex run <project> <任务说明> 指定项目。",
                 bindings
                     .into_iter()
@@ -1077,28 +1286,340 @@ impl CollaborationManager {
         }
     }
 
-    fn recent_resumable_session(
+    fn ensure_context_for_binding(
         &self,
         binding: &CollaborationProjectBinding,
-        sender: Option<&str>,
-    ) -> AppResult<Option<CodexSessionSummary>> {
-        let cutoff = timestamp_ms() - NATURAL_TASK_RESUME_WINDOW_MS;
-        Ok(self
+    ) -> AppResult<CollaborationContextSummary> {
+        let scope_key = collaboration_context_scope_key(binding);
+        if let Some(mut context) = self.repository.collaboration_context_by_scope(&scope_key)? {
+            if context.binding_id != binding.id {
+                context.binding_id = binding.id.clone();
+                context.provider = binding.provider;
+                context.bot_id = binding.bot_id.clone();
+                context.bot_name = binding.bot_name.clone();
+                context.project_name = binding.project_name.clone();
+                context.project_slug = binding.project_slug.clone();
+                context.updated_at_ms = timestamp_ms();
+                self.repository.upsert_collaboration_context(&context)?;
+                context = self.repository.collaboration_context(&context.id)?;
+            }
+            return Ok(context);
+        }
+        let now = timestamp_ms();
+        let context = CollaborationContextSummary {
+            id: collaboration_context_id(&scope_key),
+            scope_key,
+            binding_id: binding.id.clone(),
+            provider: binding.provider,
+            bot_id: binding.bot_id.clone(),
+            bot_name: binding.bot_name.clone(),
+            project_name: binding.project_name.clone(),
+            project_slug: binding.project_slug.clone(),
+            working_directory: binding.working_directory.clone(),
+            execution_target: binding.execution_target.clone(),
+            profile_id: binding.profile_id.clone(),
+            profile_alias: binding.profile_alias.clone(),
+            model_id: binding.model_id.clone(),
+            memory_enabled: true,
+            permissions_policy: "workspace-write".to_owned(),
+            active_codex_session_id: None,
+            active_relay_session_id: None,
+            goal_status: "none".to_owned(),
+            goal_text: None,
+            conversation_mode: "default".to_owned(),
+            last_turn_at_ms: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        self.repository.upsert_collaboration_context(&context)?;
+        Ok(context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_context_turn(
+        &self,
+        binding: CollaborationProjectBinding,
+        mut context: CollaborationContextSummary,
+        instruction: String,
+        started_by: Option<String>,
+        force_new: bool,
+        turn_kind: &str,
+        conversation_mode: &str,
+        images: Vec<IncomingImage>,
+    ) -> AppResult<CollaborationCommandResult> {
+        if self
             .repository
-            .list_codex_sessions(Some(&binding.id))?
-            .into_iter()
-            .filter(|stored| {
-                let session = &stored.session;
-                session.provider == binding.provider
-                    && session.provider_bot_id.as_deref() == Some(binding.bot_id.as_str())
-                    && session.provider_chat_id.as_deref() == binding.chat_id.as_deref()
-                    && session.started_by.as_deref() == sender
-                    && session.started_at_ms >= cutoff
-                    && matches!(session.relay_status.as_str(), "completed" | "failed")
-                    && session.codex_session_id.is_some()
-            })
-            .map(|stored| stored.session)
-            .next())
+            .count_running_codex_sessions_for_context(&context.id)?
+            > 0
+        {
+            return Ok(CollaborationCommandResult {
+                status: "limited".into(),
+                message: format!(
+                    "项目“{}”已有一个上下文 turn 正在运行，请先等待完成或使用 /codex status 查看。",
+                    context.project_name
+                ),
+                session: None,
+            });
+        }
+        if force_new {
+            context = self
+                .repository
+                .clear_collaboration_context_active(&context.id)?;
+        }
+        let codex_session_id = context.active_codex_session_id.clone();
+        self.start_codex_session(
+            binding,
+            build_context_instruction(&context, &instruction, conversation_mode),
+            started_by,
+            codex_session_id.is_some(),
+            codex_session_id,
+            None,
+            Some(context),
+            turn_kind,
+            conversation_mode,
+            images,
+        )
+        .await
+    }
+
+    fn handle_goal_command(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        action: GoalAction,
+    ) -> AppResult<CollaborationCommandResult> {
+        let context = match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+            CommandContextResolution::Ready { context, .. } => *context,
+            CommandContextResolution::Message(message) => {
+                return Ok(CollaborationCommandResult {
+                    status: "needs_project".into(),
+                    message,
+                    session: None,
+                });
+            }
+        };
+        let context = match action {
+            GoalAction::View => context,
+            GoalAction::Set(text) | GoalAction::Edit(text) => self
+                .repository
+                .set_collaboration_context_goal(&context.id, "active", Some(text.trim()))?,
+            GoalAction::Pause => self.repository.set_collaboration_context_goal(
+                &context.id,
+                "paused",
+                context.goal_text.as_deref(),
+            )?,
+            GoalAction::Resume => self.repository.set_collaboration_context_goal(
+                &context.id,
+                "active",
+                context.goal_text.as_deref(),
+            )?,
+            GoalAction::Clear => {
+                self.repository
+                    .set_collaboration_context_goal(&context.id, "none", None)?
+            }
+        };
+        Ok(CollaborationCommandResult {
+            status: "ok".into(),
+            message: format_context_goal_status(&context),
+            session: None,
+        })
+    }
+
+    fn handle_model_command(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        model: Option<String>,
+    ) -> AppResult<CollaborationCommandResult> {
+        let context = match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+            CommandContextResolution::Ready { context, .. } => *context,
+            CommandContextResolution::Message(message) => {
+                return Ok(CollaborationCommandResult {
+                    status: "needs_project".into(),
+                    message,
+                    session: None,
+                });
+            }
+        };
+        let context = if let Some(model) = model
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+        {
+            self.repository
+                .set_collaboration_context_model(&context.id, Some(&model))?
+        } else {
+            context
+        };
+        Ok(CollaborationCommandResult {
+            status: "ok".into(),
+            message: format!(
+                "当前模型：{}",
+                context
+                    .model_id
+                    .as_deref()
+                    .unwrap_or("跟随 Codex 档案默认模型")
+            ),
+            session: None,
+        })
+    }
+
+    fn handle_permissions_command(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        policy: Option<String>,
+    ) -> AppResult<CollaborationCommandResult> {
+        let context = match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+            CommandContextResolution::Ready { context, .. } => *context,
+            CommandContextResolution::Message(message) => {
+                return Ok(CollaborationCommandResult {
+                    status: "needs_project".into(),
+                    message,
+                    session: None,
+                });
+            }
+        };
+        let context = if let Some(policy) = policy {
+            let policy = normalize_permissions_policy(&policy)?;
+            self.repository
+                .set_collaboration_context_permissions(&context.id, policy)?
+        } else {
+            context
+        };
+        Ok(CollaborationCommandResult {
+            status: "ok".into(),
+            message: format!("当前权限策略：{}", context.permissions_policy),
+            session: None,
+        })
+    }
+
+    fn handle_memories_command(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        action: Option<String>,
+    ) -> AppResult<CollaborationCommandResult> {
+        let context = match self.resolve_command_context(provider, bot_id, chat_id, None)? {
+            CommandContextResolution::Ready { context, .. } => *context,
+            CommandContextResolution::Message(message) => {
+                return Ok(CollaborationCommandResult {
+                    status: "needs_project".into(),
+                    message,
+                    session: None,
+                });
+            }
+        };
+        let context = match action.as_deref() {
+            Some("on" | "enable" | "enabled") => self
+                .repository
+                .set_collaboration_context_memory(&context.id, true)?,
+            Some("off" | "disable" | "disabled") => self
+                .repository
+                .set_collaboration_context_memory(&context.id, false)?,
+            Some("status") | None => context,
+            _ => return Err(AppError::ValidationFailed),
+        };
+        Ok(CollaborationCommandResult {
+            status: "ok".into(),
+            message: format!(
+                "长期记忆：{}",
+                if context.memory_enabled {
+                    "已开启"
+                } else {
+                    "已关闭"
+                }
+            ),
+            session: None,
+        })
+    }
+
+    fn resume_context_session(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        reference: &str,
+    ) -> AppResult<CollaborationCommandResult> {
+        let scope = SessionLookupScope::new(provider, bot_id, chat_id);
+        let stored = self.resolve_codex_session_reference(reference, Some(&scope))?;
+        let codex_session_id = stored
+            .session
+            .codex_session_id
+            .clone()
+            .ok_or(AppError::Conflict)?;
+        let binding = self
+            .repository
+            .collaboration_project_binding(&stored.session.binding_id)?;
+        let context = if let Some(context_id) = stored.session.context_id.as_deref() {
+            self.repository.collaboration_context(context_id)?
+        } else {
+            self.ensure_context_for_binding(&binding)?
+        };
+        self.repository
+            .set_collaboration_context_codex_id(&context.id, &codex_session_id)?;
+        self.repository
+            .set_collaboration_chat_context(provider, bot_id, chat_id, &context.id)?;
+        Ok(CollaborationCommandResult {
+            status: "ok".into(),
+            message: format!(
+                "已切换当前上下文到 Codex session {}。下一条自然消息会继续该上下文。",
+                short_id(&codex_session_id)
+            ),
+            session: None,
+        })
+    }
+
+    fn resolve_natural_run(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        instruction: String,
+        force_new: bool,
+    ) -> AppResult<NaturalRunResolution> {
+        let bindings = self
+            .repository
+            .collaboration_bindings_for_chat(provider, bot_id, chat_id)?;
+        if bindings.is_empty() {
+            return Ok(NaturalRunResolution::Message(
+                "当前会话还没有绑定项目。请先在 Codex Relay 客户端创建项目绑定，再发送 /codex bind <code>。"
+                    .to_owned(),
+            ));
+        }
+        if let Some(context) = self
+            .repository
+            .collaboration_chat_context(provider, bot_id, chat_id)?
+        {
+            if let Some(binding) = bindings
+                .iter()
+                .find(|binding| binding.id == context.binding_id && binding.enabled)
+            {
+                return Ok(NaturalRunResolution::Ready {
+                    binding: Box::new(binding.clone()),
+                    instruction,
+                    force_new,
+                });
+            }
+        }
+        match bindings.as_slice() {
+            [binding] => Ok(NaturalRunResolution::Ready {
+                binding: Box::new(binding.clone()),
+                instruction,
+                force_new,
+            }),
+            _ => Ok(NaturalRunResolution::Message(format!(
+                "当前会话绑定了多个项目，请补项目名：\n{}\n可发送 /codex run <project> <任务说明> 或 /new <project> <任务说明> 指定项目。",
+                bindings
+                    .into_iter()
+                    .map(|binding| format!("- {} ({})", binding.project_name, binding.project_slug))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))),
+        }
     }
 
     async fn cancel_session_by_id(&self, session_id: &str) -> AppResult<CodexSessionSummary> {
@@ -1119,6 +1640,11 @@ impl CollaborationManager {
             None,
             Some(timestamp_ms()),
         )?;
+        if let Some(context_id) = session.context_id.as_deref() {
+            let _ = self
+                .repository
+                .mark_collaboration_context_turn_finished(context_id, session_id);
+        }
         self.record_event(session_id, "cancelled", "任务已取消。");
         let manager = self.clone();
         let session_for_update = session.clone();
@@ -1137,6 +1663,9 @@ impl CollaborationManager {
         resume: bool,
         codex_session_id: Option<String>,
         execution_override: Option<SessionExecution>,
+        context: Option<CollaborationContextSummary>,
+        turn_kind: &str,
+        conversation_mode: &str,
         images: Vec<IncomingImage>,
     ) -> AppResult<CollaborationCommandResult> {
         if self.repository.count_running_codex_sessions(None)? >= GLOBAL_CONCURRENCY_LIMIT {
@@ -1164,6 +1693,22 @@ impl CollaborationManager {
                 session: None,
             });
         }
+        if let Some(context) = context.as_ref() {
+            if self
+                .repository
+                .count_running_codex_sessions_for_context(&context.id)?
+                > 0
+            {
+                return Ok(CollaborationCommandResult {
+                    status: "limited".into(),
+                    message: format!(
+                        "项目“{}”已有一个上下文 turn 正在运行，请稍后查看状态。",
+                        context.project_name
+                    ),
+                    session: None,
+                });
+            }
+        }
         let execution = execution_override.unwrap_or_else(|| execution_from_binding(&binding));
         let working_directory = Path::new(&binding.working_directory);
         if !working_directory.is_dir() {
@@ -1171,7 +1716,15 @@ impl CollaborationManager {
         }
         let session_id = Uuid::new_v4().to_string();
         let now = timestamp_ms();
-        let session_home = self.session_home(&session_id);
+        let context_id = context.as_ref().map(|context| context.id.clone());
+        let session_home = context_id
+            .as_deref()
+            .map(|context_id| self.context_home(context_id))
+            .unwrap_or_else(|| self.session_home(&session_id));
+        let run_dir = context_id
+            .as_deref()
+            .map(|context_id| self.context_turn_dir(context_id, &session_id))
+            .unwrap_or_else(|| self.session_home(&session_id));
         if execution.target == "gateway" {
             let auth_json = self.gateway_oauth_auth_json().await?;
             let model = execution
@@ -1189,8 +1742,11 @@ impl CollaborationManager {
             let auth_json = self.profile_auth_json(&profile).await?;
             write_auth_json_to_home(&session_home, &auth_json)?;
         }
+        if let Some(context) = context.as_ref() {
+            write_context_memory_config(&session_home, context.memory_enabled)?;
+        }
         let image_paths = match self
-            .download_incoming_images(&binding.provider, &binding.bot_id, &session_id, &images)
+            .download_incoming_images(&binding.provider, &binding.bot_id, &run_dir, &images)
             .await
         {
             Ok(paths) => paths,
@@ -1202,13 +1758,21 @@ impl CollaborationManager {
                 });
             }
         };
-        let output_file = session_home.join("last-message.txt");
+        fs::create_dir_all(&run_dir).map_err(|_| AppError::RuntimeUnavailable)?;
+        let output_file = run_dir.join("last-message.txt");
         let mut command = Command::new("codex");
         let args = codex_command_args(
             resume,
             codex_session_id.as_deref(),
             &output_file,
             &image_paths,
+            context
+                .as_ref()
+                .and_then(|context| context.model_id.as_deref()),
+            context
+                .as_ref()
+                .map(|context| context.permissions_policy.as_str())
+                .unwrap_or("workspace-write"),
         )?;
         command.args(args);
         let system_prompt = self.bot_system_prompt(&binding.bot_id)?;
@@ -1233,6 +1797,7 @@ impl CollaborationManager {
         let session = CodexSessionSummary {
             id: session_id.clone(),
             binding_id: binding.id.clone(),
+            context_id: context_id.clone(),
             provider: binding.provider,
             provider_bot_id: Some(binding.bot_id.clone()),
             provider_chat_id: binding.chat_id.clone(),
@@ -1263,12 +1828,22 @@ impl CollaborationManager {
             ),
             last_error: None,
             execution_target: execution.target.clone(),
-            model_id: execution.model_id.clone(),
+            model_id: context
+                .as_ref()
+                .and_then(|context| context.model_id.clone())
+                .or_else(|| execution.model_id.clone()),
+            turn_kind: turn_kind.to_owned(),
+            conversation_mode: conversation_mode.to_owned(),
+            goal_status: context.as_ref().map(|context| context.goal_status.clone()),
         };
         self.repository.insert_codex_session(&StoredCodexSession {
             session: session.clone(),
             working_directory: binding.working_directory.clone(),
         })?;
+        if let Some(context_id) = context_id.as_deref() {
+            self.repository
+                .mark_collaboration_context_turn_started(context_id, &session_id)?;
+        }
         self.record_event(&session_id, "received", &redact(&instruction));
         if !image_paths.is_empty() {
             self.record_event(
@@ -1282,7 +1857,14 @@ impl CollaborationManager {
             .lock()
             .map_err(|_| AppError::Internal)?
             .insert(session_id.clone(), child.clone());
-        self.spawn_session_watcher(session_id.clone(), child, stdout, stderr, output_file);
+        self.spawn_session_watcher(
+            session_id.clone(),
+            context_id,
+            child,
+            stdout,
+            stderr,
+            output_file,
+        );
         Ok(CollaborationCommandResult {
             status: "running".into(),
             message: "Codex 任务已启动。".into(),
@@ -1293,6 +1875,7 @@ impl CollaborationManager {
     fn spawn_session_watcher(
         &self,
         session_id: String,
+        context_id: Option<String>,
         child: Arc<Mutex<Child>>,
         stdout: Option<std::process::ChildStdout>,
         stderr: Option<std::process::ChildStderr>,
@@ -1318,6 +1901,10 @@ impl CollaborationManager {
                     });
                     if let Some(codex_id) = parse_codex_session_id(&line) {
                         let _ = repository.set_codex_session_codex_id(&session_id, &codex_id);
+                        if let Some(context_id) = context_id.as_deref() {
+                            let _ = repository
+                                .set_collaboration_context_codex_id(context_id, &codex_id);
+                        }
                     }
                 }
             }
@@ -1361,6 +1948,10 @@ impl CollaborationManager {
                 .ok()
                 .is_some_and(|stored| stored.session.relay_status == "cancelled")
             {
+                if let Some(context_id) = context_id.as_deref() {
+                    let _ = repository
+                        .mark_collaboration_context_turn_finished(context_id, &session_id);
+                }
                 let _ = repository.insert_codex_session_event(&CodexSessionEvent {
                     id: Uuid::new_v4().to_string(),
                     session_id: session_id.clone(),
@@ -1387,6 +1978,10 @@ impl CollaborationManager {
                 event_type: status.into(),
                 content: final_summary,
             });
+            if let Some(context_id) = context_id.as_deref() {
+                let _ =
+                    repository.mark_collaboration_context_turn_finished(context_id, &session_id);
+            }
             if let Ok(session) = session {
                 tauri::async_runtime::spawn(async move {
                     let _ = manager.update_session_message(&session).await;
@@ -1464,6 +2059,21 @@ impl CollaborationManager {
             .join("codex-home")
     }
 
+    fn context_home(&self, context_id: &str) -> PathBuf {
+        self.data_dir
+            .join("collaboration-contexts")
+            .join(context_id)
+            .join("codex-home")
+    }
+
+    fn context_turn_dir(&self, context_id: &str, session_id: &str) -> PathBuf {
+        self.data_dir
+            .join("collaboration-contexts")
+            .join(context_id)
+            .join("turns")
+            .join(session_id)
+    }
+
     fn bot_system_prompt(&self, bot_id: &str) -> AppResult<Option<String>> {
         let stored = self.repository.collaboration_bot(bot_id)?;
         config_from_json(&stored.config_json).map(|config| config.system_prompt)
@@ -1473,7 +2083,7 @@ impl CollaborationManager {
         &self,
         provider: &CollaborationProvider,
         bot_id: &str,
-        session_id: &str,
+        run_dir: &Path,
         images: &[IncomingImage],
     ) -> Result<Vec<PathBuf>, String> {
         if images.is_empty() {
@@ -1485,7 +2095,7 @@ impl CollaborationManager {
                 images.len()
             ));
         }
-        let directory = self.session_home(session_id).join("incoming-images");
+        let directory = run_dir.join("incoming-images");
         fs::create_dir_all(&directory).map_err(|_| "图片保存目录创建失败。".to_owned())?;
         let mut paths = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
@@ -2874,11 +3484,21 @@ pub enum CodexCommand {
         project: String,
         instruction: String,
     },
+    New {
+        project: Option<String>,
+        instruction: String,
+    },
+    Plan {
+        instruction: String,
+    },
+    Goal {
+        action: GoalAction,
+    },
     Sessions {
         project: Option<String>,
     },
     Status {
-        session_id: String,
+        session_id: Option<String>,
     },
     Cancel {
         session_id: String,
@@ -2887,6 +3507,30 @@ pub enum CodexCommand {
         session_id: String,
         instruction: String,
     },
+    Resume {
+        session_id: String,
+    },
+    Compact,
+    Review,
+    Model {
+        model: Option<String>,
+    },
+    Permissions {
+        policy: Option<String>,
+    },
+    Memories {
+        action: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalAction {
+    View,
+    Set(String),
+    Edit(String),
+    Pause,
+    Resume,
+    Clear,
 }
 
 pub fn parse_codex_command(text: &str) -> AppResult<CodexCommand> {
@@ -2895,17 +3539,16 @@ pub fn parse_codex_command(text: &str) -> AppResult<CodexCommand> {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let Some(rest) = cleaned.strip_prefix("/codex") else {
-        return Err(AppError::ValidationFailed);
-    };
-    let rest = rest.trim();
+    let rest = command_body(&cleaned).ok_or(AppError::ValidationFailed)?;
     if rest.is_empty() || rest == "help" {
         return Ok(CodexCommand::Help);
     }
-    let mut parts = rest.splitn(3, ' ');
+    let mut parts = rest.splitn(2, ' ');
     let op = parts.next().unwrap_or_default();
+    let tail = parts.next().unwrap_or_default().trim();
     match op {
-        "bind" => parts
+        "bind" => tail
+            .split_whitespace()
             .next()
             .filter(|value| !value.is_empty())
             .map(|code| CodexCommand::Bind {
@@ -2914,31 +3557,46 @@ pub fn parse_codex_command(text: &str) -> AppResult<CodexCommand> {
             .ok_or(AppError::ValidationFailed),
         "projects" => Ok(CodexCommand::Projects),
         "run" => {
-            let project = parts.next().unwrap_or_default().trim();
-            let instruction = parts.next().unwrap_or_default().trim();
-            if project.is_empty() || instruction.is_empty() {
-                return Err(AppError::ValidationFailed);
-            }
+            let (project, instruction) = split_required_project_instruction(tail)?;
             Ok(CodexCommand::Run {
-                project: project.to_owned(),
-                instruction: instruction.to_owned(),
+                project,
+                instruction,
             })
         }
+        "new" => {
+            let (project, instruction) = split_optional_project_instruction(tail)?;
+            Ok(CodexCommand::New {
+                project,
+                instruction,
+            })
+        }
+        "plan" => {
+            if tail.is_empty() {
+                return Err(AppError::ValidationFailed);
+            }
+            Ok(CodexCommand::Plan {
+                instruction: tail.to_owned(),
+            })
+        }
+        "goal" => Ok(CodexCommand::Goal {
+            action: parse_goal_action(tail)?,
+        }),
         "sessions" => Ok(CodexCommand::Sessions {
-            project: parts
+            project: tail
+                .split_whitespace()
                 .next()
-                .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
         }),
-        "status" => parts
-            .next()
-            .filter(|value| !value.is_empty())
-            .map(|session_id| CodexCommand::Status {
-                session_id: session_id.to_owned(),
-            })
-            .ok_or(AppError::ValidationFailed),
-        "cancel" => parts
+        "status" => Ok(CodexCommand::Status {
+            session_id: tail
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        }),
+        "cancel" => tail
+            .split_whitespace()
             .next()
             .filter(|value| !value.is_empty())
             .map(|session_id| CodexCommand::Cancel {
@@ -2946,17 +3604,103 @@ pub fn parse_codex_command(text: &str) -> AppResult<CodexCommand> {
             })
             .ok_or(AppError::ValidationFailed),
         "continue" => {
-            let session_id = parts.next().unwrap_or_default().trim();
-            let instruction = parts.next().unwrap_or_default().trim();
-            if session_id.is_empty() || instruction.is_empty() {
-                return Err(AppError::ValidationFailed);
-            }
+            let (session_id, instruction) = split_required_project_instruction(tail)?;
             Ok(CodexCommand::Continue {
-                session_id: session_id.to_owned(),
-                instruction: instruction.to_owned(),
+                session_id,
+                instruction,
             })
         }
+        "resume" => tail
+            .split_whitespace()
+            .next()
+            .filter(|value| !value.is_empty())
+            .map(|session_id| CodexCommand::Resume {
+                session_id: session_id.to_owned(),
+            })
+            .ok_or(AppError::ValidationFailed),
+        "compact" => Ok(CodexCommand::Compact),
+        "review" => Ok(CodexCommand::Review),
+        "model" => Ok(CodexCommand::Model {
+            model: tail
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        }),
+        "permissions" => Ok(CodexCommand::Permissions {
+            policy: tail
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        }),
+        "memories" => Ok(CodexCommand::Memories {
+            action: tail
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_ascii_lowercase()),
+        }),
         _ => Err(AppError::ValidationFailed),
+    }
+}
+
+fn command_body(cleaned: &str) -> Option<&str> {
+    if let Some(rest) = cleaned.strip_prefix("/codex") {
+        let rest = rest.trim_start();
+        if let Some(encoded) = rest.strip_prefix("command:") {
+            return Some(encoded.trim_matches('"').trim());
+        }
+        return Some(rest.trim());
+    }
+    cleaned.strip_prefix('/').map(str::trim)
+}
+
+fn split_required_project_instruction(text: &str) -> AppResult<(String, String)> {
+    let mut parts = text.splitn(2, ' ');
+    let project = parts.next().unwrap_or_default().trim();
+    let instruction = parts.next().unwrap_or_default().trim();
+    if project.is_empty() || instruction.is_empty() {
+        return Err(AppError::ValidationFailed);
+    }
+    Ok((project.to_owned(), instruction.to_owned()))
+}
+
+fn split_optional_project_instruction(text: &str) -> AppResult<(Option<String>, String)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(AppError::ValidationFailed);
+    }
+    let mut parts = text.splitn(2, ' ');
+    let first = parts.next().unwrap_or_default().trim();
+    let rest = parts.next().unwrap_or_default().trim();
+    if rest.is_empty() {
+        Ok((None, first.to_owned()))
+    } else {
+        Ok((Some(first.to_owned()), rest.to_owned()))
+    }
+}
+
+fn parse_goal_action(text: &str) -> AppResult<GoalAction> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(GoalAction::View);
+    }
+    let mut parts = text.splitn(2, ' ');
+    let op = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    match op {
+        "edit" => {
+            if rest.is_empty() {
+                Err(AppError::ValidationFailed)
+            } else {
+                Ok(GoalAction::Edit(rest.to_owned()))
+            }
+        }
+        "pause" => Ok(GoalAction::Pause),
+        "resume" => Ok(GoalAction::Resume),
+        "clear" => Ok(GoalAction::Clear),
+        _ => Ok(GoalAction::Set(text.to_owned())),
     }
 }
 
@@ -2983,14 +3727,16 @@ fn incoming_message_intent(message: &IncomingMessage) -> Option<IncomingTextInte
     if trimmed.is_empty() && !has_images {
         return None;
     }
-    if trimmed.starts_with("/codex") {
+    if trimmed.starts_with("/codex")
+        || (message.chat_kind == IncomingChatKind::Direct && trimmed.starts_with('/'))
+    {
         return Some(IncomingTextIntent::Command(trimmed.to_owned()));
     }
 
     let (mentioned, after_mentions) = strip_leading_platform_mentions(trimmed);
     let mentioned = mentioned || message.addressed;
     let after_mentions = after_mentions.trim();
-    if mentioned && after_mentions.starts_with("/codex") {
+    if mentioned && after_mentions.starts_with('/') {
         return Some(IncomingTextIntent::Command(after_mentions.to_owned()));
     }
 
@@ -3323,6 +4069,172 @@ fn provider_label(provider: CollaborationProvider) -> &'static str {
     }
 }
 
+fn collaboration_context_scope_key(binding: &CollaborationProjectBinding) -> String {
+    let directory = fs::canonicalize(&binding.working_directory)
+        .unwrap_or_else(|_| PathBuf::from(&binding.working_directory))
+        .display()
+        .to_string();
+    format!(
+        "dir={directory}|target={}|profile={}|model={}",
+        binding.execution_target,
+        binding.profile_id.as_deref().unwrap_or(""),
+        binding.model_id.as_deref().unwrap_or("")
+    )
+}
+
+fn collaboration_context_id(scope_key: &str) -> String {
+    let digest = Sha256::digest(scope_key.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    format!("ctx-{hex}")
+}
+
+fn apply_context_snapshot(
+    binding: &mut CollaborationProjectBinding,
+    context: &CollaborationContextSummary,
+) {
+    binding.profile_id = context.profile_id.clone();
+    binding.profile_alias = context.profile_alias.clone();
+    binding.model_id = context.model_id.clone();
+}
+
+fn normalize_permissions_policy(policy: &str) -> AppResult<&'static str> {
+    match policy.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "ro" => Ok("read-only"),
+        "workspace-write" | "workspace" | "write" | "auto" => Ok("workspace-write"),
+        "danger-full-access" | "danger" | "full" | "full-access" => Ok("danger-full-access"),
+        _ => Err(AppError::ValidationFailed),
+    }
+}
+
+fn write_context_memory_config(home: &Path, enabled: bool) -> AppResult<()> {
+    fs::create_dir_all(home).map_err(|_| AppError::RuntimeUnavailable)?;
+    let path = home.join("config.toml");
+    let mut document = fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| content.parse::<DocumentMut>().ok())
+        .unwrap_or_default();
+    let features = document["features"].or_insert(Item::Table(Table::new()));
+    let features = features.as_table_like_mut().ok_or(AppError::Internal)?;
+    features.insert("goals", toml_value(true));
+    features.insert("memories", toml_value(true));
+    let memories = document["memories"].or_insert(Item::Table(Table::new()));
+    let memories = memories.as_table_like_mut().ok_or(AppError::Internal)?;
+    memories.insert("use_memories", toml_value(enabled));
+    memories.insert("generate_memories", toml_value(enabled));
+    fs::write(path, document.to_string()).map_err(|_| AppError::RuntimeUnavailable)
+}
+
+fn build_context_instruction(
+    context: &CollaborationContextSummary,
+    instruction: &str,
+    conversation_mode: &str,
+) -> String {
+    let mut parts = Vec::new();
+    if context.memory_enabled {
+        parts.push(
+            "协作上下文：启用 Codex memories；请复用该项目上下文中的长期偏好、决策和历史结论。"
+                .to_owned(),
+        );
+    }
+    if context.goal_status == "active" {
+        if let Some(goal) = context
+            .goal_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("当前长期目标：\n{goal}"));
+        }
+    }
+    match conversation_mode {
+        "plan" => parts.push("当前 turn 使用计划模式：先理解现状、提出可执行计划；除非用户要求实现，否则不要改文件。".to_owned()),
+        "compact" => parts.push("当前 turn 用于压缩上下文：输出可供后续继续执行的短摘要。".to_owned()),
+        "review" => parts.push("当前 turn 用于审查：聚焦风险、缺陷和测试缺口。".to_owned()),
+        _ => {}
+    }
+    parts.push(format!("用户任务：\n{}", instruction.trim()));
+    parts.join("\n\n")
+}
+
+fn plan_mode_instruction(instruction: &str) -> String {
+    format!(
+        "请进入 Codex 计划模式，为以下任务提出决策完整的执行计划。任务：\n{}",
+        instruction.trim()
+    )
+}
+
+fn format_context_status(context: &CollaborationContextSummary) -> String {
+    format!(
+        "Codex Relay 上下文 · {}\n项目：{} (`{}`)\n执行：{}\n记忆：{}\n权限：{}\n目标：{}\n当前 Codex session：{}\n当前 Relay turn：{}",
+        context.conversation_mode,
+        context.project_name,
+        context.project_slug,
+        context_execution_label(context),
+        if context.memory_enabled { "开启" } else { "关闭" },
+        context.permissions_policy,
+        context_goal_label(context),
+        context
+            .active_codex_session_id
+            .as_deref()
+            .map(short_id)
+            .unwrap_or_else(|| "暂无".to_owned()),
+        context
+            .active_relay_session_id
+            .as_deref()
+            .map(short_id)
+            .unwrap_or_else(|| "空闲".to_owned()),
+    )
+}
+
+fn format_context_goal_status(context: &CollaborationContextSummary) -> String {
+    format!("长期目标：{}", context_goal_label(context))
+}
+
+fn context_goal_label(context: &CollaborationContextSummary) -> String {
+    match context.goal_status.as_str() {
+        "active" => context
+            .goal_text
+            .as_deref()
+            .map(|text| format!("进行中 · {text}"))
+            .unwrap_or_else(|| "进行中".to_owned()),
+        "paused" => context
+            .goal_text
+            .as_deref()
+            .map(|text| format!("已暂停 · {text}"))
+            .unwrap_or_else(|| "已暂停".to_owned()),
+        _ => "未设置".to_owned(),
+    }
+}
+
+fn context_execution_label(context: &CollaborationContextSummary) -> String {
+    match context.execution_target.as_str() {
+        "gateway" => context
+            .model_id
+            .as_deref()
+            .map(|model| format!("API 网关 · {model}"))
+            .unwrap_or_else(|| "API 网关".to_owned()),
+        _ => context
+            .model_id
+            .as_deref()
+            .map(|model| format!("档案直连 · {model}"))
+            .unwrap_or_else(|| "档案直连".to_owned()),
+    }
+}
+
+fn binding_execution_label(binding: &CollaborationProjectBinding) -> String {
+    match binding.execution_target.as_str() {
+        "gateway" => binding
+            .model_id
+            .as_deref()
+            .map(|model| format!("API 网关 · {model}"))
+            .unwrap_or_else(|| "API 网关".to_owned()),
+        _ => "档案直连".to_owned(),
+    }
+}
+
 impl SessionLookupScope {
     fn new(provider: CollaborationProvider, bot_id: &str, chat_id: &str) -> Self {
         Self {
@@ -3382,13 +4294,6 @@ fn execution_from_binding(binding: &CollaborationProjectBinding) -> SessionExecu
     SessionExecution {
         target: binding.execution_target.clone(),
         model_id: binding.model_id.clone(),
-    }
-}
-
-fn execution_from_session(session: &CodexSessionSummary) -> SessionExecution {
-    SessionExecution {
-        target: session.execution_target.clone(),
-        model_id: session.model_id.clone(),
     }
 }
 
@@ -3492,32 +4397,36 @@ fn codex_command_args(
     codex_session_id: Option<&str>,
     output_file: &Path,
     images: &[PathBuf],
+    model: Option<&str>,
+    permissions_policy: &str,
 ) -> AppResult<Vec<String>> {
-    let mut args = Vec::new();
+    let mut args = vec!["exec".to_owned()];
     if resume {
-        let codex_id = codex_session_id.ok_or(AppError::ValidationFailed)?;
-        for arg in CODEX_RESUME_ARGS {
-            match arg {
-                "__OUTPUT__" => args.push(output_file.display().to_string()),
-                "__SESSION__" => {
-                    push_image_args(&mut args, images);
-                    args.push(codex_id.to_owned());
-                }
-                other => args.push(other.to_owned()),
-            }
-        }
-    } else {
-        for arg in CODEX_SESSION_ARGS {
-            match arg {
-                "__OUTPUT__" => {
-                    args.push(output_file.display().to_string());
-                    push_image_args(&mut args, images);
-                    args.push("-".to_owned());
-                }
-                other => args.push(other.to_owned()),
-            }
-        }
+        args.push("resume".to_owned());
     }
+    args.push("--json".to_owned());
+    args.push("--output-last-message".to_owned());
+    args.push(output_file.display().to_string());
+    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--model".to_owned());
+        args.push(model.to_owned());
+    }
+    if resume {
+        args.push("-c".to_owned());
+        args.push(format!("sandbox_mode=\"{}\"", permissions_policy));
+    } else {
+        args.push("--sandbox".to_owned());
+        args.push(permissions_policy.to_owned());
+    }
+    push_image_args(&mut args, images);
+    if resume {
+        args.push(
+            codex_session_id
+                .ok_or(AppError::ValidationFailed)?
+                .to_owned(),
+        );
+    }
+    args.push("-".to_owned());
     Ok(args)
 }
 
@@ -3733,13 +4642,22 @@ fn help_text(provider: CollaborationProvider) -> String {
     };
     [
         prefix,
-        "/codex projects — 查看当前会话已绑定项目",
-        "/codex run <project> <任务说明> — 启动任务",
-        "/codex sessions [project] — 查看最近会话",
-        "/codex status <session_id> — 查看状态",
-        "/codex cancel <session_id> — 取消任务",
-        "/codex continue <session_id> <追加说明> — 继续会话",
         "/codex bind <code> — 绑定客户端生成的项目码",
+        "/codex projects — 查看当前会话已绑定项目",
+        "@机器人 <自然语言> — 首次创建项目共享上下文，后续续接同一 Codex context",
+        "/codex new [project] <任务说明> — 创建并切换新的 Codex 会话",
+        "/codex plan <任务说明> — 使用计划模式执行一个 turn",
+        "/codex goal <objective|edit|pause|resume|clear> — 设置或管理长期目标",
+        "/codex memories on|off|status — 开关或查看长期记忆",
+        "/codex model [model] — 查看或切换上下文默认模型",
+        "/codex permissions [read-only|workspace-write|danger-full-access] — 查看或切换权限策略",
+        "/codex status [session_id] — 查看上下文或会话状态",
+        "/codex resume <session_id> — 切换 active Codex session",
+        "/codex compact — 压缩当前上下文",
+        "/codex review — 审查当前项目改动",
+        "/codex sessions [project] — 查看最近会话",
+        "/codex cancel <session_id> — 取消任务",
+        "/codex continue <session_id> <追加说明> — 兼容旧式继续会话",
     ]
     .join("\n")
 }
@@ -4165,10 +5083,10 @@ mod tests {
         incoming_text_intent, parse_codex_command, parse_session_action_data, qq_images,
         required_secret_keys, session_action_from_value, session_card, telegram_images,
         telegram_session_reply_markup, timestamp_ms, validate_gateway_model, wecom_images_from_xml,
-        write_gateway_config_to_home, write_gateway_session_files_to_home, CodexCommand,
-        CollaborationManager, IncomingChatKind, IncomingImage, IncomingImageSource,
-        IncomingMessage, IncomingTextIntent, NaturalRunResolution, SessionLookupScope,
-        COLLABORATION_MODEL_CATALOG_FILENAME,
+        write_context_memory_config, write_gateway_config_to_home,
+        write_gateway_session_files_to_home, CodexCommand, CollaborationManager, GoalAction,
+        IncomingChatKind, IncomingImage, IncomingImageSource, IncomingMessage, IncomingTextIntent,
+        NaturalRunResolution, SessionLookupScope, COLLABORATION_MODEL_CATALOG_FILENAME,
     };
     use crate::{
         database::{Repository, StoredCodexSession, StoredCollaborationBot, StoredProfile},
@@ -4333,6 +5251,53 @@ mod tests {
     #[test]
     fn rejects_missing_task_body() {
         assert!(parse_codex_command("/codex run relay").is_err());
+    }
+    #[test]
+    fn parses_context_command_mapping() {
+        assert_eq!(
+            parse_codex_command("/plan 拆解发布检查").unwrap(),
+            CodexCommand::Plan {
+                instruction: "拆解发布检查".into()
+            }
+        );
+        assert_eq!(
+            parse_codex_command("/codex goal 完成 beta 发布").unwrap(),
+            CodexCommand::Goal {
+                action: GoalAction::Set("完成 beta 发布".into())
+            }
+        );
+        assert_eq!(
+            parse_codex_command(r#"/codex command:"memories off""#).unwrap(),
+            CodexCommand::Memories {
+                action: Some("off".into())
+            }
+        );
+        assert_eq!(
+            parse_codex_command("/codex status").unwrap(),
+            CodexCommand::Status { session_id: None }
+        );
+        assert_eq!(
+            parse_codex_command("/codex permissions danger-full-access").unwrap(),
+            CodexCommand::Permissions {
+                policy: Some("danger-full-access".into())
+            }
+        );
+    }
+
+    #[test]
+    fn context_memory_config_writes_codex_toml_flags() {
+        let root =
+            std::env::temp_dir().join(format!("codex-relay-context-memory-{}", Uuid::new_v4()));
+        write_context_memory_config(&root, true).unwrap();
+        let config = fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(config.contains(r#"memories = true"#));
+        assert!(config.contains(r#"use_memories = true"#));
+        assert!(config.contains(r#"generate_memories = true"#));
+        write_context_memory_config(&root, false).unwrap();
+        let config = fs::read_to_string(root.join("config.toml")).unwrap();
+        assert!(config.contains(r#"use_memories = false"#));
+        assert!(config.contains(r#"generate_memories = false"#));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -4500,14 +5465,14 @@ mod tests {
         let images = vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.jpg")];
 
         assert_eq!(
-            codex_command_args(false, None, &output, &images).unwrap(),
+            codex_command_args(false, None, &output, &images, None, "workspace-write").unwrap(),
             vec![
                 "exec",
                 "--json",
-                "--sandbox",
-                "workspace-write",
                 "--output-last-message",
                 "/tmp/last-message.txt",
+                "--sandbox",
+                "workspace-write",
                 "--image",
                 "/tmp/a.png",
                 "--image",
@@ -4516,13 +5481,25 @@ mod tests {
             ]
         );
         assert_eq!(
-            codex_command_args(true, Some("codex-session-1"), &output, &images).unwrap(),
+            codex_command_args(
+                true,
+                Some("codex-session-1"),
+                &output,
+                &images,
+                Some("gpt-5.1-codex"),
+                "danger-full-access",
+            )
+            .unwrap(),
             vec![
                 "exec",
                 "resume",
                 "--json",
                 "--output-last-message",
                 "/tmp/last-message.txt",
+                "--model",
+                "gpt-5.1-codex",
+                "-c",
+                "sandbox_mode=\"danger-full-access\"",
                 "--image",
                 "/tmp/a.png",
                 "--image",
@@ -4614,7 +5591,6 @@ mod tests {
                 CollaborationProvider::Feishu,
                 "bot-1",
                 "chat-1",
-                Some("sender-1"),
                 "修复测试".into(),
                 false,
             )
@@ -4623,11 +5599,11 @@ mod tests {
             NaturalRunResolution::Ready {
                 binding,
                 instruction,
-                resume_session,
+                force_new,
             } => {
                 assert_eq!(binding.id, "binding-1");
                 assert_eq!(instruction, "修复测试");
-                assert!(resume_session.is_none());
+                assert!(!force_new);
             }
             NaturalRunResolution::Message(message) => {
                 panic!("single binding should resolve, got {message}");
@@ -4640,7 +5616,6 @@ mod tests {
                 CollaborationProvider::Feishu,
                 "bot-1",
                 "chat-1",
-                Some("sender-1"),
                 "继续整理".into(),
                 false,
             )
@@ -4678,7 +5653,6 @@ mod tests {
                 CollaborationProvider::Feishu,
                 "bot-1",
                 "chat-1",
-                Some("sender-1"),
                 "概述一下项目".into(),
                 false,
             )
@@ -4687,11 +5661,11 @@ mod tests {
             NaturalRunResolution::Ready {
                 binding,
                 instruction,
-                resume_session,
+                force_new,
             } => {
                 assert_eq!(binding.id, "binding-1");
                 assert_eq!(instruction, "概述一下项目");
-                assert!(resume_session.is_none());
+                assert!(!force_new);
             }
             NaturalRunResolution::Message(message) => {
                 panic!("broken resume history should not block natural task, got {message}");
@@ -4702,41 +5676,43 @@ mod tests {
     }
 
     #[test]
-    fn natural_tasks_resume_recent_same_sender_session_and_force_new_skips_resume() {
+    fn natural_tasks_reuse_chat_context_and_force_new_marks_next_turn() {
         let repository = Arc::new(Repository::memory());
         insert_profile(&repository);
         insert_bot(&repository);
         insert_binding(&repository, "binding-1", "Relay", "relay");
-        insert_session(
-            &repository,
-            "session-recent",
-            "binding-1",
-            Some("sender-1"),
-            timestamp_ms() - 10_000,
-            "completed",
-            Some("codex-existing"),
-        );
-        let manager = manager(repository);
+        let manager = manager(repository.clone());
+        let binding = repository
+            .collaboration_project_binding("binding-1")
+            .unwrap();
+        let context = manager.ensure_context_for_binding(&binding).unwrap();
+        repository
+            .set_collaboration_chat_context(
+                CollaborationProvider::Feishu,
+                "bot-1",
+                "chat-1",
+                &context.id,
+            )
+            .unwrap();
 
         match manager
             .resolve_natural_run(
                 CollaborationProvider::Feishu,
                 "bot-1",
                 "chat-1",
-                Some("sender-1"),
                 "继续修复".into(),
                 false,
             )
             .unwrap()
         {
-            NaturalRunResolution::Ready { resume_session, .. } => assert_eq!(
-                resume_session
-                    .and_then(|session| session.codex_session_id.clone())
-                    .as_deref(),
-                Some("codex-existing")
-            ),
+            NaturalRunResolution::Ready {
+                binding, force_new, ..
+            } => {
+                assert_eq!(binding.id, "binding-1");
+                assert!(!force_new);
+            }
             NaturalRunResolution::Message(message) => {
-                panic!("recent session should resolve, got {message}");
+                panic!("chat context should resolve binding, got {message}");
             }
         }
 
@@ -4745,14 +5721,16 @@ mod tests {
                 CollaborationProvider::Feishu,
                 "bot-1",
                 "chat-1",
-                Some("sender-1"),
                 "重新做".into(),
                 true,
             )
             .unwrap()
         {
-            NaturalRunResolution::Ready { resume_session, .. } => {
-                assert!(resume_session.is_none())
+            NaturalRunResolution::Ready {
+                binding, force_new, ..
+            } => {
+                assert_eq!(binding.id, "binding-1");
+                assert!(force_new);
             }
             NaturalRunResolution::Message(message) => {
                 panic!("force-new task should still resolve binding, got {message}");
@@ -5380,6 +6358,7 @@ mod tests {
                 session: CodexSessionSummary {
                     id: seed.id.into(),
                     binding_id: seed.binding_id.into(),
+                    context_id: None,
                     provider: CollaborationProvider::Feishu,
                     provider_bot_id: Some("bot-1".into()),
                     provider_chat_id: Some(seed.chat_id.into()),
@@ -5400,6 +6379,9 @@ mod tests {
                     last_error: None,
                     execution_target: "profile".into(),
                     model_id: None,
+                    turn_kind: "run".into(),
+                    conversation_mode: "default".into(),
+                    goal_status: None,
                 },
                 working_directory: "/tmp".into(),
             })

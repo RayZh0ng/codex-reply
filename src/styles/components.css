@@ -1414,6 +1414,11 @@
   display: grid;
   gap: 4px;
 }
+.key-list .key-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 .key-list strong {
   color: #435269;
   font-size: 12px;
@@ -4123,6 +4128,11 @@ input[type="number"]::-webkit-outer-spin-button {
   flex-wrap: wrap;
   justify-content: flex-end;
   margin-left: auto;
+}
+
+.collaboration-page .stacked-actions {
+  align-items: flex-end;
+  flex-direction: column;
 }
 
 .binding-facts {

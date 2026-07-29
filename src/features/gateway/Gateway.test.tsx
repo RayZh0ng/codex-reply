@@ -26,6 +26,8 @@ vi.mock("../../shared/ipc", () => ({
       oauth_profile_options: [],
     }),
     createClientKey: vi.fn(),
+    revealClientKey: vi.fn(),
+    rotateClientKey: vi.fn(),
     revokeClientKey: vi.fn(),
     exportGatewayCa: vi.fn(),
     trustGatewayCa: vi.fn(),
@@ -213,6 +215,76 @@ describe("Gateway", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("option", { name: /JSON 导入账号/ })).toHaveAttribute(
       "data-disabled",
+    );
+  });
+
+  it("reveals and rotates user-managed client keys", async () => {
+    const userKey = {
+      id: "user",
+      name: "Alice 的 Mac",
+      masked_value: "crl_••••user",
+      created_at_ms: 2,
+      last_used_at_ms: null,
+      revoked: false,
+      managed_by: "user" as const,
+      can_revoke: true,
+    };
+    vi.mocked(api.listClientKeys).mockResolvedValue([userKey]);
+    vi.mocked(api.revealClientKey).mockResolvedValue("crl_plain_user");
+    vi.mocked(api.rotateClientKey).mockResolvedValue({
+      key: { ...userKey, masked_value: "crl_••••next" },
+      plaintext_once: "crl_plain_next",
+    });
+    const { onRefresh } = renderGateway({ available_profiles: 1 });
+
+    fireEvent.click(await screen.findByRole("button", { name: "查看 Alice 的 Mac" }));
+
+    await waitFor(() => expect(api.revealClientKey).toHaveBeenCalledWith("user"));
+    expect(await screen.findByText("crl_plain_user")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "我已安全保存" }));
+    fireEvent.click(screen.getByRole("button", { name: "轮换 Alice 的 Mac" }));
+
+    await waitFor(() => expect(api.rotateClientKey).toHaveBeenCalledWith("user"));
+    expect(await screen.findByText("crl_plain_next")).toBeInTheDocument();
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledOnce());
+  });
+
+  it("saves loopback mode without LAN address or CIDR", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Gateway
+        gateway={{
+          ...gateway,
+          running: false,
+          bind_mode: "loopback",
+          bind_address: "127.0.0.1",
+          service_url: "https://127.0.0.1:53765",
+        }}
+        busy={false}
+        onSave={onSave}
+        onStart={vi.fn().mockResolvedValue(undefined)}
+        onStop={vi.fn().mockResolvedValue(undefined)}
+        onNotice={vi.fn()}
+        onNavigateProfiles={vi.fn()}
+        onRefresh={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("combobox", { name: "检测到的局域网地址" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "保存配置" }));
+
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          bind_mode: "loopback",
+          bind_address: "127.0.0.1",
+          cidrs: [],
+          confirmed_lan: false,
+        }),
+      ),
     );
   });
 

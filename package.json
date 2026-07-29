@@ -1,7 +1,7 @@
 {
   "name": "codex-relay",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "type": "module",
   "packageManager": "pnpm@10.14.0",
   "engines": {
@@ -69,5 +69,6 @@
     ],
     "*.{css,json,md,yml,yaml}": "prettier --write",
     "*.rs": "rustfmt --edition 2021"
-  }
+  },
+  "license": "MIT"
 }

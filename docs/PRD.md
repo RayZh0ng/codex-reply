@@ -3,8 +3,8 @@
 | 项目     | 内容                        |
 | -------- | --------------------------- |
 | 状态     | Draft                       |
-| 版本     | 0.1                         |
-| 更新日期 | 2026-07-22                  |
+| 版本     | 0.2 beta                    |
+| 更新日期 | 2026-07-29                  |
 | 产品形态 | 本机优先的 Tauri 2 桌面应用 |
 
 ## 1. 背景与目标
@@ -67,7 +67,7 @@ Codex Relay 帮助个人开发者和小团队在一台本机上管理多个 Code
 
 ### 3.3 网关服务
 
-- 服务控制页提供启动/停止、监听状态、绑定地址、端口、局域网开关、CIDR、客户端 Key 管理和健康摘要。
+- 服务控制页提供启动/停止、监听状态、loopback/LAN 监听模式、绑定地址、端口、CIDR、客户端 Key 管理和健康摘要。
 - 已生成的客户端 Key 提供创建、查看、轮换和撤销能力。
 
 ### 3.4 协作入口
@@ -106,40 +106,61 @@ Codex Relay 帮助个人开发者和小团队在一台本机上管理多个 Code
 - 先按优先级选择候选集合，再优先使用额度新鲜且未耗尽的成员，并在同一额度层内执行平滑加权轮换；额度缺失或过期成员作为后备。
 - 上游临时失败时，成员进入冷却，并可切换到下一合格成员重试。
 - OAuth 上游 401 时刷新凭据并重试当前成员一次；429、5xx 与网络错误只允许在响应首字节前切换成员。Responses 的 `previous_response_id` 必须保持原档案亲和。
+- API Key 上游 401/403 时标记档案 unhealthy 并尝试下一候选；429、5xx 与首字节前超时进入冷却并尝试下一候选。Dispatcher 必须遍历全部合格候选；SSE 已输出首字节后中断时不再切换成员，而是输出对应失败事件并记录最近上游错误。
 - JSON 导入的 OAuth 账号可作为反代账号池成员参与路由，但不得作为 Codex 网关切换中的 OAuth 登录态解锁档案；相关下拉项必须禁用并说明原因。
-- 无合格成员时返回服务不可用错误。
+- 无本地模型返回 404；候选全部处于冷却/额度耗尽返回 503；全部上游候选失败返回 502。
 
 ### 4.3 网关 API
 
 | 接口                        | 行为                                                                                                 |
 | --------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `GET /healthz`              | 返回服务状态。                                                                                       |
+| `GET /healthz`              | 返回 `status`、运行状态、冷却数、证书状态、Client Key 数、provider/surface 模型聚合和最近上游错误。  |
 | `GET /v1/models`            | 返回账号池可提供的模型标识。                                                                         |
-| `POST /v1/responses`        | 接受最小 OpenAI Responses 字段，路由到合格成员并透传 SSE。                                           |
-| `POST /v1/chat/completions` | 接受文本消息与 function tools，路由到合格成员并支持流式与非流式；OAuth 上游通过 Responses 事件转换。 |
+| `POST /v1/responses`        | 接受 OpenAI Responses 字段，路由到合格成员；OpenAI direct 透传，Chat/Provider 上游通过适配层转换。   |
+| `POST /v1/chat/completions` | 接受文本、图片、function tools/tool results，支持流式与非流式；adapter provider 支持 `n>1` fan-out。 |
 
-### 4.4 协作命令与卡片回传
+兼容层要求：
 
-MVP 提供五个平台通用的协作命令和会话状态回传。
+- OpenAI / OpenAI-compatible direct 在 wire API 匹配时完整透传，并将响应中的上游模型名回写为用户请求的可见模型名。
+- Codex OAuth 通过 Responses 上游服务 `/v1/responses`，并与 `/v1/chat/completions` 互转文本、function tools、usage 和 SSE 事件。
+- Anthropic 通过 Messages API 映射 system/messages/content blocks、function tools、tool_use/tool_result、usage 与 Messages SSE。
+- Gemini 使用当前 v1beta `generateContent` / `streamGenerateContent` 路径，映射 `contents/parts`、`systemInstruction`、function declarations、JSON schema、usageMetadata 和 SSE。
+- Ollama 的 OpenAI Chat/Responses 统一落到 `/api/chat`，保留 native `/api/generate`；映射 `tools`、`format`、`options`、`think`、usage 和 newline JSON streaming。
+- 非 OpenAI adapter 对没有等价能力的 `audio`、`logprobs`、`top_logprobs` 在请求前返回 OpenAI 风格 `unsupported_parameter`。
 
-| 命令                                      | 行为                 |
-| ----------------------------------------- | -------------------- |
-| `/codex help`                             | 查看帮助             |
-| `/codex bind <code>`                      | 将项目绑定到当前群   |
-| `/codex projects`                         | 查看当前群已绑定项目 |
-| `/codex run <project> <任务说明>`         | 启动 Codex 会话      |
-| `/codex sessions [project]`               | 查看最近会话         |
-| `/codex status <session_id>`              | 查看会话状态         |
-| `/codex cancel <session_id>`              | 取消运行中会话       |
-| `/codex continue <session_id> <追加说明>` | 继续已有 Codex 会话  |
+### 4.4 协作命令、上下文与卡片回传
 
-会话卡片展示项目名、会话 ID、状态、发起人、开始时间和最终摘要；不展示密钥、绝对路径或完整任务正文。
+v0.2 beta 提供五个平台通用的协作命令、项目共享上下文和会话状态回传。首次 @ 机器人时创建项目共享上下文；后续自然对话复用同一 active Codex session；只有显式 `/codex new`、`新会话`、`新任务` 创建并切换新会话。
+
+| 命令                                      | 行为                                       |
+| ----------------------------------------- | ------------------------------------------ |
+| `/codex help`                             | 查看帮助                                   |
+| `/codex bind <code>`                      | 将项目绑定到当前群                         |
+| `/codex projects`                         | 查看当前群已绑定项目                       |
+| `@机器人 <自然语言>`                      | 首次创建项目共享上下文，后续续接同一上下文 |
+| `/codex new [project] <任务说明>`         | 创建并切换新的 Codex 会话                  |
+| `/codex plan <任务说明>`                  | 以计划模式提示词执行一个 turn              |
+| `/codex goal <objective                   | edit                                       | pause   | resume                           | clear>` | 持久化并管理长期目标 |
+| `/codex memories on                       | off                                        | status` | 更新或查看 context memories 配置 |
+| `/codex model [model]`                    | 查看或切换上下文默认模型                   |
+| `/codex permissions [policy]`             | 查看或切换权限策略                         |
+| `/codex status [session_id]`              | 查看上下文或指定会话状态                   |
+| `/codex resume <session_id>`              | 切换 active Codex session                  |
+| `/codex compact`                          | 压缩当前上下文                             |
+| `/codex review`                           | 审查当前项目改动                           |
+| `/codex sessions [project]`               | 查看最近会话                               |
+| `/codex cancel <session_id>`              | 取消运行中会话                             |
+| `/codex continue <session_id> <追加说明>` | 兼容旧式按会话继续                         |
+
+会话卡片展示项目名、会话 ID、上下文 ID、模式、目标状态、执行方式、状态、发起人、开始时间和最终摘要；不展示密钥、绝对路径或完整任务正文。
 
 ## 5. 数据与运行时
 
 - 档案保存账号信息、能力、状态和账号池策略；协作机器人密钥只存本地加密凭据库。
 - JSON 导入预览在 Rust 内存中最多保留 15 分钟；取消、完成、过期和应用启动清理时均销毁预览与临时验证目录。
 - 网关保存请求统计、延迟、健康和冷却状态。
+- 协作上下文保存项目全局 scope、稳定 `CODEX_HOME`、active Codex session、memory 开关、goal 状态、model/permissions 快照；群/频道/私聊通过 `collaboration_chat_state` 指向当前 context。
+- 每次 Codex turn 的附件和 `last-message.txt` 放入 per-run 目录，同一 context 同时只允许一个 turn 运行。
 - 当前档案切换可更新默认 Codex 运行目录、认证数据和桌面端运行状态。
 - 应用支持管理本地 Codex 运行目录、任务进程和 OAuth 回调。
 
@@ -152,7 +173,7 @@ MVP 提供五个平台通用的协作命令和会话状态回传。
 3. 网关完成 `/v1/models`、`/v1/responses` 与 `/v1/chat/completions` 调用。
 4. 多成员池按优先级和权重路由；成员失败时其他成员继续服务。
 5. 状态统计反映本产品网关处理的请求。
-6. 飞书、QQ、企业微信、Discord、Telegram 协作机器人可完成配置、项目绑定、会话绑定和会话创建。
+6. 飞书、QQ、企业微信、Discord、Telegram 协作机器人可完成配置、项目绑定、会话绑定和项目共享上下文会话创建。
 
 ### 6.2 实施验证门槛
 
@@ -165,7 +186,7 @@ MVP 提供五个平台通用的协作命令和会话状态回传。
 
 ### 7.1 后续阶段
 
-- 评估更完整的 Responses、Anthropic Messages、Gemini 与 Ollama 适配器。
+- 跟进 Gemini 官方新一代交互接口，评估是否从当前 v1beta generateContent 体系迁移。
 - 扩展更多通讯软件协作连接器，并深化现有平台的富卡片/权限能力。
 - 评估更细粒度的 API Key 用量、模型能力和用量展示。
 
