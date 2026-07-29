@@ -22,7 +22,7 @@ jobs:
       prerelease: ${{ steps.channel.outputs.prerelease }}
       manifest_name: ${{ steps.channel.outputs.manifest_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: channel
         name: Validate tag and select channel
         run: node scripts/resolve-release-channel.mjs "${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
@@ -48,7 +48,7 @@ jobs:
             platform: ubuntu-22.04
             args: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
