@@ -114,6 +114,25 @@ export function Gateway({
     setKeyName("");
     await reloadGatewayState();
   };
+  const revealKey = async (key: MaskedClientKey) => {
+    try {
+      const plaintext = await api.revealClientKey(key.id);
+      setNewKey({ key, plaintext_once: plaintext });
+      onNotice("客户端 Key 已显示，请只复制到受信任客户端。");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "客户端 Key 无法显示。");
+    }
+  };
+  const rotateKey = async (id: string) => {
+    try {
+      const rotated = await api.rotateClientKey(id);
+      setNewKey(rotated);
+      await reloadGatewayState();
+      onNotice("客户端 Key 已轮换，旧 Key 立即失效。");
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "客户端 Key 轮换未完成。");
+    }
+  };
   const revoke = async (id: string) => {
     await api.revokeClientKey(id);
     await reloadGatewayState();
@@ -179,9 +198,10 @@ export function Gateway({
       <header className="page-heading" data-animate="heading">
         <div>
           <p className="section-kicker">Gateway</p>
-          <h1>局域网 API 网关</h1>
+          <h1>本机 / 局域网 API 网关</h1>
           <p className="page-subtitle">
-            所有入口均使用 HTTPS。服务只绑定已检测的私有网络地址，始终需要客户端 Key。
+            所有入口均使用 HTTPS。可限制为
+            127.0.0.1，也可绑定检测到的私有局域网地址；始终需要客户端 Key。
           </p>
           <div className="gateway-heading-meta">
             <code>{gateway.service_url}</code>
@@ -251,7 +271,11 @@ export function Gateway({
               </li>
               <li>
                 <span>监听范围</span>
-                <strong>局域网 · {gateway.bind_address}</strong>
+                <strong>
+                  {gateway.bind_mode === "loopback"
+                    ? "仅本机 · 127.0.0.1"
+                    : `局域网 · ${gateway.bind_address}`}
+                </strong>
               </li>
               <li>
                 <span>客户端鉴权</span>
@@ -382,14 +406,32 @@ export function Gateway({
                       <span>{key.masked_value}</span>
                     </div>
                     {key.can_revoke && (
-                      <button
-                        className="icon-button danger"
-                        type="button"
-                        aria-label={`撤销 ${key.name}`}
-                        onClick={() => void revoke(key.id)}
-                      >
-                        <Trash size={17} />
-                      </button>
+                      <div className="key-actions">
+                        <button
+                          className="quiet-button compact-action"
+                          type="button"
+                          aria-label={`查看 ${key.name}`}
+                          onClick={() => void revealKey(key)}
+                        >
+                          查看
+                        </button>
+                        <button
+                          className="quiet-button compact-action"
+                          type="button"
+                          aria-label={`轮换 ${key.name}`}
+                          onClick={() => void rotateKey(key.id)}
+                        >
+                          轮换
+                        </button>
+                        <button
+                          className="icon-button danger"
+                          type="button"
+                          aria-label={`撤销 ${key.name}`}
+                          onClick={() => void revoke(key.id)}
+                        >
+                          <Trash size={17} />
+                        </button>
+                      </div>
                     )}
                   </li>
                 ))}
@@ -417,6 +459,7 @@ function GatewayStatusSummary({ gateway }: { gateway: GatewayStatus }) {
         <span className="gateway-status-meta">
           {gateway.available_profiles} 个账号池成员
         </span>
+        <span className="gateway-status-meta">{gateway.cooling_profiles} 个冷却中</span>
         <span className="gateway-status-meta">
           {gateway.client_key_count} 个客户端 Key
         </span>
@@ -437,6 +480,9 @@ function GatewayForm({
   busy: boolean;
   onSave: (input: Record<string, unknown>) => Promise<void>;
 }) {
+  const [bindMode, setBindMode] = useState<GatewayStatus["bind_mode"]>(
+    gateway.bind_mode,
+  );
   const [address, setAddress] = useState(gateway.bind_address);
   const [port, setPort] = useState(String(gateway.port));
   const [cidrs, setCidrs] = useState(gateway.cidrs.join(", "));
@@ -450,6 +496,7 @@ function GatewayForm({
       : (gateway.available_addresses.find((candidate) => candidate.is_default)
           ?.address ?? gateway.bind_address);
     setAddress(selected);
+    setBindMode(gateway.bind_mode);
     setPort(String(gateway.port));
     setCidrs(gateway.cidrs.join(", "));
     setProxyMode(gateway.upstream_proxy_mode);
@@ -458,14 +505,17 @@ function GatewayForm({
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     await onSave({
-      bind_mode: "lan",
-      bind_address: address,
+      bind_mode: bindMode,
+      bind_address: bindMode === "loopback" ? "127.0.0.1" : address,
       port: Number(port),
-      cidrs: cidrs
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean),
-      confirmed_lan: true,
+      cidrs:
+        bindMode === "loopback"
+          ? []
+          : cidrs
+              .split(",")
+              .map((item) => item.trim())
+              .filter(Boolean),
+      confirmed_lan: bindMode === "lan",
       upstream_proxy_mode: proxyMode,
       upstream_proxy_url:
         proxyMode === "manual" && proxyUrl.trim() ? proxyUrl.trim() : null,
@@ -494,15 +544,29 @@ function GatewayForm({
         <LockKey size={23} weight="duotone" />
       </div>
       <label>
-        检测到的局域网地址
+        监听模式
         <Select
-          ariaLabel="检测到的局域网地址"
-          onValueChange={setAddress}
-          options={addressOptions}
-          placeholder="等待检测局域网地址"
-          value={address}
+          ariaLabel="监听模式"
+          onValueChange={(value) => setBindMode(value as GatewayStatus["bind_mode"])}
+          options={[
+            { value: "loopback", label: "仅本机 · 127.0.0.1" },
+            { value: "lan", label: "局域网设备" },
+          ]}
+          value={bindMode}
         />
       </label>
+      {bindMode === "lan" && (
+        <label>
+          检测到的局域网地址
+          <Select
+            ariaLabel="检测到的局域网地址"
+            onValueChange={setAddress}
+            options={addressOptions}
+            placeholder="等待检测局域网地址"
+            value={address}
+          />
+        </label>
+      )}
       <label>
         服务端口
         <input
@@ -511,14 +575,16 @@ function GatewayForm({
           inputMode="numeric"
         />
       </label>
-      <label>
-        允许的 CIDR（可选）
-        <input
-          value={cidrs}
-          onChange={(event) => setCidrs(event.target.value)}
-          placeholder="留空允许局域网设备；例如：192.168.1.0/24"
-        />
-      </label>
+      {bindMode === "lan" && (
+        <label>
+          允许的 CIDR（可选）
+          <input
+            value={cidrs}
+            onChange={(event) => setCidrs(event.target.value)}
+            placeholder="留空允许局域网设备；例如：192.168.1.0/24"
+          />
+        </label>
+      )}
       <label>
         上游代理
         <Select
@@ -557,8 +623,9 @@ function GatewayForm({
       <div className="config-note">
         <ShieldCheck size={19} weight="fill" />
         <p>
-          留空 CIDR 时，监听网段内任意设备都可连接；每个请求仍必须携带 Relay Client
-          Key。
+          {bindMode === "loopback"
+            ? "仅本机模式只接受 127.0.0.1 访问；每个请求仍必须携带 Relay Client Key。"
+            : "留空 CIDR 时，监听网段内任意设备都可连接；每个请求仍必须携带 Relay Client Key。"}
         </p>
       </div>
       <div className="form-actions">
@@ -588,11 +655,12 @@ function SecretOnce({
     <section className="secret-once" role="status">
       <div>
         <span className="status-pill warning">
-          <i /> 仅显示一次
+          <i /> 敏感凭据
         </span>
-        <h2>{name} 已创建</h2>
+        <h2>{name} 的 Client Key</h2>
         <p>
-          请使用受信任的密码管理器手动保存此值。关闭后不能再次查看原始值，应用不会写入剪贴板。
+          请使用受信任的密码管理器手动保存此值。用户管理的 Key
+          可在确认后再次查看或轮换，应用不会写入剪贴板。
         </p>
         <code>{value}</code>
       </div>

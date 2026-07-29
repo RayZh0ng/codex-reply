@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Collaboration } from "./Collaboration";
 import type {
   CodexSessionSummary,
+  CollaborationContextSummary,
   CollaborationProjectBinding,
   MaskedCollaborationBot,
   MaskedProfile,
@@ -67,6 +68,7 @@ const longBinding: CollaborationProjectBinding = {
 const longSession: CodexSessionSummary = {
   id: "session-long-1234567890",
   binding_id: "binding-long",
+  context_id: "ctx-long-1234567890",
   provider: "feishu",
   provider_bot_id: "bot-1",
   provider_chat_id: "chat-1",
@@ -88,6 +90,36 @@ const longSession: CodexSessionSummary = {
   last_error: null,
   execution_target: "profile",
   model_id: null,
+  turn_kind: "natural",
+  conversation_mode: "default",
+  goal_status: "active",
+};
+
+const longContext: CollaborationContextSummary = {
+  id: "ctx-long-1234567890",
+  scope_key:
+    "dir=/private/workspace/that/should/not/render|target=profile|profile=profile-1|model=",
+  binding_id: longBinding.id,
+  provider: "feishu",
+  bot_id: "bot-1",
+  bot_name: bot.name,
+  project_name: longBinding.project_name,
+  project_slug: longBinding.project_slug,
+  working_directory: longBinding.working_directory,
+  execution_target: "profile",
+  profile_id: "profile-1",
+  profile_alias: longBinding.profile_alias,
+  model_id: null,
+  memory_enabled: true,
+  permissions_policy: "workspace-write",
+  active_codex_session_id: "codex-session-long-1234567890",
+  active_relay_session_id: null,
+  goal_status: "active",
+  goal_text: "完成 beta 发布",
+  conversation_mode: "default",
+  last_turn_at_ms: 2,
+  created_at_ms: 1,
+  updated_at_ms: 2,
 };
 
 const handlers = () => ({
@@ -104,6 +136,8 @@ const handlers = () => ({
   }),
   onCancelSession: vi.fn().mockResolvedValue(undefined),
   onContinueSession: vi.fn().mockResolvedValue(undefined),
+  onUpdateContext: vi.fn().mockResolvedValue(undefined),
+  onResetContext: vi.fn().mockResolvedValue(undefined),
   onRefresh: vi.fn().mockResolvedValue(undefined),
 });
 
@@ -121,6 +155,7 @@ describe("Collaboration", () => {
         bots={[]}
         bindings={[]}
         sessions={[]}
+        contexts={[]}
         profiles={[]}
         gatewayModelOptions={[]}
         busy={false}
@@ -151,6 +186,7 @@ describe("Collaboration", () => {
         bots={[bot]}
         bindings={[]}
         sessions={[]}
+        contexts={[]}
         profiles={[profile]}
         gatewayModelOptions={[]}
         busy={false}
@@ -195,6 +231,7 @@ describe("Collaboration", () => {
         bots={[]}
         bindings={[]}
         sessions={[]}
+        contexts={[]}
         profiles={[]}
         gatewayModelOptions={[]}
         busy={false}
@@ -236,6 +273,7 @@ describe("Collaboration", () => {
         bots={[{ ...bot, system_prompt: "旧提示词" }]}
         bindings={[]}
         sessions={[]}
+        contexts={[]}
         profiles={[profile]}
         gatewayModelOptions={[]}
         busy={false}
@@ -277,6 +315,7 @@ describe("Collaboration", () => {
         bots={[bot]}
         bindings={[]}
         sessions={[]}
+        contexts={[]}
         profiles={[gatewayProfile]}
         gatewayModelOptions={["third-party-coder"]}
         busy={false}
@@ -335,6 +374,7 @@ describe("Collaboration", () => {
         bots={[bot]}
         bindings={[]}
         sessions={[]}
+        contexts={[]}
         profiles={[healthyGatewayProfile, unhealthyGatewayProfile]}
         gatewayModelOptions={["usable-coder"]}
         busy={false}
@@ -361,6 +401,7 @@ describe("Collaboration", () => {
         bots={[bot]}
         bindings={[]}
         sessions={[]}
+        contexts={[]}
         profiles={[profile]}
         gatewayModelOptions={[]}
         busy={false}
@@ -391,6 +432,7 @@ describe("Collaboration", () => {
         bots={[bot]}
         bindings={[longBinding]}
         sessions={[longSession]}
+        contexts={[longContext]}
         profiles={[profile]}
         gatewayModelOptions={[]}
         busy={false}
@@ -400,12 +442,19 @@ describe("Collaboration", () => {
 
     expect(screen.getAllByText(longBinding.project_name).length).toBeGreaterThan(0);
     expect(
-      screen.getByText(/very-long-project-slug-that-should-wrap/),
-    ).toBeInTheDocument();
+      screen.getAllByText(/very-long-project-slug-that-should-wrap/).length,
+    ).toBeGreaterThan(0);
     expect(
       screen.getAllByText(/一个名字同样非常长的 Codex 工作账号档案/).length,
     ).toBeGreaterThan(0);
     expect(screen.getByText(/这是一段很长很长的最终摘要/)).toBeInTheDocument();
+    expect(screen.getByText("项目协作上下文")).toBeInTheDocument();
+    expect(screen.getByText(/完成 beta 发布/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "关闭记忆" }));
+    expect(props.onUpdateContext).toHaveBeenCalledWith({
+      context_id: longContext.id,
+      memory_enabled: false,
+    });
     expect(
       screen.queryByText("/private/workspace/that/should/not/render"),
     ).not.toBeInTheDocument();
@@ -426,6 +475,7 @@ describe("Collaboration", () => {
         bots={[bot]}
         bindings={[longBinding]}
         sessions={[failedSession]}
+        contexts={[]}
         profiles={[profile]}
         gatewayModelOptions={[]}
         busy={false}

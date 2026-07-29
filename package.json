@@ -1,7 +1,7 @@
 {
   "name": "codex-relay",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "type": "module",
   "packageManager": "pnpm@10.14.0",
   "engines": {
@@ -51,16 +51,16 @@
     "eslint": "^9.32.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-react-hooks": "^5.2.0",
-    "eslint-plugin-react-refresh": "^0.4.20",
+    "eslint-plugin-react-refresh": "^0.5.3",
     "globals": "^16.3.0",
     "husky": "^9.1.7",
     "jsdom": "^26.1.0",
     "lint-staged": "^16.1.2",
     "prettier": "^3.6.2",
-    "typescript": "~5.8.3",
+    "typescript": "~6.0.3",
     "typescript-eslint": "^8.38.0",
     "vite": "^7.0.4",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.10"
   },
   "lint-staged": {
     "*.{ts,tsx}": [
@@ -69,5 +69,6 @@
     ],
     "*.{css,json,md,yml,yaml}": "prettier --write",
     "*.rs": "rustfmt --edition 2021"
-  }
+  },
+  "license": "MIT"
 }

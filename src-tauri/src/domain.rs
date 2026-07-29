@@ -17,7 +17,7 @@ pub enum ProfileKind {
 /// The upstream wire protocol used by a gateway profile. Codex OAuth profiles
 /// use the OpenAI Responses-compatible adapter while API-key profiles retain
 /// their configured provider protocol.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 pub enum GatewayProvider {
     #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
@@ -391,6 +391,28 @@ pub struct GatewayStatus {
     pub upstream_last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GatewayHealthProviderSummary {
+    pub provider: GatewayProvider,
+    pub surface: String,
+    pub profiles: usize,
+    pub models: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GatewayHealthSummary {
+    pub status: String,
+    pub running: bool,
+    pub bind_mode: String,
+    pub service_url: String,
+    pub available_profiles: usize,
+    pub cooling_profiles: usize,
+    pub certificate_ready: bool,
+    pub client_key_count: usize,
+    pub upstream_last_error: Option<String>,
+    pub providers: Vec<GatewayHealthProviderSummary>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayNetworkAddress {
     pub name: String,
@@ -426,6 +448,7 @@ pub struct UpdateGatewayInput {
     pub bind_address: String,
     pub port: u16,
     pub cidrs: Vec<String>,
+    #[serde(default)]
     pub confirmed_lan: bool,
     pub upstream_proxy_mode: Option<String>,
     pub upstream_proxy_url: Option<String>,
@@ -452,6 +475,12 @@ pub struct CreatedClientKey {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateClientKeyInput {
     pub name: String,
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientKeySecretInput {
+    pub id: String,
     pub confirmed: bool,
 }
 
@@ -567,6 +596,57 @@ pub struct CollaborationCommandResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CollaborationContextSummary {
+    pub id: String,
+    pub scope_key: String,
+    pub binding_id: String,
+    pub provider: CollaborationProvider,
+    pub bot_id: String,
+    pub bot_name: String,
+    pub project_name: String,
+    pub project_slug: String,
+    pub working_directory: String,
+    pub execution_target: String,
+    pub profile_id: Option<String>,
+    pub profile_alias: Option<String>,
+    pub model_id: Option<String>,
+    pub memory_enabled: bool,
+    pub permissions_policy: String,
+    pub active_codex_session_id: Option<String>,
+    pub active_relay_session_id: Option<String>,
+    pub goal_status: String,
+    pub goal_text: Option<String>,
+    pub conversation_mode: String,
+    pub last_turn_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateCollaborationContextInput {
+    pub context_id: String,
+    #[serde(default)]
+    pub memory_enabled: Option<bool>,
+    #[serde(default)]
+    pub goal_status: Option<String>,
+    #[serde(default)]
+    pub goal_text: Option<String>,
+    #[serde(default)]
+    pub conversation_mode: Option<String>,
+    #[serde(default)]
+    pub permissions_policy: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResetCollaborationContextInput {
+    pub context_id: String,
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CollaborationCallbackStatus {
     pub local_url: String,
     pub public_urls: Vec<String>,
@@ -642,6 +722,7 @@ pub struct DeleteFeishuProjectBindingInput {
 pub struct CodexSessionSummary {
     pub id: String,
     pub binding_id: String,
+    pub context_id: Option<String>,
     pub provider: CollaborationProvider,
     pub provider_bot_id: Option<String>,
     pub provider_chat_id: Option<String>,
@@ -662,6 +743,9 @@ pub struct CodexSessionSummary {
     pub last_error: Option<String>,
     pub execution_target: String,
     pub model_id: Option<String>,
+    pub turn_kind: String,
+    pub conversation_mode: String,
+    pub goal_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

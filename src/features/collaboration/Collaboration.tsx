@@ -17,6 +17,7 @@ import { FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import type {
   CodexSessionSummary,
   CollaborationCallbackStatus,
+  CollaborationContextSummary,
   CollaborationExecutionTarget,
   CollaborationProjectBinding,
   CollaborationProvider,
@@ -39,6 +40,7 @@ interface CollaborationProps {
   bots: MaskedCollaborationBot[];
   bindings: CollaborationProjectBinding[];
   sessions: CodexSessionSummary[];
+  contexts: CollaborationContextSummary[];
   profiles: MaskedProfile[];
   gatewayModelOptions: string[];
   busy: boolean;
@@ -51,6 +53,8 @@ interface CollaborationProps {
   onLoadCallbackStatus: () => Promise<CollaborationCallbackStatus>;
   onCancelSession: (id: string) => Promise<void>;
   onContinueSession: (id: string, instruction: string) => Promise<void>;
+  onUpdateContext: (input: Record<string, unknown>) => Promise<void>;
+  onResetContext: (id: string) => Promise<void>;
 }
 
 const providers: ProviderCard[] = [
@@ -139,6 +143,7 @@ export function Collaboration({
   bots,
   bindings,
   sessions,
+  contexts,
   profiles,
   gatewayModelOptions,
   busy,
@@ -151,6 +156,8 @@ export function Collaboration({
   onLoadCallbackStatus,
   onCancelSession,
   onContinueSession,
+  onUpdateContext,
+  onResetContext,
 }: CollaborationProps) {
   const [selectedProvider, setSelectedProvider] =
     useState<CollaborationProvider>("feishu");
@@ -174,6 +181,9 @@ export function Collaboration({
   );
   const selectedSessions = sessions.filter(
     (session) => session.provider === selectedProvider,
+  );
+  const selectedContexts = contexts.filter(
+    (context) => context.provider === selectedProvider,
   );
   const providerConfigured = selectedBots.length > 0;
 
@@ -240,6 +250,14 @@ export function Collaboration({
                 bindings={selectedBindings}
                 busy={busy}
                 onDelete={onDeleteBinding}
+              />
+            )}
+            {selectedContexts.length > 0 && (
+              <ContextPanel
+                contexts={selectedContexts}
+                busy={busy}
+                onUpdate={onUpdateContext}
+                onReset={onResetContext}
               />
             )}
           </section>
@@ -461,9 +479,17 @@ function CommandQuickStart({
     { label: "查看帮助", value: "/codex help" },
     { label: "绑定群聊", value: `/codex bind ${bindCode}` },
     { label: "列出项目", value: "/codex projects" },
-    { label: "启动任务", value: `/codex run ${project} 修复当前失败的测试` },
-    { label: "列出会话", value: `/codex sessions ${project}` },
-    { label: "查看状态", value: `/codex status ${sessionId}` },
+    { label: "自然续接", value: "@Codex 继续根据最新反馈修改" },
+    { label: "新会话", value: `/codex new ${project} 修复当前失败的测试` },
+    { label: "计划模式", value: `/codex plan ${project} 拆解发布前检查` },
+    { label: "长期目标", value: "/codex goal 完成本项目 beta 发布" },
+    { label: "记忆开关", value: "/codex memories status" },
+    { label: "切换模型", value: "/codex model gpt-5.1-codex" },
+    { label: "权限策略", value: "/codex permissions workspace-write" },
+    { label: "上下文状态", value: "/codex status" },
+    { label: "恢复会话", value: `/codex resume ${sessionId}` },
+    { label: "压缩上下文", value: "/codex compact" },
+    { label: "审查当前改动", value: "/codex review" },
     { label: "取消会话", value: `/codex cancel ${sessionId}` },
     { label: "继续会话", value: `/codex continue ${sessionId} 根据最新反馈继续修改` },
   ];
@@ -1056,6 +1082,88 @@ function BindingList({
   );
 }
 
+function ContextPanel({
+  contexts,
+  busy,
+  onUpdate,
+  onReset,
+}: {
+  contexts: CollaborationContextSummary[];
+  busy: boolean;
+  onUpdate: (input: Record<string, unknown>) => Promise<void>;
+  onReset: (id: string) => Promise<void>;
+}) {
+  return (
+    <section className="flat-panel contexts-panel" data-animate="cards">
+      <div className="card-heading">
+        <div>
+          <p className="section-kicker">Shared contexts</p>
+          <h2>项目协作上下文</h2>
+          <p>
+            同一目录、执行方式、档案/模型会复用稳定 CODEX_HOME、active Codex
+            session、长期记忆与目标。
+          </p>
+        </div>
+      </div>
+      <div className="channel-list">
+        {contexts.map((context) => (
+          <article className="channel-card" key={context.id}>
+            <div className="channel-icon">
+              <ChatCircleDots size={23} weight="duotone" />
+            </div>
+            <div className="channel-main">
+              <div>
+                <h2>{context.project_name}</h2>
+                <span className="status-pill compact running">
+                  <i /> {context.memory_enabled ? "记忆开启" : "记忆关闭"}
+                </span>
+              </div>
+              <p>
+                {context.bot_name} · {context.project_slug} ·{" "}
+                {contextExecutionLabel(context)}
+              </p>
+              <small>
+                Context：{shortId(context.id)} · 模式：
+                {modeLabel(context.conversation_mode)} · 权限：
+                {context.permissions_policy}
+              </small>
+              <small>
+                目标：{contextGoalLabel(context)} · Active：
+                {context.active_codex_session_id
+                  ? shortId(context.active_codex_session_id)
+                  : "暂无"}
+              </small>
+            </div>
+            <div className="channel-actions stacked-actions">
+              <button
+                className="quiet-button"
+                disabled={busy}
+                type="button"
+                onClick={() =>
+                  void onUpdate({
+                    context_id: context.id,
+                    memory_enabled: !context.memory_enabled,
+                  })
+                }
+              >
+                {context.memory_enabled ? "关闭记忆" : "开启记忆"}
+              </button>
+              <button
+                className="quiet-button danger"
+                disabled={busy}
+                type="button"
+                onClick={() => void onReset(context.id)}
+              >
+                重置上下文
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function SessionList({
   sessions,
   busy,
@@ -1094,8 +1202,16 @@ function SessionList({
                 <p>
                   {providerLabel(session.provider)} · {shortId(session.id)} ·{" "}
                   {profileAliasLabel(session.profile_alias)} ·{" "}
-                  {sessionExecutionLabel(session)}
+                  {sessionExecutionLabel(session)} · {turnKindLabel(session.turn_kind)}
                 </p>
+                <small>
+                  上下文：
+                  {session.context_id ? shortId(session.context_id) : "独立会话"} ·
+                  模式：{modeLabel(session.conversation_mode)}
+                  {session.goal_status
+                    ? ` · 目标：${goalStatusLabel(session.goal_status)}`
+                    : ""}
+                </small>
                 <small>{session.summary ?? "暂无摘要"}</small>
                 {session.relay_status === "failed" && session.last_error && (
                   <small className="session-error">
@@ -1260,7 +1376,7 @@ function setupSteps(
     {
       title: "开始群聊任务",
       detail:
-        "发送 /codex help 或 /codex run <project> <任务说明> 创建会话。Discord 可使用 /codex command。",
+        "首次 @ 机器人会创建项目共享上下文；后续自然对话续接，/codex new、/codex plan、/codex goal、/codex memories 可显式控制。Discord 可使用 /codex command。",
       done: progress.hasSession,
     },
   ];
@@ -1280,6 +1396,49 @@ function sessionExecutionLabel(session: CodexSessionSummary) {
 
 function profileAliasLabel(alias: string | null) {
   return alias?.trim() || "网关全局设置";
+}
+
+function contextExecutionLabel(context: CollaborationContextSummary) {
+  return context.execution_target === "gateway"
+    ? `API 网关${context.model_id ? ` · ${context.model_id}` : ""}`
+    : `档案直连${context.profile_alias ? ` · ${context.profile_alias}` : ""}`;
+}
+
+function contextGoalLabel(context: CollaborationContextSummary) {
+  if (context.goal_status === "active") return context.goal_text || "进行中";
+  if (context.goal_status === "paused")
+    return context.goal_text ? `已暂停 · ${context.goal_text}` : "已暂停";
+  return "未设置";
+}
+
+function modeLabel(mode: string) {
+  return (
+    {
+      default: "默认",
+      plan: "计划",
+      goal: "目标",
+      compact: "压缩",
+      review: "审查",
+    }[mode] ?? mode
+  );
+}
+
+function turnKindLabel(kind: string) {
+  return (
+    {
+      natural: "自然对话",
+      run: "任务",
+      new: "新会话",
+      plan: "计划",
+      compact: "压缩",
+      review: "审查",
+      continue: "继续",
+    }[kind] ?? kind
+  );
+}
+
+function goalStatusLabel(status: string) {
+  return { active: "进行中", paused: "已暂停", none: "未设置" }[status] ?? status;
 }
 
 function providerFields(provider: CollaborationProvider) {

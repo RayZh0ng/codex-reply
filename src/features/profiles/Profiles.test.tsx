@@ -453,6 +453,10 @@ describe("Profiles OAuth import", () => {
       .getByRole("heading", { name: "添加第三方模型提供商" })
       .closest("section") as HTMLElement;
     const form = within(sheet);
+    expect(form.getByText(/OpenAI 兼容 direct/)).toBeInTheDocument();
+    expect(
+      form.getByText(/模型映射会生成 Codex model_catalog_json/),
+    ).toBeInTheDocument();
     fireEvent.change(form.getByLabelText("档案名称"), {
       target: { value: "Third Party" },
     });

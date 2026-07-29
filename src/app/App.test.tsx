@@ -118,6 +118,7 @@ describe("App", () => {
       if (command === "list_collaboration_bots") return Promise.resolve([]);
       if (command === "list_collaboration_project_bindings") return Promise.resolve([]);
       if (command === "list_codex_sessions") return Promise.resolve([]);
+      if (command === "list_collaboration_contexts") return Promise.resolve([]);
       if (command === "list_gateway_model_options") return Promise.resolve([]);
       if (command === "collaboration_callback_status")
         return Promise.resolve({
@@ -225,6 +226,7 @@ describe("App", () => {
     const session = {
       id: "12345678-session",
       binding_id: "binding-1",
+      context_id: "ctx-12345678",
       provider: "feishu" as const,
       provider_bot_id: "bot-1",
       provider_chat_id: "chat-1",
@@ -245,6 +247,9 @@ describe("App", () => {
       finished_at_ms: null,
       summary: "任务运行中。",
       last_error: null,
+      turn_kind: "natural",
+      conversation_mode: "default",
+      goal_status: null,
     };
     native.invoke.mockImplementation((command: string) => {
       if (command === "dashboard_snapshot") return Promise.resolve(snapshot);
@@ -254,6 +259,7 @@ describe("App", () => {
       if (command === "list_collaboration_project_bindings")
         return Promise.resolve([binding]);
       if (command === "list_codex_sessions") return Promise.resolve([session]);
+      if (command === "list_collaboration_contexts") return Promise.resolve([]);
       if (command === "list_gateway_model_options") return Promise.resolve(["gpt-5"]);
       if (command === "collaboration_callback_status")
         return Promise.resolve({

@@ -10,12 +10,12 @@ use serde_json::Value;
 use crate::{
     domain::{
         AppUpdateChannel, AppUpdateSettings, CodexAuthMode, CodexSessionEvent, CodexSessionSummary,
-        CollaborationProjectBinding, CollaborationProvider, CollaborationSummary,
-        DesktopWorkspaceHistoryItem, DesktopWorkspaceMode, FeishuProjectBinding,
-        GatewayModelMapping, GatewayNetworkAddress, GatewayProvider, GatewayStatus, GatewayWireApi,
-        MaskedClientKey, MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile, MetricsSnapshot,
-        ProfileAccountSummary, ProfileKind, ProfileQuota, ProfileSubscription,
-        GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+        CollaborationContextSummary, CollaborationProjectBinding, CollaborationProvider,
+        CollaborationSummary, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
+        FeishuProjectBinding, GatewayModelMapping, GatewayNetworkAddress, GatewayProvider,
+        GatewayStatus, GatewayWireApi, MaskedClientKey, MaskedCollaborationBot, MaskedFeishuBot,
+        MaskedProfile, MetricsSnapshot, ProfileAccountSummary, ProfileKind, ProfileQuota,
+        ProfileSubscription, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
     },
     error::{AppError, AppResult},
 };
@@ -217,9 +217,38 @@ impl Repository {
                       updated_at_ms INTEGER NOT NULL,
                       PRIMARY KEY(provider, bot_id, state_key)
                     );
+                    CREATE TABLE IF NOT EXISTS collaboration_contexts (
+                      id TEXT PRIMARY KEY,
+                      scope_key TEXT NOT NULL UNIQUE,
+                      binding_id TEXT NOT NULL,
+                      memory_enabled INTEGER NOT NULL DEFAULT 1,
+                      permissions_policy TEXT NOT NULL DEFAULT 'workspace-write',
+                      model_id TEXT,
+                      active_codex_session_id TEXT,
+                      active_relay_session_id TEXT,
+                      goal_status TEXT NOT NULL DEFAULT 'none',
+                      goal_text TEXT,
+                      conversation_mode TEXT NOT NULL DEFAULT 'default',
+                      last_turn_at_ms INTEGER,
+                      created_at_ms INTEGER NOT NULL,
+                      updated_at_ms INTEGER NOT NULL,
+                      FOREIGN KEY(binding_id) REFERENCES collaboration_project_bindings(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_collaboration_contexts_binding
+                      ON collaboration_contexts(binding_id);
+                    CREATE TABLE IF NOT EXISTS collaboration_chat_state (
+                      provider TEXT NOT NULL,
+                      bot_id TEXT NOT NULL,
+                      chat_id TEXT NOT NULL,
+                      context_id TEXT NOT NULL,
+                      updated_at_ms INTEGER NOT NULL,
+                      PRIMARY KEY(provider, bot_id, chat_id),
+                      FOREIGN KEY(context_id) REFERENCES collaboration_contexts(id) ON DELETE CASCADE
+                    );
                     CREATE TABLE IF NOT EXISTS codex_sessions (
                       id TEXT PRIMARY KEY,
                       binding_id TEXT NOT NULL,
+                      context_id TEXT,
                       profile_id TEXT,
                       provider TEXT NOT NULL DEFAULT 'feishu',
                       provider_bot_id TEXT,
@@ -237,8 +266,12 @@ impl Repository {
                       last_error TEXT,
                       execution_target TEXT NOT NULL DEFAULT 'profile',
                       model_id TEXT,
+                      turn_kind TEXT NOT NULL DEFAULT 'run',
+                      conversation_mode TEXT NOT NULL DEFAULT 'default',
+                      goal_status TEXT,
                       working_directory TEXT NOT NULL,
                       FOREIGN KEY(binding_id) REFERENCES collaboration_project_bindings(id) ON DELETE CASCADE,
+                      FOREIGN KEY(context_id) REFERENCES collaboration_contexts(id) ON DELETE SET NULL,
                       FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE
                     );
                     CREATE INDEX IF NOT EXISTS idx_codex_sessions_binding_status
@@ -322,8 +355,12 @@ impl Repository {
                 ("provider_bot_id", "TEXT"),
                 ("provider_chat_id", "TEXT"),
                 ("provider_message_id", "TEXT"),
+                ("context_id", "TEXT"),
                 ("execution_target", "TEXT NOT NULL DEFAULT 'profile'"),
                 ("model_id", "TEXT"),
+                ("turn_kind", "TEXT NOT NULL DEFAULT 'run'"),
+                ("conversation_mode", "TEXT NOT NULL DEFAULT 'default'"),
+                ("goal_status", "TEXT"),
             ] {
                 if !session_columns.iter().any(|column| column == name) {
                     connection
@@ -334,7 +371,27 @@ impl Repository {
                     .map_err(|_| AppError::Internal)?;
                 }
             }
+            let context_columns = table_columns(connection, "collaboration_contexts")?;
+            for (name, definition) in [
+                ("permissions_policy", "TEXT NOT NULL DEFAULT 'workspace-write'"),
+                ("model_id", "TEXT"),
+            ] {
+                if !context_columns.iter().any(|column| column == name) {
+                    connection
+                        .execute(
+                            &format!("ALTER TABLE collaboration_contexts ADD COLUMN {name} {definition}"),
+                            [],
+                        )
+                        .map_err(|_| AppError::Internal)?;
+                }
+            }
             make_collaboration_profile_columns_nullable(connection)?;
+            connection
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS idx_codex_sessions_context_status ON codex_sessions(context_id, relay_status)",
+                    [],
+                )
+                .map_err(|_| AppError::Internal)?;
             migrate_feishu_to_collaboration(connection)?;
             Ok(())
         })
@@ -845,19 +902,17 @@ impl Repository {
         })
     }
 
-    pub fn revoke_client_key(&self, id: &str) -> AppResult<Option<String>> {
+    pub fn user_client_key_secret_ref(&self, id: &str) -> AppResult<String> {
         self.with_connection(|connection| {
-            let secret = connection
+            let secret_ref = connection
                 .query_row(
-                    "SELECT secret_ref FROM client_keys WHERE id = ?1",
+                    "SELECT secret_ref FROM client_keys WHERE id = ?1 AND revoked = 0",
                     params![id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()
-                .map_err(|_| AppError::Internal)?;
-            let Some(secret_ref) = secret else {
-                return Err(AppError::NotFound);
-            };
+                .map_err(|_| AppError::Internal)?
+                .ok_or(AppError::NotFound)?;
             let codex_key_ref = connection
                 .query_row(
                     "SELECT value FROM app_settings WHERE key = ?1",
@@ -869,6 +924,31 @@ impl Repository {
             if codex_key_ref.as_deref() == Some(secret_ref.as_str()) {
                 return Err(AppError::Conflict);
             }
+            Ok(secret_ref)
+        })
+    }
+
+    pub fn update_client_key_material(
+        &self,
+        id: &str,
+        hash: &str,
+        masked_value: &str,
+    ) -> AppResult<String> {
+        self.with_connection(|connection| {
+            let secret_ref = user_client_key_secret_ref_from_connection(connection, id)?;
+            let updated = connection
+                .execute(
+                    "UPDATE client_keys SET key_hash = ?2, masked_value = ?3, last_used_at_ms = NULL WHERE id = ?1 AND revoked = 0",
+                    params![id, hash, masked_value],
+                )
+                .map_err(|_| AppError::Internal)?;
+            (updated == 1).then_some(secret_ref).ok_or(AppError::NotFound)
+        })
+    }
+
+    pub fn revoke_client_key(&self, id: &str) -> AppResult<Option<String>> {
+        self.with_connection(|connection| {
+            let secret_ref = user_client_key_secret_ref_from_connection(connection, id)?;
             connection
                 .execute(
                     "UPDATE client_keys SET revoked = 1 WHERE id = ?1",
@@ -1220,6 +1300,266 @@ impl Repository {
         })
     }
 
+    pub fn upsert_collaboration_context(
+        &self,
+        context: &CollaborationContextSummary,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO collaboration_contexts(id, scope_key, binding_id, memory_enabled, permissions_policy, model_id, active_codex_session_id, active_relay_session_id, goal_status, goal_text, conversation_mode, last_turn_at_ms, created_at_ms, updated_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(id) DO UPDATE SET scope_key = excluded.scope_key, binding_id = excluded.binding_id, memory_enabled = excluded.memory_enabled, permissions_policy = excluded.permissions_policy, model_id = excluded.model_id, active_codex_session_id = excluded.active_codex_session_id, active_relay_session_id = excluded.active_relay_session_id, goal_status = excluded.goal_status, goal_text = excluded.goal_text, conversation_mode = excluded.conversation_mode, last_turn_at_ms = excluded.last_turn_at_ms, updated_at_ms = excluded.updated_at_ms",
+                params![
+                    context.id,
+                    context.scope_key,
+                    context.binding_id,
+                    context.memory_enabled,
+                    context.permissions_policy,
+                    context.model_id,
+                    context.active_codex_session_id,
+                    context.active_relay_session_id,
+                    context.goal_status,
+                    context.goal_text,
+                    context.conversation_mode,
+                    context.last_turn_at_ms,
+                    context.created_at_ms,
+                    context.updated_at_ms,
+                ],
+            ).map_err(|_| AppError::Internal)?;
+            Ok(())
+        })
+    }
+
+    pub fn list_collaboration_contexts(&self) -> AppResult<Vec<CollaborationContextSummary>> {
+        self.with_connection(|connection| {
+            let mut statement = connection
+                .prepare(COLLABORATION_CONTEXT_SELECT)
+                .map_err(|_| AppError::Internal)?;
+            let rows = statement
+                .query_map([], collaboration_context_from_row)
+                .map_err(|_| AppError::Internal)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|_| AppError::Internal)
+        })
+    }
+
+    pub fn collaboration_context(&self, id: &str) -> AppResult<CollaborationContextSummary> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!("{COLLABORATION_CONTEXT_SELECT} WHERE c.id = ?1"),
+                    params![id],
+                    collaboration_context_from_row,
+                )
+                .map_err(map_session_lookup_error)
+        })
+    }
+
+    pub fn collaboration_context_by_scope(
+        &self,
+        scope_key: &str,
+    ) -> AppResult<Option<CollaborationContextSummary>> {
+        self.with_connection(|connection| {
+            connection
+                .query_row(
+                    &format!("{COLLABORATION_CONTEXT_SELECT} WHERE c.scope_key = ?1"),
+                    params![scope_key],
+                    collaboration_context_from_row,
+                )
+                .optional()
+                .map_err(|_| AppError::Internal)
+        })
+    }
+
+    pub fn set_collaboration_chat_context(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+        context_id: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO collaboration_chat_state(provider, bot_id, chat_id, context_id, updated_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(provider, bot_id, chat_id) DO UPDATE SET context_id = excluded.context_id, updated_at_ms = excluded.updated_at_ms",
+                params![collaboration_provider_name(&provider), bot_id, chat_id, context_id, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            Ok(())
+        })
+    }
+
+    pub fn collaboration_chat_context(
+        &self,
+        provider: CollaborationProvider,
+        bot_id: &str,
+        chat_id: &str,
+    ) -> AppResult<Option<CollaborationContextSummary>> {
+        self.with_connection(|connection| {
+            connection.query_row(
+                &format!(
+                    "{COLLABORATION_CONTEXT_SELECT} JOIN collaboration_chat_state cs ON cs.context_id = c.id WHERE cs.provider = ?1 AND cs.bot_id = ?2 AND cs.chat_id = ?3"
+                ),
+                params![collaboration_provider_name(&provider), bot_id, chat_id],
+                collaboration_context_from_row,
+            ).optional().map_err(|_| AppError::Internal)
+        })
+    }
+
+    pub fn set_collaboration_context_memory(
+        &self,
+        context_id: &str,
+        enabled: bool,
+    ) -> AppResult<CollaborationContextSummary> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET memory_enabled = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                params![context_id, enabled, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            Ok(())
+        })?;
+        self.collaboration_context(context_id)
+    }
+
+    pub fn set_collaboration_context_goal(
+        &self,
+        context_id: &str,
+        status: &str,
+        text: Option<&str>,
+    ) -> AppResult<CollaborationContextSummary> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET goal_status = ?2, goal_text = ?3, updated_at_ms = ?4 WHERE id = ?1",
+                params![context_id, status, text, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            Ok(())
+        })?;
+        self.collaboration_context(context_id)
+    }
+
+    pub fn set_collaboration_context_mode(
+        &self,
+        context_id: &str,
+        mode: &str,
+    ) -> AppResult<CollaborationContextSummary> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET conversation_mode = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                params![context_id, mode, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            Ok(())
+        })?;
+        self.collaboration_context(context_id)
+    }
+
+    pub fn set_collaboration_context_permissions(
+        &self,
+        context_id: &str,
+        policy: &str,
+    ) -> AppResult<CollaborationContextSummary> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET permissions_policy = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                params![context_id, policy, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            Ok(())
+        })?;
+        self.collaboration_context(context_id)
+    }
+
+    pub fn set_collaboration_context_model(
+        &self,
+        context_id: &str,
+        model_id: Option<&str>,
+    ) -> AppResult<CollaborationContextSummary> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET model_id = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                params![context_id, model_id, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            connection.execute(
+                "UPDATE collaboration_project_bindings SET model_id = ?2, updated_at_ms = ?3 WHERE id = (SELECT binding_id FROM collaboration_contexts WHERE id = ?1)",
+                params![context_id, model_id, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            Ok(())
+        })?;
+        self.collaboration_context(context_id)
+    }
+
+    pub fn clear_collaboration_context_active(
+        &self,
+        context_id: &str,
+    ) -> AppResult<CollaborationContextSummary> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET active_codex_session_id = NULL, active_relay_session_id = NULL, conversation_mode = 'default', updated_at_ms = ?2 WHERE id = ?1",
+                params![context_id, timestamp_ms()],
+            ).map_err(|_| AppError::Internal)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            Ok(())
+        })?;
+        self.collaboration_context(context_id)
+    }
+
+    pub fn mark_collaboration_context_turn_started(
+        &self,
+        context_id: &str,
+        relay_session_id: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET active_relay_session_id = ?2, last_turn_at_ms = ?3, updated_at_ms = ?3 WHERE id = ?1",
+                params![context_id, relay_session_id, timestamp_ms()],
+            ).map_err(map_local_state_error)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            Ok(())
+        })
+    }
+
+    pub fn set_collaboration_context_codex_id(
+        &self,
+        context_id: &str,
+        codex_session_id: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            let changed = connection.execute(
+                "UPDATE collaboration_contexts SET active_codex_session_id = ?2, updated_at_ms = ?3 WHERE id = ?1",
+                params![context_id, codex_session_id, timestamp_ms()],
+            ).map_err(map_local_state_error)?;
+            if changed == 0 { return Err(AppError::NotFound); }
+            Ok(())
+        })
+    }
+
+    pub fn mark_collaboration_context_turn_finished(
+        &self,
+        context_id: &str,
+        relay_session_id: &str,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE collaboration_contexts SET active_relay_session_id = CASE WHEN active_relay_session_id = ?2 THEN NULL ELSE active_relay_session_id END, last_turn_at_ms = ?3, updated_at_ms = ?3 WHERE id = ?1",
+                params![context_id, relay_session_id, timestamp_ms()],
+            ).map_err(map_local_state_error)?;
+            Ok(())
+        })
+    }
+
+    pub fn count_running_codex_sessions_for_context(&self, context_id: &str) -> AppResult<i64> {
+        self.with_connection(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM codex_sessions WHERE context_id = ?1 AND relay_status = 'running'",
+                params![context_id],
+                |row| row.get(0),
+            ).map_err(map_local_state_error)
+        })
+    }
+
     #[allow(dead_code)]
     pub fn insert_feishu_bot(&self, stored: &StoredFeishuBot) -> AppResult<()> {
         self.with_connection(|connection| {
@@ -1434,11 +1774,12 @@ impl Repository {
                 .execute("PRAGMA foreign_keys = OFF", [])
                 .map_err(map_local_state_error)?;
             connection.execute(
-                "INSERT INTO codex_sessions(id, binding_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, working_directory)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                "INSERT INTO codex_sessions(id, binding_id, context_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, turn_kind, conversation_mode, goal_status, working_directory)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     stored.session.id,
                     stored.session.binding_id,
+                    stored.session.context_id.as_deref(),
                     stored.session.profile_id.as_deref(),
                     collaboration_provider_name(&stored.session.provider),
                     stored.session.provider_bot_id,
@@ -1456,6 +1797,9 @@ impl Repository {
                     stored.session.last_error,
                     stored.session.execution_target,
                     stored.session.model_id,
+                    stored.session.turn_kind,
+                    stored.session.conversation_mode,
+                    stored.session.goal_status,
                     stored.working_directory,
                 ],
             ).map_err(map_local_state_error)?;
@@ -1516,10 +1860,10 @@ impl Repository {
     ) -> AppResult<Vec<StoredCodexSession>> {
         self.with_connection(|connection| {
             let sql = if binding_id.is_some() {
-                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.working_directory
+                "SELECT s.id, s.binding_id, s.context_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.turn_kind, s.conversation_mode, s.goal_status, s.working_directory
                  FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id LEFT JOIN profiles p ON p.id = s.profile_id WHERE s.binding_id = ?1 ORDER BY s.started_at_ms DESC"
             } else {
-                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.working_directory
+                "SELECT s.id, s.binding_id, s.context_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.turn_kind, s.conversation_mode, s.goal_status, s.working_directory
                  FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id LEFT JOIN profiles p ON p.id = s.profile_id ORDER BY s.started_at_ms DESC LIMIT 200"
             };
             let mut statement = connection.prepare(sql).map_err(map_local_state_error)?;
@@ -1543,7 +1887,7 @@ impl Repository {
     pub fn codex_session(&self, id: &str) -> AppResult<StoredCodexSession> {
         self.with_connection(|connection| {
             connection.query_row(
-                "SELECT s.id, s.binding_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.working_directory
+                "SELECT s.id, s.binding_id, s.context_id, s.provider, s.provider_bot_id, s.provider_chat_id, s.provider_message_id, b.project_name, b.project_slug, s.profile_id, p.alias, s.relay_status, s.codex_session_id, s.feishu_message_id, s.feishu_chat_id, s.started_by, s.started_at_ms, s.updated_at_ms, s.finished_at_ms, s.summary, s.last_error, s.execution_target, s.model_id, s.turn_kind, s.conversation_mode, s.goal_status, s.working_directory
                  FROM codex_sessions s JOIN collaboration_project_bindings b ON b.id = s.binding_id LEFT JOIN profiles p ON p.id = s.profile_id WHERE s.id = ?1",
                 params![id],
                 codex_session_from_row,
@@ -1601,11 +1945,71 @@ impl Repository {
     }
 
     pub fn record_metric(&self, successful: bool, latency_ms: i64) -> AppResult<()> {
-        self.with_connection(|connection| { connection.execute("UPDATE metrics SET total_requests = total_requests + 1, successful_requests = successful_requests + ?1, failed_requests = failed_requests + ?2, total_latency_ms = total_latency_ms + ?3, latency_samples = latency_samples + 1 WHERE id = 1", params![i64::from(successful), i64::from(!successful), latency_ms]).map_err(|_| AppError::Internal)?; Ok(()) })
+        self.record_metric_with_tokens(successful, latency_ms, 0)
+    }
+
+    pub fn record_metric_with_tokens(
+        &self,
+        successful: bool,
+        latency_ms: i64,
+        estimated_tokens: i64,
+    ) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute("UPDATE metrics SET total_requests = total_requests + 1, successful_requests = successful_requests + ?1, failed_requests = failed_requests + ?2, total_latency_ms = total_latency_ms + ?3, latency_samples = latency_samples + 1, estimated_tokens = estimated_tokens + ?4 WHERE id = 1", params![i64::from(successful), i64::from(!successful), latency_ms, estimated_tokens.max(0)]).map_err(|_| AppError::Internal)?;
+            Ok(())
+        })
+    }
+
+    pub fn add_estimated_tokens(&self, estimated_tokens: i64) -> AppResult<()> {
+        if estimated_tokens <= 0 {
+            return Ok(());
+        }
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "UPDATE metrics SET estimated_tokens = estimated_tokens + ?1 WHERE id = 1",
+                    params![estimated_tokens],
+                )
+                .map_err(|_| AppError::Internal)?;
+            Ok(())
+        })
     }
 }
 
-#[allow(dead_code)]
+fn user_client_key_secret_ref_from_connection(
+    connection: &Connection,
+    id: &str,
+) -> AppResult<String> {
+    let secret_ref = connection
+        .query_row(
+            "SELECT secret_ref FROM client_keys WHERE id = ?1 AND revoked = 0",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| AppError::Internal)?
+        .ok_or(AppError::NotFound)?;
+    let codex_key_ref = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            params![GATEWAY_CODEX_CLIENT_KEY_REF_SETTING],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| AppError::Internal)?;
+    if codex_key_ref.as_deref() == Some(secret_ref.as_str()) {
+        return Err(AppError::Conflict);
+    }
+    Ok(secret_ref)
+}
+
+const COLLABORATION_CONTEXT_SELECT: &str =
+    "SELECT c.id, c.scope_key, c.binding_id, b.provider, b.bot_id, bot.name, b.project_name, b.project_slug, b.working_directory, b.execution_target, b.profile_id, p.alias, c.model_id, c.memory_enabled, c.permissions_policy, c.active_codex_session_id, c.active_relay_session_id, c.goal_status, c.goal_text, c.conversation_mode, c.last_turn_at_ms, c.created_at_ms, c.updated_at_ms
+     FROM collaboration_contexts c
+     JOIN collaboration_project_bindings b ON b.id = c.binding_id
+     JOIN collaboration_bots bot ON bot.id = b.bot_id
+     LEFT JOIN profiles p ON p.id = b.profile_id";
+
 fn feishu_binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeishuProjectBinding> {
     Ok(FeishuProjectBinding {
         id: row.get(0)?,
@@ -1650,6 +2054,37 @@ fn collaboration_binding_from_row(
     })
 }
 
+fn collaboration_context_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CollaborationContextSummary> {
+    let provider: String = row.get(3)?;
+    Ok(CollaborationContextSummary {
+        id: row.get(0)?,
+        scope_key: row.get(1)?,
+        binding_id: row.get(2)?,
+        provider: parse_collaboration_provider(&provider).unwrap_or(CollaborationProvider::Feishu),
+        bot_id: row.get(4)?,
+        bot_name: row.get(5)?,
+        project_name: row.get(6)?,
+        project_slug: row.get(7)?,
+        working_directory: row.get(8)?,
+        execution_target: row.get(9)?,
+        profile_id: row.get(10)?,
+        profile_alias: row.get(11)?,
+        model_id: row.get(12)?,
+        memory_enabled: row.get(13)?,
+        permissions_policy: row.get(14)?,
+        active_codex_session_id: row.get(15)?,
+        active_relay_session_id: row.get(16)?,
+        goal_status: row.get(17)?,
+        goal_text: row.get(18)?,
+        conversation_mode: row.get(19)?,
+        last_turn_at_ms: row.get(20)?,
+        created_at_ms: row.get(21)?,
+        updated_at_ms: row.get(22)?,
+    })
+}
+
 fn system_prompt_from_config_json(value: &str) -> Option<String> {
     serde_json::from_str::<Value>(value)
         .ok()
@@ -1675,33 +2110,37 @@ fn map_session_lookup_error(error: rusqlite::Error) -> AppError {
 }
 
 fn codex_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCodexSession> {
-    let working_directory: String = row.get(22)?;
-    let provider: String = row.get(2)?;
+    let working_directory: String = row.get(26)?;
+    let provider: String = row.get(3)?;
     Ok(StoredCodexSession {
         session: CodexSessionSummary {
             id: row.get(0)?,
             binding_id: row.get(1)?,
+            context_id: row.get(2)?,
             provider: parse_collaboration_provider(&provider)
                 .unwrap_or(CollaborationProvider::Feishu),
-            provider_bot_id: row.get(3)?,
-            provider_chat_id: row.get(4)?,
-            provider_message_id: row.get(5)?,
-            project_name: row.get(6)?,
-            project_slug: row.get(7)?,
-            profile_id: row.get(8)?,
-            profile_alias: row.get(9)?,
-            relay_status: row.get(10)?,
-            codex_session_id: row.get(11)?,
-            feishu_message_id: row.get(12)?,
-            feishu_chat_id: row.get(13)?,
-            started_by: row.get(14)?,
-            started_at_ms: row.get(15)?,
-            updated_at_ms: row.get(16)?,
-            finished_at_ms: row.get(17)?,
-            summary: row.get(18)?,
-            last_error: row.get(19)?,
-            execution_target: row.get(20)?,
-            model_id: row.get(21)?,
+            provider_bot_id: row.get(4)?,
+            provider_chat_id: row.get(5)?,
+            provider_message_id: row.get(6)?,
+            project_name: row.get(7)?,
+            project_slug: row.get(8)?,
+            profile_id: row.get(9)?,
+            profile_alias: row.get(10)?,
+            relay_status: row.get(11)?,
+            codex_session_id: row.get(12)?,
+            feishu_message_id: row.get(13)?,
+            feishu_chat_id: row.get(14)?,
+            started_by: row.get(15)?,
+            started_at_ms: row.get(16)?,
+            updated_at_ms: row.get(17)?,
+            finished_at_ms: row.get(18)?,
+            summary: row.get(19)?,
+            last_error: row.get(20)?,
+            execution_target: row.get(21)?,
+            model_id: row.get(22)?,
+            turn_kind: row.get(23)?,
+            conversation_mode: row.get(24)?,
+            goal_status: row.get(25)?,
         },
         working_directory,
     })
@@ -1892,6 +2331,7 @@ fn make_collaboration_profile_columns_nullable(connection: &Connection) -> AppRe
                 CREATE TABLE codex_sessions (
                   id TEXT PRIMARY KEY,
                   binding_id TEXT NOT NULL,
+                  context_id TEXT,
                   profile_id TEXT,
                   provider TEXT NOT NULL DEFAULT 'feishu',
                   provider_bot_id TEXT,
@@ -1909,15 +2349,21 @@ fn make_collaboration_profile_columns_nullable(connection: &Connection) -> AppRe
                   last_error TEXT,
                   execution_target TEXT NOT NULL DEFAULT 'profile',
                   model_id TEXT,
+                  turn_kind TEXT NOT NULL DEFAULT 'run',
+                  conversation_mode TEXT NOT NULL DEFAULT 'default',
+                  goal_status TEXT,
                   working_directory TEXT NOT NULL,
-                  FOREIGN KEY(binding_id) REFERENCES collaboration_project_bindings(id) ON DELETE CASCADE
+                  FOREIGN KEY(binding_id) REFERENCES collaboration_project_bindings(id) ON DELETE CASCADE,
+                  FOREIGN KEY(context_id) REFERENCES collaboration_contexts(id) ON DELETE SET NULL
                 );
-                INSERT INTO codex_sessions(id, binding_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, working_directory)
-                SELECT id, binding_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, working_directory
+                INSERT INTO codex_sessions(id, binding_id, context_id, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, turn_kind, conversation_mode, goal_status, working_directory)
+                SELECT id, binding_id, NULL, profile_id, provider, provider_bot_id, provider_chat_id, provider_message_id, relay_status, codex_session_id, feishu_message_id, feishu_chat_id, started_by, started_at_ms, updated_at_ms, finished_at_ms, summary, last_error, execution_target, model_id, 'run', 'default', NULL, working_directory
                 FROM codex_sessions_notnull_profile;
                 DROP TABLE codex_sessions_notnull_profile;
                 CREATE INDEX IF NOT EXISTS idx_codex_sessions_binding_status
                   ON codex_sessions(binding_id, relay_status);
+                CREATE INDEX IF NOT EXISTS idx_codex_sessions_context_status
+                  ON codex_sessions(context_id, relay_status);
                 PRAGMA foreign_keys = ON;
                 ",
             )
@@ -2170,6 +2616,7 @@ mod tests {
             session: CodexSessionSummary {
                 id: id.into(),
                 binding_id: "binding-1".into(),
+                context_id: None,
                 provider: CollaborationProvider::Feishu,
                 provider_bot_id: Some("bot-1".into()),
                 provider_chat_id: Some("chat-1".into()),
@@ -2190,6 +2637,9 @@ mod tests {
                 last_error: None,
                 execution_target: "profile".into(),
                 model_id: None,
+                turn_kind: "run".into(),
+                conversation_mode: "default".into(),
+                goal_status: None,
             },
             working_directory: "/tmp".into(),
         }
@@ -2503,6 +2953,55 @@ mod tests {
         assert_eq!(metrics.successful_requests, 1);
         assert_eq!(metrics.failed_requests, 1);
         assert_eq!(metrics.average_latency_ms, Some(100));
+    }
+
+    #[test]
+    fn gateway_metrics_accumulate_estimated_tokens() {
+        let repository = Repository::memory();
+        repository
+            .record_metric_with_tokens(true, 50, 12)
+            .expect("metric with tokens must record");
+        repository
+            .add_estimated_tokens(8)
+            .expect("stream tokens must accumulate");
+
+        let metrics = repository.metrics().unwrap();
+
+        assert_eq!(metrics.total_requests, 1);
+        assert_eq!(metrics.successful_requests, 1);
+        assert_eq!(metrics.estimated_tokens, 20);
+    }
+
+    #[test]
+    fn client_key_material_can_rotate_only_user_keys() {
+        let repository = Repository::memory();
+        insert_test_client_key(&repository, "user", "用户 Key", "client-key:user");
+        insert_test_client_key(
+            &repository,
+            "codex",
+            "Codex CLI Gateway",
+            "client-key:codex",
+        );
+        repository
+            .set_setting(GATEWAY_CODEX_CLIENT_KEY_REF_SETTING, "client-key:codex")
+            .unwrap();
+
+        let secret_ref = repository
+            .update_client_key_material("user", "new-hash", "crl_••••next")
+            .unwrap();
+
+        assert_eq!(secret_ref, "client-key:user");
+        let user = repository
+            .list_client_keys()
+            .unwrap()
+            .into_iter()
+            .find(|key| key.id == "user")
+            .unwrap();
+        assert_eq!(user.masked_value, "crl_••••next");
+        assert!(matches!(
+            repository.update_client_key_material("codex", "hash", "crl_••••deny"),
+            Err(crate::error::AppError::Conflict)
+        ));
     }
 
     #[test]

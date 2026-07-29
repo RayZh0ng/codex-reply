@@ -1112,7 +1112,41 @@ const API_PROVIDER_PRESETS: ApiProviderPreset[] = [
     wireApi: "chat_completions",
     baseUrl: "https://openrouter.ai/api/v1",
   },
+  {
+    id: "anthropic",
+    label: "Anthropic Messages",
+    provider: "anthropic",
+    wireApi: "chat_completions",
+    baseUrl: "https://api.anthropic.com",
+  },
+  {
+    id: "gemini",
+    label: "Gemini generateContent",
+    provider: "gemini",
+    wireApi: "chat_completions",
+    baseUrl: "https://generativelanguage.googleapis.com",
+  },
+  {
+    id: "ollama",
+    label: "Ollama Local",
+    provider: "ollama",
+    wireApi: "chat_completions",
+    baseUrl: "http://127.0.0.1:11434",
+  },
 ];
+
+const PROVIDER_CAPABILITY_NOTES: Record<GatewayProvider, string> = {
+  openai:
+    "OpenAI direct：Responses / Chat Completions 按所选 wire API 透传，支持上游原生参数与模型名回写。",
+  openai_compatible:
+    "OpenAI 兼容 direct：Responses / Chat Completions 按所选 wire API 透传；第三方非等价参数由上游决定。",
+  anthropic:
+    "Anthropic adapter：映射 Messages、system/content blocks、图片 data URL、tools/tool_choice、tool_use/tool_result、SSE 与 usage；不支持 audio/logprobs/top_logprobs。",
+  gemini:
+    "Gemini adapter：映射 v1beta generateContent、systemInstruction、parts/inlineData、functionDeclarations、JSON schema、SSE 与 usageMetadata；不支持 audio/logprobs/top_logprobs。",
+  ollama:
+    "Ollama adapter：OpenAI Chat/Responses 统一落到 /api/chat，映射 tools、format/schema、options、think、newline JSON streaming 与 token 统计；/api/generate 保留 native 透传。",
+};
 
 function identityMappings(models: string[]): GatewayModelMapping[] {
   return models.map((model) => ({
@@ -1333,10 +1367,10 @@ function ApiProfileSheet({
             }}
           />
         </label>
+        <p className="form-note">{PROVIDER_CAPABILITY_NOTES[provider]}</p>
         <p className="form-note">
-          Chat Completions 提供商会通过 Relay 本地路由转换为 Codex
-          Responses；模型映射会生成 Codex model_catalog_json，修改后需重启 Codex 刷新
-          /model 列表。
+          模型映射会生成 Codex model_catalog_json，并决定网关对客户端暴露的 Model
+          ID；修改后需重启 Codex 刷新 /model 列表。
         </p>
         {localError && <p className="form-note error-note">{localError}</p>}
         {report && (

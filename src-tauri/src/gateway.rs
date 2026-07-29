@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{future::join_all, StreamExt, TryStreamExt};
 use ipnet::IpNet;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use reqwest::{redirect::Policy, Client, NoProxy, Proxy};
@@ -29,8 +29,9 @@ use crate::{
     database::Repository,
     database::StoredProfile,
     domain::{
-        ApiServiceTestReport, GatewayModelMapping, GatewayNetworkAddress, GatewayProvider,
-        GatewayStatus, GatewayWireApi, MaskedProfile, ProfileKind,
+        ApiServiceTestReport, GatewayHealthProviderSummary, GatewayHealthSummary,
+        GatewayModelMapping, GatewayNetworkAddress, GatewayProvider, GatewayStatus, GatewayWireApi,
+        MaskedProfile, ProfileKind,
     },
     error::{AppError, AppResult},
     oauth_credentials::{CredentialAccess, OAuthCredentialStore},
@@ -46,6 +47,7 @@ struct GatewayApiState {
     cidrs: Vec<IpNet>,
     oauth_responses_url: Url,
     upstream_proxy: GatewayUpstreamProxy,
+    certificate_ready: bool,
     scheduler: Arc<Mutex<WeightedScheduler>>,
     affinities: Arc<Mutex<HashMap<String, ResponseAffinity>>>,
 }
@@ -440,7 +442,10 @@ impl GatewayManager {
             self.certificate_ready(),
             available_lan_addresses(),
         )?;
-        if settings.bind_mode != "lan"
+        if settings.bind_mode == "loopback" {
+            settings.bind_address = "127.0.0.1".to_owned();
+            settings.cidrs.clear();
+        } else if settings.bind_mode != "lan"
             || settings
                 .bind_address
                 .parse::<IpAddr>()
@@ -462,15 +467,19 @@ impl GatewayManager {
             .parse()
             .map_err(|_| AppError::ValidationFailed)?;
         validate_binding(&settings.bind_mode, address, &settings.cidrs)?;
-        let cidrs = settings
-            .cidrs
-            .iter()
-            .map(|value| {
-                value
-                    .parse::<IpNet>()
-                    .map_err(|_| AppError::ValidationFailed)
-            })
-            .collect::<AppResult<Vec<_>>>()?;
+        let cidrs = if settings.bind_mode == "loopback" {
+            Vec::new()
+        } else {
+            settings
+                .cidrs
+                .iter()
+                .map(|value| {
+                    value
+                        .parse::<IpNet>()
+                        .map_err(|_| AppError::ValidationFailed)
+                })
+                .collect::<AppResult<Vec<_>>>()?
+        };
         let (certificate_pem, key_pem) = self.ensure_local_certificates(address).await?;
         let upstream_proxy =
             match load_gateway_upstream_proxy(&self.repository, self.secrets.clone()).await {
@@ -493,6 +502,7 @@ impl GatewayManager {
             cidrs,
             oauth_responses_url: Url::parse(CODEX_RESPONSES_URL).map_err(|_| AppError::Internal)?,
             upstream_proxy,
+            certificate_ready: self.certificate_ready(),
             scheduler: self.scheduler.clone(),
             affinities: self.affinities.clone(),
         };
@@ -643,6 +653,7 @@ fn new_certificate_authority() -> AppResult<(rcgen::Certificate, KeyPair, String
 
 pub fn validate_binding(mode: &str, address: IpAddr, cidrs: &[String]) -> AppResult<()> {
     match mode {
+        "loopback" if address.is_loopback() && cidrs.is_empty() => Ok(()),
         "lan" if is_private_address(address) => {
             for cidr in cidrs {
                 let _: IpNet = cidr.parse().map_err(|_| AppError::ValidationFailed)?;
@@ -700,11 +711,81 @@ fn is_private_address(address: IpAddr) -> bool {
 }
 
 async fn healthz(State(state): State<GatewayApiState>) -> impl IntoResponse {
-    let has_candidates = candidates_for_model(&state.repository, None)
-        .map(|profiles| !profiles.is_empty())
-        .unwrap_or(false);
-    let status = if has_candidates { "ok" } else { "unavailable" };
-    (StatusCode::OK, Json(json!({"status": status})))
+    let gateway =
+        state
+            .repository
+            .gateway_settings(true, state.certificate_ready, available_lan_addresses());
+    let candidates = candidates_for_model(&state.repository, None).unwrap_or_default();
+    let status = if candidates.is_empty() {
+        "unavailable"
+    } else {
+        "ok"
+    };
+    let mut summaries = HashMap::<(GatewayProvider, String), (HashSet<String>, usize)>::new();
+    for candidate in candidates {
+        let surface = match candidate.profile.kind {
+            ProfileKind::CodexOauth => "openai".to_owned(),
+            ProfileKind::ApiKey => provider_surface(&candidate.profile),
+        };
+        let entry = summaries
+            .entry((candidate.profile.provider.clone(), surface))
+            .or_insert_with(|| (HashSet::new(), 0));
+        entry.1 += 1;
+        for model in candidate.profile.models {
+            entry.0.insert(model);
+        }
+    }
+    let providers = summaries
+        .into_iter()
+        .map(
+            |((provider, surface), (models, profiles))| GatewayHealthProviderSummary {
+                provider,
+                surface,
+                profiles,
+                models: models.len(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let summary = match gateway {
+        Ok(gateway) => GatewayHealthSummary {
+            status: status.to_owned(),
+            running: gateway.running,
+            bind_mode: gateway.bind_mode,
+            service_url: gateway.service_url,
+            available_profiles: gateway.available_profiles,
+            cooling_profiles: gateway.cooling_profiles,
+            certificate_ready: gateway.certificate_ready,
+            client_key_count: gateway.client_key_count,
+            upstream_last_error: gateway.upstream_last_error,
+            providers,
+        },
+        Err(_) => GatewayHealthSummary {
+            status: status.to_owned(),
+            running: true,
+            bind_mode: "unknown".to_owned(),
+            service_url: String::new(),
+            available_profiles: 0,
+            cooling_profiles: 0,
+            certificate_ready: state.certificate_ready,
+            client_key_count: 0,
+            upstream_last_error: None,
+            providers,
+        },
+    };
+    (StatusCode::OK, Json(summary))
+}
+
+fn provider_surface(profile: &MaskedProfile) -> String {
+    match profile.provider {
+        GatewayProvider::OpenAi | GatewayProvider::OpenAiCompatible => match profile.wire_api {
+            GatewayWireApi::Responses => "responses",
+            GatewayWireApi::ChatCompletions => "chat_completions",
+        },
+        GatewayProvider::Anthropic => "messages",
+        GatewayProvider::Gemini => "generate_content",
+        GatewayProvider::Ollama => "chat",
+    }
+    .to_owned()
 }
 
 async fn list_models(
@@ -845,6 +926,7 @@ enum GatewayRequestKind {
     ChatCompletions,
 }
 
+#[derive(Clone)]
 enum ApiResponseAdapter {
     Direct {
         visible_model: String,
@@ -858,6 +940,155 @@ enum ApiResponseAdapter {
         visible_model: String,
         profile_id: String,
     },
+    ProviderToResponses {
+        provider: GatewayProvider,
+        client_stream: bool,
+        visible_model: String,
+    },
+    ProviderToChat {
+        provider: GatewayProvider,
+        client_stream: bool,
+        visible_model: String,
+    },
+}
+
+fn upstream_attempt(
+    profile: &MaskedProfile,
+    payload: &Value,
+    route: &str,
+    request_kind: Option<GatewayRequestKind>,
+    client_stream: bool,
+    visible_model: String,
+    upstream_model: String,
+) -> Result<(String, Value, ApiResponseAdapter), String> {
+    if request_kind.is_none()
+        || matches!(
+            profile.provider,
+            GatewayProvider::OpenAi | GatewayProvider::OpenAiCompatible
+        )
+    {
+        let mut upstream_route = route.to_owned();
+        let mut upstream_payload = payload_with_model(payload, &upstream_model);
+        let mut response_adapter = ApiResponseAdapter::Direct {
+            visible_model: visible_model.clone(),
+        };
+        if profile.wire_api == GatewayWireApi::ChatCompletions
+            && request_kind == Some(GatewayRequestKind::Responses)
+        {
+            upstream_route = "chat/completions".to_owned();
+            upstream_payload = responses_to_chat_completion(payload, &upstream_model)?;
+            response_adapter = ApiResponseAdapter::ChatToResponses {
+                client_stream,
+                visible_model,
+            };
+        } else if profile.wire_api == GatewayWireApi::Responses
+            && request_kind == Some(GatewayRequestKind::ChatCompletions)
+        {
+            upstream_route = "responses".to_owned();
+            upstream_payload = payload_with_model(&chat_to_responses(payload)?, &upstream_model);
+            response_adapter = ApiResponseAdapter::ResponsesToChat {
+                client_stream,
+                visible_model,
+                profile_id: profile.id.clone(),
+            };
+        }
+        return Ok((upstream_route, upstream_payload, response_adapter));
+    }
+
+    let kind = request_kind.ok_or_else(|| "request kind is required".to_owned())?;
+    let chat_payload = match kind {
+        GatewayRequestKind::ChatCompletions => payload_with_model(payload, &upstream_model),
+        GatewayRequestKind::Responses => responses_to_chat_completion(payload, &upstream_model)?,
+    };
+    validate_provider_chat_request(&profile.provider, &chat_payload)?;
+    let upstream_payload = provider_chat_payload(
+        &profile.provider,
+        &chat_payload,
+        &upstream_model,
+        client_stream,
+    )?;
+    let upstream_route = provider_chat_route(&profile.provider, &upstream_model, client_stream);
+    let adapter = match kind {
+        GatewayRequestKind::Responses => ApiResponseAdapter::ProviderToResponses {
+            provider: profile.provider.clone(),
+            client_stream,
+            visible_model,
+        },
+        GatewayRequestKind::ChatCompletions => ApiResponseAdapter::ProviderToChat {
+            provider: profile.provider.clone(),
+            client_stream,
+            visible_model,
+        },
+    };
+    Ok((upstream_route, upstream_payload, adapter))
+}
+
+enum ProviderFanoutAttempt {
+    Response(Response, bool),
+    RetryAfter(Duration),
+    Unhealthy,
+    TemporaryFailure,
+}
+
+fn chat_choice_count(payload: &Value) -> Result<usize, String> {
+    match payload.get("n") {
+        None | Some(Value::Null) => Ok(1),
+        Some(value) => {
+            let Some(count) = value.as_u64() else {
+                return Err("n must be a positive integer".to_owned());
+            };
+            if !(1..=128).contains(&count) {
+                return Err("n must be between 1 and 128".to_owned());
+            }
+            Ok(count as usize)
+        }
+    }
+}
+
+fn provider_chat_route(provider: &GatewayProvider, model: &str, stream: bool) -> String {
+    match provider {
+        GatewayProvider::Anthropic => "v1/messages".to_owned(),
+        GatewayProvider::Gemini if stream => {
+            format!("v1beta/models/{model}:streamGenerateContent?alt=sse")
+        }
+        GatewayProvider::Gemini => format!("v1beta/models/{model}:generateContent"),
+        GatewayProvider::Ollama => "api/chat".to_owned(),
+        GatewayProvider::OpenAi | GatewayProvider::OpenAiCompatible => {
+            "chat/completions".to_owned()
+        }
+    }
+}
+
+fn validate_provider_chat_request(
+    provider: &GatewayProvider,
+    payload: &Value,
+) -> Result<(), String> {
+    let unsupported = match provider {
+        GatewayProvider::Anthropic | GatewayProvider::Gemini | GatewayProvider::Ollama => {
+            ["audio", "logprobs", "top_logprobs"]
+                .into_iter()
+                .find(|field| payload.get(field).is_some_and(|value| !value.is_null()))
+        }
+        _ => None,
+    };
+    if let Some(field) = unsupported {
+        return Err(format!("{field} is not supported by this provider adapter"));
+    }
+    Ok(())
+}
+
+fn provider_chat_payload(
+    provider: &GatewayProvider,
+    payload: &Value,
+    model: &str,
+    stream: bool,
+) -> Result<Value, String> {
+    match provider {
+        GatewayProvider::Anthropic => anthropic_chat_payload(payload, model, stream),
+        GatewayProvider::Gemini => gemini_chat_payload(payload, stream),
+        GatewayProvider::Ollama => ollama_chat_payload_from_openai(payload, model, stream),
+        _ => Ok(payload_with_model(payload, model)),
+    }
 }
 
 fn visible_model_for(profile: &MaskedProfile, requested: Option<&str>) -> String {
@@ -945,6 +1176,10 @@ async fn forward(
                 if candidate.profile.kind == ProfileKind::CodexOauth {
                     request_kind.is_some()
                         && requested_provider == GatewayProvider::OpenAiCompatible
+                } else if request_kind.is_some()
+                    && requested_provider == GatewayProvider::OpenAiCompatible
+                {
+                    true
                 } else {
                     candidate.profile.provider == requested_provider
                         || matches!(
@@ -1018,7 +1253,7 @@ async fn forward(
         }
     };
     let started = Instant::now();
-    for candidate in candidates.into_iter().take(2) {
+    for candidate in candidates.into_iter() {
         if candidate.profile.kind == ProfileKind::CodexOauth {
             let Some(kind) = request_kind else {
                 continue;
@@ -1069,37 +1304,18 @@ async fn forward(
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut upstream_route = route.to_owned();
-        let mut upstream_payload = payload_with_model(&payload, &upstream_model);
-        let mut response_adapter = ApiResponseAdapter::Direct {
-            visible_model: visible_model.clone(),
+        let (upstream_route, upstream_payload, response_adapter) = match upstream_attempt(
+            &candidate.profile,
+            &payload,
+            route,
+            request_kind,
+            client_stream,
+            visible_model.clone(),
+            upstream_model.clone(),
+        ) {
+            Ok(value) => value,
+            Err(message) => return openai_bad_request(&message),
         };
-        if candidate.profile.wire_api == GatewayWireApi::ChatCompletions
-            && request_kind == Some(GatewayRequestKind::Responses)
-        {
-            upstream_route = "chat/completions".to_owned();
-            upstream_payload = match responses_to_chat_completion(&payload, &upstream_model) {
-                Ok(value) => value,
-                Err(message) => return openai_bad_request(&message),
-            };
-            response_adapter = ApiResponseAdapter::ChatToResponses {
-                client_stream,
-                visible_model,
-            };
-        } else if candidate.profile.wire_api == GatewayWireApi::Responses
-            && request_kind == Some(GatewayRequestKind::ChatCompletions)
-        {
-            upstream_route = "responses".to_owned();
-            upstream_payload = match chat_to_responses(&payload) {
-                Ok(value) => payload_with_model(&value, &upstream_model),
-                Err(message) => return openai_bad_request(&message),
-            };
-            response_adapter = ApiResponseAdapter::ResponsesToChat {
-                client_stream,
-                visible_model,
-                profile_id: candidate.profile.id.clone(),
-            };
-        }
         let endpoint = match build_upstream_url(&base_url, &upstream_route) {
             Ok(url) => url,
             Err(_) => continue,
@@ -1108,6 +1324,62 @@ async fn forward(
             Ok(key) => key,
             Err(_) => continue,
         };
+        if let ApiResponseAdapter::ProviderToChat {
+            provider,
+            client_stream,
+            visible_model,
+        } = &response_adapter
+        {
+            let choice_count = match chat_choice_count(&payload) {
+                Ok(value) => value,
+                Err(message) => return openai_bad_request(&message),
+            };
+            if choice_count > 1 {
+                match forward_provider_chat_choices(ProviderFanoutRequest {
+                    client: &client,
+                    endpoint: endpoint.clone(),
+                    provider: provider.clone(),
+                    key: key.clone(),
+                    upstream_payload: upstream_payload.clone(),
+                    choice_count,
+                    client_stream: *client_stream,
+                    model: visible_model.clone(),
+                    repository: state.repository.clone(),
+                })
+                .await
+                {
+                    ProviderFanoutAttempt::Response(response, successful) => {
+                        if successful {
+                            clear_gateway_upstream_error(&state.repository);
+                        }
+                        let _ = state
+                            .repository
+                            .record_metric(successful, started.elapsed().as_millis() as i64);
+                        return response;
+                    }
+                    ProviderFanoutAttempt::RetryAfter(duration) => {
+                        cool_down_profile(&state.repository, &candidate.profile.id, duration);
+                        continue;
+                    }
+                    ProviderFanoutAttempt::Unhealthy => {
+                        mark_profile_health(&state.repository, &candidate.profile.id, "unhealthy");
+                        continue;
+                    }
+                    ProviderFanoutAttempt::TemporaryFailure => {
+                        record_gateway_upstream_error(
+                            &state.repository,
+                            GATEWAY_ERROR_FIRST_RESPONSE,
+                        );
+                        cool_down_profile(
+                            &state.repository,
+                            &candidate.profile.id,
+                            Duration::from_secs(15),
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
         let request = upstream_request(
             client.post(endpoint),
             &candidate.profile.provider,
@@ -1124,6 +1396,15 @@ async fn forward(
                     &candidate.profile.id,
                     retry_after(&response).unwrap_or_else(|| Duration::from_secs(30)),
                 );
+                continue;
+            }
+            Ok(response)
+                if matches!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) =>
+            {
+                mark_profile_health(&state.repository, &candidate.profile.id, "unhealthy");
                 continue;
             }
             Ok(response) => {
@@ -1169,6 +1450,36 @@ async fn forward(
                             profile_id,
                             state.repository.clone(),
                             state.affinities.clone(),
+                        )
+                        .await
+                    }
+                    ApiResponseAdapter::ProviderToResponses {
+                        provider,
+                        client_stream,
+                        visible_model,
+                    } => {
+                        adapt_provider_response(
+                            response,
+                            provider,
+                            GatewayRequestKind::Responses,
+                            client_stream,
+                            visible_model,
+                            state.repository.clone(),
+                        )
+                        .await
+                    }
+                    ApiResponseAdapter::ProviderToChat {
+                        provider,
+                        client_stream,
+                        visible_model,
+                    } => {
+                        adapt_provider_response(
+                            response,
+                            provider,
+                            GatewayRequestKind::ChatCompletions,
+                            client_stream,
+                            visible_model,
+                            state.repository.clone(),
                         )
                         .await
                     }
@@ -1460,6 +1771,10 @@ async fn adapt_oauth_response(
                             Ok(bytes) => {
                                 buffer.push_str(&String::from_utf8_lossy(&bytes));
                                 for event in drain_sse_events(buffer) {
+                                    let tokens = usage_tokens_from_response_event(&event);
+                                    if tokens > 0 {
+                                        let _ = repository.add_estimated_tokens(tokens);
+                                    }
                                     if let Some(id) = response_id_from_event(&event) {
                                         record_affinity(&affinities, &id, &profile_id);
                                     }
@@ -1492,6 +1807,10 @@ async fn adapt_oauth_response(
                                 let events = drain_sse_events(&mut state.buffer);
                                 let mut output = String::new();
                                 for event in events {
+                                    let tokens = usage_tokens_from_response_event(&event);
+                                    if tokens > 0 {
+                                        let _ = repository.add_estimated_tokens(tokens);
+                                    }
                                     output.push_str(&state.translate(event));
                                 }
                                 Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
@@ -1527,6 +1846,7 @@ async fn adapt_oauth_response(
     if let Some(id) = completed.get("id").and_then(Value::as_str) {
         record_affinity(&affinities, id, &profile_id);
     }
+    let _ = repository.add_estimated_tokens(usage_tokens_from_value(&completed));
     match kind {
         GatewayRequestKind::Responses => Json(completed).into_response(),
         GatewayRequestKind::ChatCompletions => {
@@ -1551,14 +1871,6 @@ fn sse_response(body: Body) -> Response {
 fn validate_chat_request(payload: &Value) -> Result<(), String> {
     if payload.get("messages").and_then(Value::as_array).is_none() {
         return Err("messages is required".to_owned());
-    }
-    if payload.get("n").and_then(Value::as_i64).unwrap_or(1) != 1 {
-        return Err("n must be 1".to_owned());
-    }
-    for field in ["audio", "logprobs", "top_logprobs"] {
-        if payload.get(field).is_some_and(|value| !value.is_null()) {
-            return Err(format!("{field} is not supported"));
-        }
     }
     Ok(())
 }
@@ -1816,6 +2128,471 @@ fn responses_content_to_chat(content: &Value) -> Value {
     }
 }
 
+fn chat_messages(payload: &Value) -> Result<Vec<Value>, String> {
+    payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "messages is required".to_owned())
+}
+
+fn openai_tools_to_anthropic(payload: &Value) -> Vec<Value> {
+    payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("function"))
+        .map(|function| {
+            json!({
+                "name": function.get("name").cloned().unwrap_or_default(),
+                "description": function.get("description").cloned().unwrap_or_default(),
+                "input_schema": function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"}))
+            })
+        })
+        .collect()
+}
+
+fn openai_tools_to_gemini(payload: &Value) -> Vec<Value> {
+    let declarations = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("function"))
+        .map(|function| {
+            json!({
+                "name": function.get("name").cloned().unwrap_or_default(),
+                "description": function.get("description").cloned().unwrap_or_default(),
+                "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"}))
+            })
+        })
+        .collect::<Vec<_>>();
+    if declarations.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!({"functionDeclarations": declarations})]
+    }
+}
+
+fn anthropic_chat_payload(payload: &Value, model: &str, stream: bool) -> Result<Value, String> {
+    let mut system_parts = Vec::new();
+    let mut messages = Vec::new();
+    for message in chat_messages(payload)? {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if role == "system" {
+            if let Some(text) = openai_content_text(message.get("content").unwrap_or(&Value::Null))
+            {
+                system_parts.push(text);
+            }
+            continue;
+        }
+        if role == "tool" {
+            messages.push(json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": message.get("tool_call_id").cloned().unwrap_or_default(),
+                    "content": openai_content_text(message.get("content").unwrap_or(&Value::Null)).unwrap_or_default()
+                }]
+            }));
+            continue;
+        }
+        let anthropic_role = if role == "assistant" {
+            "assistant"
+        } else {
+            "user"
+        };
+        let mut content =
+            openai_content_to_anthropic_blocks(message.get("content").unwrap_or(&Value::Null));
+        if role == "assistant" {
+            for tool_call in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let function = tool_call.get("function").cloned().unwrap_or_default();
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": tool_call.get("id").cloned().unwrap_or_default(),
+                    "name": function.get("name").cloned().unwrap_or_default(),
+                    "input": serde_json::from_str::<Value>(
+                        function.get("arguments").and_then(Value::as_str).unwrap_or("{}")
+                    ).unwrap_or_else(|_| json!({"arguments": function.get("arguments").cloned().unwrap_or_default()}))
+                }));
+            }
+        }
+        if content.is_empty() {
+            content.push(json!({"type":"text", "text":""}));
+        }
+        messages.push(json!({"role": anthropic_role, "content": content}));
+    }
+    let mut output = json!({
+        "model": model,
+        "max_tokens": payload
+            .get("max_tokens")
+            .or_else(|| payload.get("max_completion_tokens"))
+            .or_else(|| payload.get("max_output_tokens"))
+            .cloned()
+            .unwrap_or_else(|| json!(4096)),
+        "messages": messages,
+        "stream": stream
+    });
+    let object = output
+        .as_object_mut()
+        .ok_or_else(|| "invalid request".to_owned())?;
+    if !system_parts.is_empty() {
+        object.insert("system".to_owned(), Value::String(system_parts.join("\n")));
+    }
+    for (from, to) in [("temperature", "temperature"), ("top_p", "top_p")] {
+        if let Some(value) = payload.get(from).filter(|value| !value.is_null()) {
+            object.insert(to.to_owned(), value.clone());
+        }
+    }
+    if let Some(stop) = payload.get("stop").filter(|value| !value.is_null()) {
+        object.insert("stop_sequences".to_owned(), stop.clone());
+    }
+    let tools = openai_tools_to_anthropic(payload);
+    if !tools.is_empty() {
+        object.insert("tools".to_owned(), Value::Array(tools));
+    }
+    if let Some(choice) = payload.get("tool_choice").filter(|value| !value.is_null()) {
+        object.insert("tool_choice".to_owned(), anthropic_tool_choice(choice));
+    }
+    Ok(output)
+}
+
+fn anthropic_tool_choice(choice: &Value) -> Value {
+    if let Some(text) = choice.as_str() {
+        return match text {
+            "none" => json!({"type":"none"}),
+            "required" => json!({"type":"any"}),
+            _ => json!({"type":"auto"}),
+        };
+    }
+    choice
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .map(|name| json!({"type":"tool", "name": name}))
+        .unwrap_or_else(|| json!({"type":"auto"}))
+}
+
+fn openai_content_to_anthropic_blocks(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(text) => vec![json!({"type":"text", "text": text})],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("text" | "input_text") => Some(json!({
+                    "type":"text",
+                    "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
+                })),
+                Some("image_url" | "input_image") => part
+                    .get("image_url")
+                    .and_then(|value| value.get("url").or(Some(value)))
+                    .and_then(Value::as_str)
+                    .and_then(data_url_image_source)
+                    .map(|source| json!({"type":"image", "source": source})),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn data_url_image_source(url: &str) -> Option<Value> {
+    let rest = url.strip_prefix("data:")?;
+    let (media, data) = rest.split_once(",")?;
+    let media_type = media.strip_suffix(";base64").unwrap_or(media);
+    Some(json!({"type":"base64", "media_type": media_type, "data": data}))
+}
+
+fn openai_content_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("input_text"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Value::Null => None,
+        _ => Some(content.to_string()),
+    }
+}
+
+fn gemini_chat_payload(payload: &Value, _stream: bool) -> Result<Value, String> {
+    let mut contents = Vec::new();
+    let mut system_parts = Vec::new();
+    for message in chat_messages(payload)? {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if role == "system" {
+            if let Some(text) = openai_content_text(message.get("content").unwrap_or(&Value::Null))
+            {
+                system_parts.push(json!({"text": text}));
+            }
+            continue;
+        }
+        if role == "tool" {
+            contents.push(json!({
+                "role": "user",
+                "parts": [{"functionResponse": {
+                    "name": message.get("tool_name").and_then(Value::as_str).unwrap_or("tool"),
+                    "response": {"content": message.get("content").cloned().unwrap_or_default()}
+                }}]
+            }));
+            continue;
+        }
+        let mut parts =
+            openai_content_to_gemini_parts(message.get("content").unwrap_or(&Value::Null));
+        if role == "assistant" {
+            for tool_call in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let function = tool_call.get("function").cloned().unwrap_or_default();
+                parts.push(json!({"functionCall": {
+                    "name": function.get("name").cloned().unwrap_or_default(),
+                    "args": serde_json::from_str::<Value>(
+                        function.get("arguments").and_then(Value::as_str).unwrap_or("{}")
+                    ).unwrap_or_default()
+                }}));
+            }
+        }
+        if parts.is_empty() {
+            parts.push(json!({"text":""}));
+        }
+        contents.push(json!({
+            "role": if role == "assistant" { "model" } else { "user" },
+            "parts": parts
+        }));
+    }
+    let mut output = json!({"contents": contents});
+    let object = output
+        .as_object_mut()
+        .ok_or_else(|| "invalid request".to_owned())?;
+    if !system_parts.is_empty() {
+        object.insert(
+            "systemInstruction".to_owned(),
+            json!({"parts": system_parts}),
+        );
+    }
+    let generation_config = gemini_generation_config(payload);
+    if !generation_config.is_null() {
+        object.insert("generationConfig".to_owned(), generation_config);
+    }
+    let tools = openai_tools_to_gemini(payload);
+    if !tools.is_empty() {
+        object.insert("tools".to_owned(), Value::Array(tools));
+    }
+    if let Some(tool_config) = gemini_tool_config(payload.get("tool_choice")) {
+        object.insert("toolConfig".to_owned(), tool_config);
+    }
+    Ok(output)
+}
+
+fn openai_content_to_gemini_parts(content: &Value) -> Vec<Value> {
+    match content {
+        Value::String(text) => vec![json!({"text": text})],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("text" | "input_text") => Some(json!({
+                    "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
+                })),
+                Some("image_url" | "input_image") => part
+                    .get("image_url")
+                    .and_then(|value| value.get("url").or(Some(value)))
+                    .and_then(Value::as_str)
+                    .and_then(|url| {
+                        let rest = url.strip_prefix("data:")?;
+                        let (media, data) = rest.split_once(",")?;
+                        Some(json!({"inlineData": {
+                            "mimeType": media.strip_suffix(";base64").unwrap_or(media),
+                            "data": data
+                        }}))
+                    }),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn gemini_generation_config(payload: &Value) -> Value {
+    let mut config = serde_json::Map::new();
+    for (from, to) in [
+        ("temperature", "temperature"),
+        ("top_p", "topP"),
+        ("seed", "seed"),
+    ] {
+        if let Some(value) = payload.get(from).filter(|value| !value.is_null()) {
+            config.insert(to.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = payload
+        .get("max_tokens")
+        .or_else(|| payload.get("max_completion_tokens"))
+        .or_else(|| payload.get("max_output_tokens"))
+        .filter(|value| !value.is_null())
+    {
+        config.insert("maxOutputTokens".to_owned(), value.clone());
+    }
+    if let Some(stop) = payload.get("stop").filter(|value| !value.is_null()) {
+        config.insert("stopSequences".to_owned(), stop.clone());
+    }
+    if let Some(format) = payload
+        .get("response_format")
+        .filter(|value| !value.is_null())
+    {
+        if format.get("type").and_then(Value::as_str) == Some("json_object") {
+            config.insert(
+                "responseMimeType".to_owned(),
+                Value::String("application/json".to_owned()),
+            );
+        }
+        if let Some(schema) = format
+            .get("json_schema")
+            .and_then(|json_schema| json_schema.get("schema"))
+            .or_else(|| format.get("schema"))
+        {
+            config.insert(
+                "responseMimeType".to_owned(),
+                Value::String("application/json".to_owned()),
+            );
+            config.insert("responseSchema".to_owned(), schema.clone());
+        }
+    }
+    Value::Object(config)
+}
+
+fn gemini_tool_config(choice: Option<&Value>) -> Option<Value> {
+    let choice = choice?.clone();
+    if choice.is_null() {
+        return None;
+    }
+    let mode = match choice.as_str() {
+        Some("none") => "NONE",
+        Some("required") => "ANY",
+        Some("auto") | None => "AUTO",
+        _ => "AUTO",
+    };
+    let mut config = json!({"functionCallingConfig": {"mode": mode}});
+    if let Some(name) = choice
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+    {
+        config["functionCallingConfig"]["mode"] = Value::String("ANY".to_owned());
+        config["functionCallingConfig"]["allowedFunctionNames"] = json!([name]);
+    }
+    Some(config)
+}
+
+fn ollama_chat_payload_from_openai(
+    payload: &Value,
+    model: &str,
+    stream: bool,
+) -> Result<Value, String> {
+    let mut messages = chat_messages(payload)?;
+    for message in &mut messages {
+        if let Some(object) = message.as_object_mut() {
+            if object.get("content").is_some_and(Value::is_array) {
+                let content = Value::Array(
+                    object
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|part| {
+                            part.get("text")
+                                .or_else(|| part.get("input_text"))
+                                .and_then(Value::as_str)
+                        })
+                        .map(|text| Value::String(text.to_owned()))
+                        .collect(),
+                );
+                object.insert(
+                    "content".to_owned(),
+                    Value::String(
+                        content
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                );
+            }
+        }
+    }
+    let mut output = json!({"model": model, "messages": messages, "stream": stream});
+    let object = output
+        .as_object_mut()
+        .ok_or_else(|| "invalid request".to_owned())?;
+    if let Some(tools) = payload.get("tools").filter(|value| !value.is_null()) {
+        object.insert("tools".to_owned(), tools.clone());
+    }
+    if let Some(format) = payload
+        .get("response_format")
+        .filter(|value| !value.is_null())
+    {
+        if format.get("type").and_then(Value::as_str) == Some("json_object") {
+            object.insert("format".to_owned(), Value::String("json".to_owned()));
+        } else if let Some(schema) = format
+            .get("json_schema")
+            .and_then(|json_schema| json_schema.get("schema"))
+            .or_else(|| format.get("schema"))
+        {
+            object.insert("format".to_owned(), schema.clone());
+        }
+    }
+    let mut options = serde_json::Map::new();
+    for (from, to) in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("seed", "seed"),
+        ("stop", "stop"),
+    ] {
+        if let Some(value) = payload.get(from).filter(|value| !value.is_null()) {
+            options.insert(to.to_owned(), value.clone());
+        }
+    }
+    if let Some(value) = payload
+        .get("max_tokens")
+        .or_else(|| payload.get("max_completion_tokens"))
+        .or_else(|| payload.get("max_output_tokens"))
+        .filter(|value| !value.is_null())
+    {
+        options.insert("num_predict".to_owned(), value.clone());
+    }
+    if !options.is_empty() {
+        object.insert("options".to_owned(), Value::Object(options));
+    }
+    if let Some(reasoning) = payload
+        .get("reasoning")
+        .or_else(|| payload.get("reasoning_effort"))
+    {
+        object.insert("think".to_owned(), reasoning.clone());
+    }
+    Ok(output)
+}
+
 async fn adapt_chat_completion_response(
     response: reqwest::Response,
     client_stream: bool,
@@ -1832,6 +2609,10 @@ async fn adapt_chat_completion_response(
                         let events = drain_sse_events(&mut state.buffer);
                         let mut output = String::new();
                         for event in events {
+                            let tokens = usage_tokens_from_value(&event);
+                            if tokens > 0 {
+                                let _ = repository.add_estimated_tokens(tokens);
+                            }
                             output.push_str(&state.translate(event));
                         }
                         Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
@@ -1862,6 +2643,7 @@ async fn adapt_chat_completion_response(
         )
             .into_response();
     };
+    let _ = repository.add_estimated_tokens(usage_tokens_from_value(&completed));
     Json(chat_completion_to_response(&completed, &model)).into_response()
 }
 
@@ -2373,6 +3155,1023 @@ fn retry_after(response: &reqwest::Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+struct ProviderFanoutRequest<'a> {
+    client: &'a Client,
+    endpoint: Url,
+    provider: GatewayProvider,
+    key: String,
+    upstream_payload: Value,
+    choice_count: usize,
+    client_stream: bool,
+    model: String,
+    repository: Arc<Repository>,
+}
+
+async fn forward_provider_chat_choices(
+    request: ProviderFanoutRequest<'_>,
+) -> ProviderFanoutAttempt {
+    let attempts = (0..request.choice_count).map(|_| {
+        let request = upstream_request(
+            request.client.post(request.endpoint.clone()),
+            &request.provider,
+            &request.key,
+            &request.upstream_payload,
+        );
+        send_with_first_response_timeout(request)
+    });
+    let results = join_all(attempts).await;
+    let mut responses = Vec::with_capacity(request.choice_count);
+    for result in results {
+        let response = match result {
+            Ok(response) => response,
+            Err(_) => return ProviderFanoutAttempt::TemporaryFailure,
+        };
+        if response.status().is_server_error() || response.status() == StatusCode::TOO_MANY_REQUESTS
+        {
+            return ProviderFanoutAttempt::RetryAfter(
+                retry_after(&response).unwrap_or_else(|| Duration::from_secs(30)),
+            );
+        }
+        if matches!(
+            response.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ) {
+            return ProviderFanoutAttempt::Unhealthy;
+        }
+        if !response.status().is_success() {
+            return ProviderFanoutAttempt::Response(
+                upstream_provider_error_response(response).await,
+                false,
+            );
+        }
+        responses.push(response);
+    }
+    if request.client_stream {
+        ProviderFanoutAttempt::Response(
+            adapt_provider_chat_fanout_stream(
+                responses,
+                request.provider,
+                request.model,
+                request.repository,
+            ),
+            true,
+        )
+    } else {
+        ProviderFanoutAttempt::Response(
+            adapt_provider_chat_fanout_response(
+                responses,
+                request.provider,
+                request.model,
+                request.repository,
+            )
+            .await,
+            true,
+        )
+    }
+}
+
+async fn upstream_provider_error_response(response: reqwest::Response) -> Response {
+    let status = response.status();
+    let bytes = response.bytes().await.unwrap_or_else(|_| Bytes::new());
+    let value = serde_json::from_slice::<Value>(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).trim().to_owned()));
+    let message = match &value {
+        Value::Object(object) => object
+            .get("error")
+            .and_then(|error| {
+                error
+                    .get("message")
+                    .or_else(|| error.get("code"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| object.get("message").and_then(Value::as_str))
+            .unwrap_or("upstream request failed")
+            .to_owned(),
+        Value::String(text) if !text.is_empty() => text.clone(),
+        _ => "upstream request failed".to_owned(),
+    };
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "upstream_error",
+                "code": "upstream_error",
+                "upstream": value
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn adapt_provider_chat_fanout_response(
+    responses: Vec<reqwest::Response>,
+    provider: GatewayProvider,
+    model: String,
+    repository: Arc<Repository>,
+) -> Response {
+    let mut choices = Vec::new();
+    let mut prompt_tokens = 0_i64;
+    let mut completion_tokens = 0_i64;
+    let mut total_tokens = 0_i64;
+    let mut estimated_tokens = 0_i64;
+    let created = timestamp_ms() / 1000;
+
+    for (index, response) in responses.into_iter().enumerate() {
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        };
+        let value = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": {"code": "invalid_upstream_response"}})),
+                )
+                    .into_response()
+            }
+        };
+        estimated_tokens += provider_usage_tokens(&provider, &value);
+        let chat = provider_value_to_chat(&provider, &value, &model);
+        if let Some(usage) = chat.get("usage") {
+            prompt_tokens += usage
+                .get("prompt_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            completion_tokens += usage
+                .get("completion_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            total_tokens += usage
+                .get("total_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+        }
+        let Some(mut choice) = chat
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .cloned()
+        else {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"code": "invalid_upstream_response"}})),
+            )
+                .into_response();
+        };
+        if let Some(choice) = choice.as_object_mut() {
+            choice.insert("index".to_owned(), json!(index));
+        }
+        choices.push(choice);
+    }
+
+    let _ = repository.add_estimated_tokens(estimated_tokens);
+    Json(json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
+        }
+    }))
+    .into_response()
+}
+
+fn adapt_provider_chat_fanout_stream(
+    responses: Vec<reqwest::Response>,
+    provider: GatewayProvider,
+    model: String,
+    repository: Arc<Repository>,
+) -> Response {
+    let choice_count = responses.len();
+    let streams = responses.into_iter().enumerate().map(|(index, response)| {
+        response
+            .bytes_stream()
+            .map_err(std::io::Error::other)
+            .map(move |chunk| (index, chunk))
+            .boxed()
+    });
+    let merged = futures_util::stream::select_all(streams);
+    let states = (0..choice_count)
+        .map(|index| {
+            (
+                String::new(),
+                ProviderSseState::new_choice(
+                    provider.clone(),
+                    GatewayRequestKind::ChatCompletions,
+                    model.clone(),
+                    index,
+                    false,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let stream = merged.scan(
+        (states, vec![false; choice_count], 0_usize, false),
+        move |(states, done, done_count, terminated), (index, chunk)| {
+            let repository = repository.clone();
+            let provider = provider.clone();
+            let result = if *terminated {
+                None
+            } else {
+                match chunk {
+                    Ok(bytes) => {
+                        let Some((buffer, state)) = states.get_mut(index) else {
+                            return futures_util::future::ready(None);
+                        };
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let events = if provider == GatewayProvider::Ollama {
+                            drain_json_lines(buffer)
+                        } else {
+                            drain_sse_events(buffer)
+                        };
+                        let mut output = String::new();
+                        for event in events {
+                            let (translated, tokens) = if provider == GatewayProvider::Ollama {
+                                translate_ollama_event(state, event)
+                            } else {
+                                state.translate(event)
+                            };
+                            if tokens > 0 {
+                                let _ = repository.add_estimated_tokens(tokens);
+                            }
+                            output.push_str(&translated);
+                            if state.done && !done[index] {
+                                done[index] = true;
+                                *done_count += 1;
+                            }
+                        }
+                        if *done_count == done.len() {
+                            output.push_str("data: [DONE]\n\n");
+                            *terminated = true;
+                        }
+                        Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
+                    }
+                    Err(_) => {
+                        record_gateway_upstream_error(
+                            &repository,
+                            GATEWAY_ERROR_STREAM_INTERRUPTED,
+                        );
+                        *terminated = true;
+                        Some(Ok(Bytes::from(sse_upstream_error_event(Some(
+                            GatewayRequestKind::ChatCompletions,
+                        )))))
+                    }
+                }
+            };
+            futures_util::future::ready(result)
+        },
+    );
+    sse_response(Body::from_stream(stream))
+}
+
+async fn adapt_provider_response(
+    response: reqwest::Response,
+    provider: GatewayProvider,
+    kind: GatewayRequestKind,
+    client_stream: bool,
+    model: String,
+    repository: Arc<Repository>,
+) -> Response {
+    if !response.status().is_success() {
+        return upstream_provider_error_response(response).await;
+    }
+    if client_stream {
+        return match provider {
+            GatewayProvider::Ollama => adapt_ollama_stream(response, kind, model, repository),
+            GatewayProvider::Anthropic | GatewayProvider::Gemini => {
+                adapt_provider_sse_stream(response, provider, kind, model, repository)
+            }
+            _ => upstream_response(response, repository, Some(kind)),
+        };
+    }
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": {"code": "invalid_upstream_response"}})),
+            )
+                .into_response()
+        }
+    };
+    let tokens = provider_usage_tokens(&provider, &value);
+    let _ = repository.add_estimated_tokens(tokens);
+    let output = match kind {
+        GatewayRequestKind::Responses => provider_value_to_response(&provider, &value, &model),
+        GatewayRequestKind::ChatCompletions => provider_value_to_chat(&provider, &value, &model),
+    };
+    Json(output).into_response()
+}
+
+fn provider_value_to_response(provider: &GatewayProvider, value: &Value, model: &str) -> Value {
+    match provider {
+        GatewayProvider::Anthropic => anthropic_value_to_response(value, model),
+        GatewayProvider::Gemini => gemini_value_to_response(value, model),
+        GatewayProvider::Ollama => ollama_value_to_response(value, model),
+        _ => value.clone(),
+    }
+}
+
+fn provider_value_to_chat(provider: &GatewayProvider, value: &Value, model: &str) -> Value {
+    match provider {
+        GatewayProvider::Anthropic => {
+            response_to_chat_completion(&anthropic_value_to_response(value, model), model)
+        }
+        GatewayProvider::Gemini => {
+            response_to_chat_completion(&gemini_value_to_response(value, model), model)
+        }
+        GatewayProvider::Ollama => {
+            response_to_chat_completion(&ollama_value_to_response(value, model), model)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn anthropic_value_to_response(value: &Value, model: &str) -> Value {
+    let mut output = Vec::new();
+    for block in value
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => output.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": block.get("text").and_then(Value::as_str).unwrap_or_default()}]
+            })),
+            Some("tool_use") => output.push(json!({
+                "type": "function_call",
+                "id": block.get("id").cloned().unwrap_or_default(),
+                "call_id": block.get("id").cloned().unwrap_or_default(),
+                "name": block.get("name").cloned().unwrap_or_default(),
+                "arguments": block.get("input").map(Value::to_string).unwrap_or_else(|| "{}".to_owned())
+            })),
+            _ => {}
+        }
+    }
+    json!({
+        "id": value.get("id").cloned().unwrap_or_else(|| Value::String(format!("resp_{}", uuid::Uuid::new_v4()))),
+        "object": "response",
+        "created_at": timestamp_ms() / 1000,
+        "model": model,
+        "status": "completed",
+        "output": output,
+        "usage": responses_usage_from_anthropic(value.get("usage"))
+    })
+}
+
+fn gemini_value_to_response(value: &Value, model: &str) -> Value {
+    let mut output = Vec::new();
+    let parts = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("content"))
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut text = String::new();
+    for part in parts {
+        if let Some(delta) = part.get("text").and_then(Value::as_str) {
+            text.push_str(delta);
+        }
+        if let Some(call) = part.get("functionCall") {
+            let call_id = format!("call_{}", uuid::Uuid::new_v4());
+            output.push(json!({
+                "type": "function_call",
+                "id": call_id,
+                "call_id": call_id,
+                "name": call.get("name").cloned().unwrap_or_default(),
+                "arguments": call.get("args").map(Value::to_string).unwrap_or_else(|| "{}".to_owned())
+            }));
+        }
+    }
+    if !text.is_empty() || output.is_empty() {
+        output.insert(
+            0,
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]
+            }),
+        );
+    }
+    json!({
+        "id": format!("resp_{}", uuid::Uuid::new_v4()),
+        "object": "response",
+        "created_at": timestamp_ms() / 1000,
+        "model": model,
+        "status": "completed",
+        "output": output,
+        "usage": responses_usage_from_gemini(value.get("usageMetadata"))
+    })
+}
+
+fn ollama_value_to_response(value: &Value, model: &str) -> Value {
+    let message = value.get("message").cloned().unwrap_or_default();
+    let mut output = Vec::new();
+    if let Some(content) = message.get("content").and_then(Value::as_str) {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content}]
+        }));
+    }
+    for call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let function = call
+            .get("function")
+            .cloned()
+            .unwrap_or_else(|| call.clone());
+        let call_id = format!("call_{}", uuid::Uuid::new_v4());
+        output.push(json!({
+            "type": "function_call",
+            "id": call_id,
+            "call_id": call_id,
+            "name": function.get("name").cloned().unwrap_or_default(),
+            "arguments": function.get("arguments").map(Value::to_string).unwrap_or_else(|| "{}".to_owned())
+        }));
+    }
+    json!({
+        "id": format!("resp_{}", uuid::Uuid::new_v4()),
+        "object": "response",
+        "created_at": timestamp_ms() / 1000,
+        "model": model,
+        "status": "completed",
+        "output": output,
+        "usage": responses_usage_from_ollama(value)
+    })
+}
+
+fn responses_usage_from_anthropic(usage: Option<&Value>) -> Value {
+    let input = usage
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let output = usage
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    json!({"input_tokens": input, "output_tokens": output, "total_tokens": input + output})
+}
+
+fn responses_usage_from_gemini(usage: Option<&Value>) -> Value {
+    let input = usage
+        .and_then(|usage| usage.get("promptTokenCount"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let output = usage
+        .and_then(|usage| usage.get("candidatesTokenCount"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    json!({
+        "input_tokens": input,
+        "output_tokens": output,
+        "total_tokens": usage.and_then(|usage| usage.get("totalTokenCount")).and_then(Value::as_i64).unwrap_or(input + output)
+    })
+}
+
+fn responses_usage_from_ollama(value: &Value) -> Value {
+    let input = value
+        .get("prompt_eval_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let output = value
+        .get("eval_count")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    json!({"input_tokens": input, "output_tokens": output, "total_tokens": input + output})
+}
+
+fn provider_usage_tokens(provider: &GatewayProvider, value: &Value) -> i64 {
+    match provider {
+        GatewayProvider::Anthropic => value
+            .get("usage")
+            .map(|usage| {
+                usage
+                    .get("input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+                    + usage
+                        .get("output_tokens")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default()
+            })
+            .unwrap_or_default(),
+        GatewayProvider::Gemini => value
+            .get("usageMetadata")
+            .and_then(|usage| usage.get("totalTokenCount"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        GatewayProvider::Ollama => {
+            value
+                .get("prompt_eval_count")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                + value
+                    .get("eval_count")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default()
+        }
+        _ => usage_tokens_from_value(value),
+    }
+}
+
+fn usage_tokens_from_response_event(event: &Value) -> i64 {
+    event
+        .get("response")
+        .and_then(|response| response.get("usage"))
+        .map(usage_tokens_from_value)
+        .or_else(|| event.get("usage").map(usage_tokens_from_value))
+        .unwrap_or_default()
+}
+
+fn usage_tokens_from_value(value: &Value) -> i64 {
+    let usage = value.get("usage").unwrap_or(value);
+    usage
+        .get("total_tokens")
+        .or_else(|| usage.get("totalTokens"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            let input = usage
+                .get("input_tokens")
+                .or_else(|| usage.get("prompt_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let output = usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            (input + output > 0).then_some(input + output)
+        })
+        .unwrap_or_default()
+}
+
+struct ProviderSseState {
+    provider: GatewayProvider,
+    kind: GatewayRequestKind,
+    id: String,
+    model: String,
+    created: i64,
+    choice_index: usize,
+    terminal_done: bool,
+    done: bool,
+    emitted_created: bool,
+    text: String,
+    has_tools: bool,
+    tool_indexes: HashMap<String, usize>,
+    tool_block_ids: HashMap<i64, String>,
+    tool_names: HashMap<String, String>,
+    usage: Option<Value>,
+    last_usage_tokens: i64,
+}
+
+impl ProviderSseState {
+    fn new(provider: GatewayProvider, kind: GatewayRequestKind, model: String) -> Self {
+        Self::new_choice(provider, kind, model, 0, true)
+    }
+
+    fn new_choice(
+        provider: GatewayProvider,
+        kind: GatewayRequestKind,
+        model: String,
+        choice_index: usize,
+        terminal_done: bool,
+    ) -> Self {
+        Self {
+            provider,
+            kind,
+            id: match kind {
+                GatewayRequestKind::Responses => format!("resp_{}", uuid::Uuid::new_v4()),
+                GatewayRequestKind::ChatCompletions => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            },
+            model,
+            created: timestamp_ms() / 1000,
+            choice_index,
+            terminal_done,
+            done: false,
+            emitted_created: false,
+            text: String::new(),
+            has_tools: false,
+            tool_indexes: HashMap::new(),
+            tool_block_ids: HashMap::new(),
+            tool_names: HashMap::new(),
+            usage: None,
+            last_usage_tokens: 0,
+        }
+    }
+
+    fn translate(&mut self, event: Value) -> (String, i64) {
+        match self.provider {
+            GatewayProvider::Anthropic => self.translate_anthropic(event),
+            GatewayProvider::Gemini => self.translate_gemini(event),
+            _ => (String::new(), 0),
+        }
+    }
+
+    fn response_created(&mut self) -> String {
+        if self.emitted_created || self.kind != GatewayRequestKind::Responses {
+            return String::new();
+        }
+        self.emitted_created = true;
+        format!(
+            "event: response.created\ndata: {}\n\n",
+            json!({"type":"response.created","response":{"id": self.id,"object":"response","created_at": self.created,"model": self.model,"status":"in_progress","output":[]}})
+        )
+    }
+
+    fn emit_text(&mut self, delta: &str) -> String {
+        self.text.push_str(delta);
+        match self.kind {
+            GatewayRequestKind::Responses => format!(
+                "{}event: response.output_text.delta\ndata: {}\n\n",
+                self.response_created(),
+                json!({"type":"response.output_text.delta","delta": delta})
+            ),
+            GatewayRequestKind::ChatCompletions => {
+                self.chat_chunk(json!({"content": delta}), None, None)
+            }
+        }
+    }
+
+    fn emit_tool(&mut self, id: String, name: String, arguments_delta: Option<String>) -> String {
+        self.has_tools = true;
+        if !name.is_empty() {
+            self.tool_names.insert(id.clone(), name.clone());
+        }
+        match self.kind {
+            GatewayRequestKind::Responses => {
+                let mut output = self.response_created();
+                if !self.tool_indexes.contains_key(&id) {
+                    let index = self.tool_indexes.len();
+                    self.tool_indexes.insert(id.clone(), index);
+                    output.push_str(&format!(
+                        "event: response.output_item.added\ndata: {}\n\n",
+                        json!({"type":"response.output_item.added","output_index": index,"item":{"type":"function_call","id": id,"call_id": id,"name": name,"arguments":""}})
+                    ));
+                }
+                if let Some(delta) = arguments_delta {
+                    let index = self.tool_indexes.get(&id).copied().unwrap_or_default();
+                    output.push_str(&format!(
+                        "event: response.function_call_arguments.delta\ndata: {}\n\n",
+                        json!({"type":"response.function_call_arguments.delta","output_index": index,"delta": delta})
+                    ));
+                }
+                output
+            }
+            GatewayRequestKind::ChatCompletions => {
+                let next = self.tool_indexes.len();
+                let index = *self.tool_indexes.entry(id.clone()).or_insert(next);
+                self.chat_chunk(
+                    json!({"tool_calls":[{"index": index,"id": id,"type":"function","function":{"name": name,"arguments": arguments_delta.unwrap_or_default()}}]}),
+                    None,
+                    None,
+                )
+            }
+        }
+    }
+
+    fn emit_done(&mut self, usage: Option<Value>) -> String {
+        self.done = true;
+        let usage = usage.or_else(|| self.usage.clone());
+        let terminal = if self.terminal_done {
+            "data: [DONE]\n\n"
+        } else {
+            ""
+        };
+        match self.kind {
+            GatewayRequestKind::Responses => format!(
+                "{}event: response.completed\ndata: {}\n\n{}",
+                self.response_created(),
+                json!({"type":"response.completed","response":{"id": self.id,"object":"response","created_at": self.created,"model": self.model,"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text": self.text}]}],"usage": usage.unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0,"total_tokens":0}))}}),
+                terminal
+            ),
+            GatewayRequestKind::ChatCompletions => format!(
+                "{}{}",
+                self.chat_chunk(
+                    json!({}),
+                    Some(if self.has_tools { "tool_calls" } else { "stop" }),
+                    usage.map(|usage| chat_usage(Some(&usage))),
+                ),
+                terminal
+            ),
+        }
+    }
+
+    fn chat_chunk(
+        &self,
+        delta: Value,
+        finish_reason: Option<&str>,
+        usage: Option<Value>,
+    ) -> String {
+        let mut chunk = json!({
+            "id": self.id,
+            "object":"chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices":[{"index":self.choice_index,"delta":delta,"finish_reason":finish_reason}]
+        });
+        if let Some(usage) = usage {
+            chunk["usage"] = usage;
+        }
+        format!("data: {chunk}\n\n")
+    }
+
+    fn record_usage(&mut self, usage: Value) -> i64 {
+        let total = usage
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let delta = total.saturating_sub(self.last_usage_tokens);
+        self.last_usage_tokens = self.last_usage_tokens.max(total);
+        self.usage = Some(usage);
+        delta
+    }
+
+    fn translate_anthropic(&mut self, event: Value) -> (String, i64) {
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(id) = event
+                    .get("message")
+                    .and_then(|message| message.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.id = id.to_owned();
+                }
+                (self.response_created(), 0)
+            }
+            Some("content_block_start") => {
+                let block = event.get("content_block").cloned().unwrap_or_default();
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("call")
+                        .to_owned();
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned();
+                    let block_index = event
+                        .get("index")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default();
+                    self.tool_block_ids.insert(block_index, id.clone());
+                    self.tool_names.insert(id.clone(), name.clone());
+                    (self.emit_tool(id, name, None), 0)
+                } else {
+                    (String::new(), 0)
+                }
+            }
+            Some("content_block_delta") => {
+                let delta = event.get("delta").cloned().unwrap_or_default();
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => (
+                        self.emit_text(
+                            delta
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        ),
+                        0,
+                    ),
+                    Some("input_json_delta") => {
+                        let partial = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let block_index = event
+                            .get("index")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default();
+                        let id = self
+                            .tool_block_ids
+                            .get(&block_index)
+                            .cloned()
+                            .unwrap_or_else(|| block_index.to_string());
+                        let name = self
+                            .tool_names
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| "tool".to_owned());
+                        (self.emit_tool(id, name, Some(partial)), 0)
+                    }
+                    _ => (String::new(), 0),
+                }
+            }
+            Some("message_delta") => {
+                let usage = event
+                    .get("usage")
+                    .map(|usage| responses_usage_from_anthropic(Some(usage)));
+                let tokens = usage
+                    .map(|usage| self.record_usage(usage))
+                    .unwrap_or_default();
+                (String::new(), tokens)
+            }
+            Some("message_stop") => (self.emit_done(None), 0),
+            _ => (String::new(), 0),
+        }
+    }
+
+    fn translate_gemini(&mut self, event: Value) -> (String, i64) {
+        let mut output = String::new();
+        let parts = event
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                output.push_str(&self.emit_text(text));
+            }
+            if let Some(call) = part.get("functionCall") {
+                output.push_str(
+                    &self.emit_tool(
+                        format!("call_{}", uuid::Uuid::new_v4()),
+                        call.get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_owned(),
+                        call.get("args").map(Value::to_string),
+                    ),
+                );
+            }
+        }
+        let usage = event
+            .get("usageMetadata")
+            .map(|usage| responses_usage_from_gemini(Some(usage)));
+        let tokens = usage
+            .as_ref()
+            .map(|usage| self.record_usage(usage.clone()))
+            .unwrap_or_default();
+        let done = event
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("finishReason"))
+            .is_some();
+        if done {
+            output.push_str(&self.emit_done(usage));
+        }
+        (output, tokens)
+    }
+}
+
+fn translate_ollama_event(state: &mut ProviderSseState, event: Value) -> (String, i64) {
+    let mut output = String::new();
+    if let Some(content) = event
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+    {
+        output.push_str(&state.emit_text(content));
+    }
+    if let Some(calls) = event
+        .get("message")
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+    {
+        for call in calls {
+            let function = call
+                .get("function")
+                .cloned()
+                .unwrap_or_else(|| call.clone());
+            output.push_str(
+                &state.emit_tool(
+                    format!("call_{}", uuid::Uuid::new_v4()),
+                    function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned(),
+                    function.get("arguments").map(Value::to_string),
+                ),
+            );
+        }
+    }
+    let usage = responses_usage_from_ollama(&event);
+    let tokens = if event.get("done").and_then(Value::as_bool).unwrap_or(false) {
+        let tokens = state.record_usage(usage.clone());
+        output.push_str(&state.emit_done(Some(usage)));
+        tokens
+    } else {
+        0
+    };
+    (output, tokens)
+}
+
+fn adapt_provider_sse_stream(
+    response: reqwest::Response,
+    provider: GatewayProvider,
+    kind: GatewayRequestKind,
+    model: String,
+    repository: Arc<Repository>,
+) -> Response {
+    let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
+        (String::new(), ProviderSseState::new(provider, kind, model)),
+        move |(buffer, state), chunk| {
+            let repository = repository.clone();
+            let result = match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    let events = drain_sse_events(buffer);
+                    let mut output = String::new();
+                    for event in events {
+                        let (translated, tokens) = state.translate(event);
+                        if tokens > 0 {
+                            let _ = repository.add_estimated_tokens(tokens);
+                        }
+                        output.push_str(&translated);
+                    }
+                    Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
+                }
+                Err(_) => {
+                    record_gateway_upstream_error(&repository, GATEWAY_ERROR_STREAM_INTERRUPTED);
+                    Some(Ok(Bytes::from(sse_upstream_error_event(Some(kind)))))
+                }
+            };
+            futures_util::future::ready(result)
+        },
+    );
+    sse_response(Body::from_stream(stream))
+}
+
+fn drain_json_lines(buffer: &mut String) -> Vec<Value> {
+    let normalized = buffer.replace("\r\n", "\n");
+    *buffer = normalized;
+    let Some(last_newline) = buffer.rfind('\n') else {
+        return Vec::new();
+    };
+    let complete = buffer[..=last_newline].to_owned();
+    buffer.drain(..=last_newline);
+    complete
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .collect()
+}
+
+fn adapt_ollama_stream(
+    response: reqwest::Response,
+    kind: GatewayRequestKind,
+    model: String,
+    repository: Arc<Repository>,
+) -> Response {
+    let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
+        (
+            String::new(),
+            ProviderSseState::new(GatewayProvider::Ollama, kind, model),
+        ),
+        move |(buffer, state), chunk| {
+            let repository = repository.clone();
+            let result = match chunk {
+                Ok(bytes) => {
+                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    let events = drain_json_lines(buffer);
+                    let mut output = String::new();
+                    for event in events {
+                        let (translated, tokens) = translate_ollama_event(state, event);
+                        if tokens > 0 {
+                            let _ = repository.add_estimated_tokens(tokens);
+                        }
+                        output.push_str(&translated);
+                    }
+                    Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
+                }
+                Err(_) => {
+                    record_gateway_upstream_error(&repository, GATEWAY_ERROR_STREAM_INTERRUPTED);
+                    Some(Ok(Bytes::from(sse_upstream_error_event(Some(kind)))))
+                }
+            };
+            futures_util::future::ready(result)
+        },
+    );
+    sse_response(Body::from_stream(stream))
+}
+
 fn upstream_response(
     response: reqwest::Response,
     repository: Arc<Repository>,
@@ -2386,8 +4185,19 @@ fn upstream_response(
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
     let stream = response.bytes_stream().map_err(std::io::Error::other);
     if is_sse {
+        let mut buffer = String::new();
         let stream = stream.map(move |chunk| match chunk {
-            Ok(bytes) => Ok::<Bytes, std::io::Error>(bytes),
+            Ok(bytes) => {
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                for event in drain_sse_events(&mut buffer) {
+                    let tokens = usage_tokens_from_response_event(&event)
+                        .max(usage_tokens_from_value(&event));
+                    if tokens > 0 {
+                        let _ = repository.add_estimated_tokens(tokens);
+                    }
+                }
+                Ok::<Bytes, std::io::Error>(bytes)
+            }
             Err(_) => {
                 record_gateway_upstream_error(&repository, GATEWAY_ERROR_STREAM_INTERRUPTED);
                 Ok(Bytes::from(sse_upstream_error_event(kind)))
@@ -2443,6 +4253,7 @@ async fn upstream_response_with_visible_model(
             .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
         {
             if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
+                let _ = repository.add_estimated_tokens(usage_tokens_from_value(&value));
                 rewrite_model_fields(&mut value, &visible_model);
                 return (status, Json(value)).into_response();
             }
@@ -2691,10 +4502,18 @@ fn authorize(state: &GatewayApiState, peer: IpAddr, headers: &HeaderMap) -> bool
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use axum::{
         body::{to_bytes, Body, Bytes},
+        extract::State,
         http::{header, HeaderMap, HeaderValue},
         response::Response,
         routing::post,
@@ -2702,13 +4521,16 @@ mod tests {
     };
 
     use super::{
-        build_upstream_url, chat_to_responses, completed_response, gateway_http_client,
-        mask_proxy_url, model_discovery_route, model_ids_from_provider_response,
-        payload_with_model, response_to_chat_completion, responses_to_chat_completion,
-        rewrite_model_fields, send_oauth_request, send_with_first_response_timeout_after,
-        test_api_service, upstream_model_for, upstream_response, validate_binding,
+        adapt_provider_chat_fanout_response, anthropic_chat_payload, build_upstream_url,
+        chat_choice_count, chat_to_responses, completed_response, gateway_http_client,
+        gemini_chat_payload, mask_proxy_url, model_discovery_route,
+        model_ids_from_provider_response, ollama_chat_payload_from_openai, payload_with_model,
+        provider_usage_tokens, provider_value_to_chat, provider_value_to_response,
+        response_to_chat_completion, responses_to_chat_completion, rewrite_model_fields,
+        send_oauth_request, send_with_first_response_timeout_after, test_api_service,
+        translate_ollama_event, upstream_model_for, upstream_response, validate_binding,
         validate_manual_proxy_url, visible_model_for, GatewayRequestKind, GatewayUpstreamProxy,
-        WeightedScheduler,
+        ProviderSseState, WeightedScheduler,
     };
     use crate::error::AppError;
     use crate::{
@@ -2745,6 +4567,255 @@ mod tests {
             credential_fingerprint: None,
         }
     }
+
+    #[test]
+    fn allows_loopback_binding_without_cidrs() {
+        assert!(validate_binding("loopback", "127.0.0.1".parse().unwrap(), &[]).is_ok());
+        assert!(matches!(
+            validate_binding(
+                "loopback",
+                "127.0.0.1".parse().unwrap(),
+                &["127.0.0.1/32".into()]
+            ),
+            Err(AppError::ForbiddenNetworkTarget)
+        ));
+    }
+
+    #[test]
+    fn maps_openai_chat_to_anthropic_messages_with_tools() {
+        let payload = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "system", "content": "Be concise"},
+                {"role": "user", "content": [{"type":"text", "text":"Weather?"}]},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": "{\"city\":\"SF\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+            ],
+            "tools": [{"type":"function", "function": {
+                "name":"weather", "description":"Read weather", "parameters":{"type":"object"}
+            }}],
+            "tool_choice": {"type":"function", "function":{"name":"weather"}},
+            "max_tokens": 128,
+            "stream": true
+        });
+
+        let mapped = anthropic_chat_payload(&payload, "claude-sonnet", true).unwrap();
+
+        assert_eq!(mapped["model"], "claude-sonnet");
+        assert_eq!(mapped["system"], "Be concise");
+        assert_eq!(mapped["messages"][0]["role"], "user");
+        assert_eq!(mapped["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(mapped["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(mapped["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(mapped["tool_choice"]["name"], "weather");
+    }
+
+    #[test]
+    fn maps_openai_chat_to_gemini_generate_content_with_schema() {
+        let payload = serde_json::json!({
+            "messages": [
+                {"role":"system", "content":"Answer JSON"},
+                {"role":"user", "content":"Hi"}
+            ],
+            "tools": [{"type":"function", "function": {
+                "name":"lookup", "parameters":{"type":"object"}
+            }}],
+            "response_format": {"type":"json_schema", "json_schema":{"schema":{"type":"object"}}},
+            "temperature": 0.2
+        });
+
+        let mapped = gemini_chat_payload(&payload, false).unwrap();
+
+        assert_eq!(
+            mapped["systemInstruction"]["parts"][0]["text"],
+            "Answer JSON"
+        );
+        assert_eq!(mapped["contents"][0]["role"], "user");
+        assert_eq!(
+            mapped["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            mapped["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(mapped["generationConfig"]["temperature"], 0.2);
+    }
+
+    #[test]
+    fn maps_openai_chat_to_ollama_chat_options_and_format() {
+        let payload = serde_json::json!({
+            "messages": [{"role":"user", "content":"Hi"}],
+            "response_format": {"type":"json_object"},
+            "temperature": 0.1,
+            "max_tokens": 64,
+            "reasoning_effort": "high"
+        });
+
+        let mapped = ollama_chat_payload_from_openai(&payload, "qwen", true).unwrap();
+
+        assert_eq!(mapped["model"], "qwen");
+        assert_eq!(mapped["format"], "json");
+        assert_eq!(mapped["options"]["temperature"], 0.1);
+        assert_eq!(mapped["options"]["num_predict"], 64);
+        assert_eq!(mapped["think"], "high");
+    }
+
+    #[test]
+    fn converts_provider_usage_and_outputs_back_to_openai_shapes() {
+        let anthropic = serde_json::json!({
+            "id":"msg_1",
+            "content":[
+                {"type":"text", "text":"hello"},
+                {"type":"tool_use", "id":"toolu_1", "name":"weather", "input":{"city":"SF"}}
+            ],
+            "usage":{"input_tokens":2,"output_tokens":3}
+        });
+        let chat = provider_value_to_chat(&GatewayProvider::Anthropic, &anthropic, "claude");
+        assert_eq!(chat["choices"][0]["message"]["content"], "hello");
+        assert_eq!(chat["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            provider_usage_tokens(&GatewayProvider::Anthropic, &anthropic),
+            5
+        );
+
+        let gemini = serde_json::json!({
+            "candidates":[{"content":{"parts":[{"text":"hi"}]}, "finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":5,"totalTokenCount":9}
+        });
+        let response = provider_value_to_response(&GatewayProvider::Gemini, &gemini, "gemini");
+        assert_eq!(response["output"][0]["content"][0]["text"], "hi");
+        assert_eq!(response["usage"]["total_tokens"], 9);
+
+        let ollama = serde_json::json!({
+            "message":{"role":"assistant", "content":"local"},
+            "prompt_eval_count":6,
+            "eval_count":7
+        });
+        let response = provider_value_to_response(&GatewayProvider::Ollama, &ollama, "qwen");
+        assert_eq!(response["output"][0]["content"][0]["text"], "local");
+        assert_eq!(response["usage"]["total_tokens"], 13);
+    }
+
+    #[test]
+    fn validates_chat_choice_count_for_adapter_fanout() {
+        assert_eq!(chat_choice_count(&serde_json::json!({})).unwrap(), 1);
+        assert_eq!(chat_choice_count(&serde_json::json!({"n": 3})).unwrap(), 3);
+        assert!(chat_choice_count(&serde_json::json!({"n": 0})).is_err());
+        assert!(chat_choice_count(&serde_json::json!({"n": "2"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn merges_provider_chat_fanout_choices_and_usage() {
+        async fn anthropic_reply(
+            State(counter): State<Arc<AtomicUsize>>,
+        ) -> Json<serde_json::Value> {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "id": format!("msg_{index}"),
+                "content": [{"type": "text", "text": format!("reply {index}")}],
+                "usage": {"input_tokens": 2, "output_tokens": 3}
+            }))
+        }
+
+        let repository = Arc::new(Repository::memory());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let counter = counter.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/v1/messages", post(anthropic_reply))
+                        .with_state(counter),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = reqwest::Client::new();
+        let first = client
+            .post(format!("http://{address}/v1/messages"))
+            .send()
+            .await
+            .unwrap();
+        let second = client
+            .post(format!("http://{address}/v1/messages"))
+            .send()
+            .await
+            .unwrap();
+
+        let response = adapt_provider_chat_fanout_response(
+            vec![first, second],
+            GatewayProvider::Anthropic,
+            "claude-visible".to_owned(),
+            repository.clone(),
+        )
+        .await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        server.abort();
+        let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+
+        assert!(status.is_success());
+        assert_eq!(value["model"], "claude-visible");
+        assert_eq!(value["choices"][0]["index"], 0);
+        assert_eq!(value["choices"][1]["index"], 1);
+        assert_eq!(value["usage"]["total_tokens"], 10);
+        assert_eq!(repository.metrics().unwrap().estimated_tokens, 10);
+    }
+
+    #[test]
+    fn provider_stream_state_preserves_choice_and_tool_ids() {
+        let mut anthropic = ProviderSseState::new_choice(
+            GatewayProvider::Anthropic,
+            GatewayRequestKind::ChatCompletions,
+            "claude-visible".to_owned(),
+            2,
+            false,
+        );
+        let (started, _) = anthropic.translate(serde_json::json!({
+            "type": "content_block_start",
+            "index": 4,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "weather"}
+        }));
+        let (arguments, _) = anthropic.translate(serde_json::json!({
+            "type": "content_block_delta",
+            "index": 4,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"city\":\"SF\"}"}
+        }));
+        assert!(started.contains("\"index\":2"));
+        assert!(started.contains("\"id\":\"toolu_1\""));
+        assert!(arguments.contains("\"index\":2"));
+        assert!(arguments.contains("toolu_1"));
+        assert!(arguments.contains("weather"));
+
+        let mut ollama = ProviderSseState::new_choice(
+            GatewayProvider::Ollama,
+            GatewayRequestKind::ChatCompletions,
+            "qwen-visible".to_owned(),
+            1,
+            false,
+        );
+        let (delta, _) = translate_ollama_event(
+            &mut ollama,
+            serde_json::json!({"message": {"content": "local"}}),
+        );
+        let (done, tokens) = translate_ollama_event(
+            &mut ollama,
+            serde_json::json!({"done": true, "prompt_eval_count": 6, "eval_count": 7}),
+        );
+        assert!(delta.contains("\"index\":1"));
+        assert_eq!(tokens, 13);
+        assert!(!done.contains("[DONE]"));
+    }
+
     #[test]
     fn refuses_public_and_wildcard_bindings() {
         assert!(matches!(

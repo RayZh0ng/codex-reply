@@ -254,6 +254,32 @@ export interface CollaborationCallbackStatus {
   running: boolean;
 }
 
+export interface CollaborationContextSummary {
+  id: string;
+  scope_key: string;
+  binding_id: string;
+  provider: CollaborationProvider;
+  bot_id: string;
+  bot_name: string;
+  project_name: string;
+  project_slug: string;
+  working_directory: string;
+  execution_target: CollaborationExecutionTarget;
+  profile_id: string | null;
+  profile_alias: string | null;
+  model_id: string | null;
+  memory_enabled: boolean;
+  permissions_policy: string;
+  active_codex_session_id: string | null;
+  active_relay_session_id: string | null;
+  goal_status: string;
+  goal_text: string | null;
+  conversation_mode: string;
+  last_turn_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
 export interface MaskedFeishuBot {
   id: string;
   name: string;
@@ -288,6 +314,7 @@ export type CodexSessionStatus =
 export interface CodexSessionSummary {
   id: string;
   binding_id: string;
+  context_id: string | null;
   provider: CollaborationProvider;
   provider_bot_id: string | null;
   provider_chat_id: string | null;
@@ -308,6 +335,9 @@ export interface CodexSessionSummary {
   finished_at_ms: number | null;
   summary: string | null;
   last_error: string | null;
+  turn_kind: string;
+  conversation_mode: string;
+  goal_status: string | null;
 }
 
 export interface DashboardSnapshot {
@@ -552,6 +582,14 @@ export const api = {
     relayInvoke<CreatedClientKey>("create_client_key", {
       input: { name, confirmed: true },
     }),
+  revealClientKey: (id: string) =>
+    relayInvoke<string>("reveal_client_key", {
+      input: { id, confirmed: true },
+    }),
+  rotateClientKey: (id: string) =>
+    relayInvoke<CreatedClientKey>("rotate_client_key", {
+      input: { id, confirmed: true },
+    }),
   revokeClientKey: (id: string) =>
     relayInvoke<void>("revoke_client_key", { id, confirmed: true }),
   listCollaborationBots: () =>
@@ -578,6 +616,16 @@ export const api = {
     relayInvoke<MaskedCollaborationBot>("register_discord_commands", { id }),
   collaborationCallbackStatus: () =>
     relayInvoke<CollaborationCallbackStatus>("collaboration_callback_status"),
+  listCollaborationContexts: () =>
+    relayInvoke<CollaborationContextSummary[]>("list_collaboration_contexts"),
+  updateCollaborationContext: (input: Record<string, unknown>) =>
+    relayInvoke<CollaborationContextSummary>("update_collaboration_context", {
+      input: { ...input, confirmed: true },
+    }),
+  resetCollaborationContext: (contextId: string) =>
+    relayInvoke<CollaborationContextSummary>("reset_collaboration_context", {
+      input: { context_id: contextId, confirmed: true },
+    }),
   listFeishuBots: () => relayInvoke<MaskedFeishuBot[]>("list_feishu_bots"),
   upsertFeishuBot: (input: Record<string, unknown>) =>
     relayInvoke<MaskedFeishuBot>("upsert_feishu_bot", { input }),
