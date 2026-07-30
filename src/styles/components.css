@@ -4335,6 +4335,317 @@ input[type="number"]::-webkit-outer-spin-button {
   margin: 0;
 }
 
+.codex-environment-settings {
+  display: grid;
+  gap: var(--space-5);
+  margin-bottom: var(--space-8);
+  padding: clamp(18px, 2vw, 26px);
+  overflow: hidden;
+  border-radius: 28px;
+  background:
+    radial-gradient(circle at top right, rgb(49 130 246 / 10%), transparent 30%),
+    var(--color-surface-elevated);
+}
+
+.environment-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.environment-hero-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.environment-hero h2 {
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: clamp(24px, 2vw, 32px);
+  letter-spacing: -0.04em;
+}
+
+.environment-hero p {
+  max-width: 760px;
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.environment-score-card {
+  display: grid;
+  place-items: center;
+  min-width: 112px;
+  min-height: 94px;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: 24px;
+  background: var(--color-surface-soft);
+  box-shadow: var(--shadow-sm);
+}
+
+.environment-score-card span {
+  color: var(--color-text-primary);
+  font-size: 34px;
+  font-weight: 820;
+  letter-spacing: -0.06em;
+}
+
+.environment-score-card small {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.environment-score-card.is-success {
+  border-color: color-mix(in srgb, var(--color-success) 28%, var(--color-border));
+  background: color-mix(in srgb, var(--color-success-soft) 78%, var(--color-surface));
+}
+
+.environment-score-card.is-warning {
+  border-color: color-mix(in srgb, var(--color-warning) 28%, var(--color-border));
+  background: color-mix(in srgb, var(--color-warning-soft) 72%, var(--color-surface));
+}
+
+.environment-score-card.is-danger {
+  border-color: color-mix(in srgb, var(--color-danger) 24%, var(--color-border));
+  background: color-mix(in srgb, var(--color-danger-soft) 72%, var(--color-surface));
+}
+
+.environment-summary-panel {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 20px;
+  background: rgb(255 255 255 / 62%);
+}
+
+.environment-summary-panel svg {
+  color: var(--color-text-secondary);
+}
+
+.environment-summary-panel.is-success svg {
+  color: var(--color-success);
+}
+
+.environment-summary-panel.is-warning svg {
+  color: var(--color-warning);
+}
+
+.environment-summary-panel.is-danger svg {
+  color: var(--color-danger);
+}
+
+.environment-summary-panel strong {
+  color: var(--color-text-primary);
+  font-size: 15px;
+}
+
+.environment-summary-panel p {
+  margin: 3px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.environment-summary-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.environment-summary-metrics span {
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.environment-check-grid,
+.environment-install-report ul {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.environment-check-grid {
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+}
+
+.environment-check-card {
+  display: grid;
+  gap: var(--space-3);
+  min-height: 176px;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 20px;
+  background: rgb(255 255 255 / 72%);
+  box-shadow: 0 14px 34px rgb(31 41 55 / 5%);
+}
+
+.environment-check-card.is-ok {
+  border-color: color-mix(in srgb, var(--color-success) 18%, var(--color-border));
+}
+
+.environment-check-card.is-warning {
+  border-color: color-mix(in srgb, var(--color-warning) 24%, var(--color-border));
+}
+
+.environment-check-card.is-missing,
+.environment-check-card.is-failed {
+  border-color: color-mix(in srgb, var(--color-danger) 22%, var(--color-border));
+}
+
+.environment-check-topline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.environment-check-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 14px;
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+}
+
+.environment-check-icon.success {
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.environment-check-icon.warning {
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.environment-check-icon.danger {
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+}
+
+.environment-check-body {
+  display: grid;
+  gap: 5px;
+}
+
+.environment-check-body strong {
+  color: var(--color-text-primary);
+  font-size: 15px;
+}
+
+.environment-check-body small,
+.environment-check-body p,
+.environment-check-detail,
+.environment-install-report li {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.environment-check-body p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.environment-check-detail {
+  align-self: end;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border);
+}
+
+.environment-check-detail summary,
+.environment-install-report summary {
+  cursor: pointer;
+  color: var(--color-text-primary);
+  font-weight: 750;
+}
+
+.environment-check-detail span,
+.environment-install-report em {
+  display: block;
+  margin-top: 7px;
+  font-style: normal;
+}
+
+.environment-check-detail code,
+.environment-install-report code {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 7px;
+  padding: 5px 8px;
+  overflow-wrap: anywhere;
+  border-radius: 10px;
+  background: var(--color-surface-muted);
+  color: var(--color-text-primary);
+  font-size: 11px;
+}
+
+.environment-install-report {
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 18px;
+  background: var(--color-surface-muted);
+}
+
+.environment-install-report summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.environment-install-report summary span {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.environment-install-report ul {
+  margin-top: 12px;
+}
+
+.environment-install-report li {
+  padding: 10px 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.environment-install-report li > div {
+  display: grid;
+  gap: 3px;
+}
+
+.environment-empty-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 18px;
+  border: 1px dashed var(--color-border);
+  border-radius: 20px;
+  color: var(--color-text-secondary);
+}
+
+.environment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 .update-channel-picker {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   min-width: 0;
@@ -4784,6 +5095,41 @@ input[type="number"]::-webkit-outer-spin-button {
 .model-mapping-list {
   display: grid;
   gap: var(--space-2);
+}
+
+.model-discovery-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-soft);
+}
+
+.model-discovery-picker legend {
+  grid-column: 1 / -1;
+  padding: 0 var(--space-1);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.model-discovery-picker label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-elevated);
+  color: var(--color-text-primary);
+  font-size: 12px;
+}
+
+.model-discovery-picker span {
+  overflow-wrap: anywhere;
 }
 
 .model-mapping-row {

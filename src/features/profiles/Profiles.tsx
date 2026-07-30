@@ -6,6 +6,7 @@ import { Check } from "@phosphor-icons/react/Check";
 import { CheckCircle } from "@phosphor-icons/react/CheckCircle";
 import { CloudArrowUp } from "@phosphor-icons/react/CloudArrowUp";
 import { Key } from "@phosphor-icons/react/Key";
+import { PencilSimple } from "@phosphor-icons/react/PencilSimple";
 import { Plus } from "@phosphor-icons/react/Plus";
 import { Trash } from "@phosphor-icons/react/Trash";
 import { UserSwitch } from "@phosphor-icons/react/UserSwitch";
@@ -36,7 +37,7 @@ import type {
   ProfileQuotaWindow,
   ProfileSubscription,
 } from "../../shared/ipc";
-import { api } from "../../shared/ipc";
+import { api, RelayError } from "../../shared/ipc";
 import { Select } from "../../shared/ui/Select";
 
 interface ProfilesProps {
@@ -50,6 +51,7 @@ interface ProfilesProps {
   onSyncAccount: (id: string) => Promise<MaskedProfile>;
   onRefreshModels?: (id: string) => Promise<void>;
   onCreateApiProfile?: (input: Record<string, unknown>) => Promise<void>;
+  onUpdateApiProfile?: (input: Record<string, unknown>) => Promise<void>;
   onTogglePool?: (profile: MaskedProfile) => Promise<void>;
   onConfigurePool?: (
     profile: MaskedProfile,
@@ -68,7 +70,7 @@ type ImportFlow =
   | { step: "authorizing"; status: OAuthImportStatus }
   | { step: "naming"; status: OAuthImportStatus }
   | { step: "json"; preview: JsonProfileImportPreview }
-  | { step: "api" }
+  | { step: "api"; profile?: MaskedProfile }
   | null;
 
 type ProfileSortKey = "default" | "quota" | "subscription" | "reset";
@@ -99,6 +101,7 @@ export function Profiles({
   onCompleteOAuth,
   onSyncAccount,
   onCreateApiProfile = async () => undefined,
+  onUpdateApiProfile = async () => undefined,
   onTogglePool = async () => undefined,
   onActivateApiProfile = async () => undefined,
   onDelete,
@@ -329,8 +332,8 @@ export function Profiles({
     try {
       const status = await onStartOAuth(profileId);
       setFlow({ step: "authorizing", status });
-    } catch {
-      setImportError("无法启动官方登录。请确认 Codex CLI 与系统安全存储可用后重试。");
+    } catch (error) {
+      setImportError(oauthStartErrorMessage(error));
     }
   };
   const handleStatus = useCallback(
@@ -571,9 +574,14 @@ export function Profiles({
       ) : flow?.step === "api" ? (
         <ApiProfileSheet
           busy={busy}
+          profile={flow.profile}
           onClose={closeFlow}
           onSubmit={async (input) => {
-            await onCreateApiProfile(input);
+            if (flow.profile) {
+              await onUpdateApiProfile({ ...input, id: flow.profile.id });
+            } else {
+              await onCreateApiProfile(input);
+            }
             closeFlow();
           }}
         />
@@ -615,6 +623,7 @@ export function Profiles({
             onSyncAccount={() => refreshAccount(profile.id)}
             onTogglePool={() => onTogglePool(profile)}
             onActivateApiProfile={() => onActivateApiProfile(profile)}
+            onEditApiProfile={() => setFlow({ step: "api", profile })}
             refreshing={refreshingProfileId === profile.id}
             onDelete={onDelete}
           />
@@ -1137,9 +1146,9 @@ const API_PROVIDER_PRESETS: ApiProviderPreset[] = [
 
 const PROVIDER_CAPABILITY_NOTES: Record<GatewayProvider, string> = {
   openai:
-    "OpenAI direct：Responses / Chat Completions 按所选 wire API 透传，支持上游原生参数与模型名回写。",
+    "OpenAI Relay：Responses / Chat Completions 按所选 wire API 透传，支持上游原生参数与模型名回写。",
   openai_compatible:
-    "OpenAI 兼容 direct：Responses / Chat Completions 按所选 wire API 透传；第三方非等价参数由上游决定。",
+    "OpenAI 兼容 Relay：Responses / Chat Completions 按所选 wire API 透传；第三方非等价参数由上游决定。",
   anthropic:
     "Anthropic adapter：映射 Messages、system/content blocks、图片 data URL、tools/tool_choice、tool_use/tool_result、SSE 与 usage；不支持 audio/logprobs/top_logprobs。",
   gemini:
@@ -1157,22 +1166,59 @@ function identityMappings(models: string[]): GatewayModelMapping[] {
   }));
 }
 
+function findPresetId(
+  provider?: GatewayProvider,
+  wireApi?: GatewayWireApi,
+  baseUrl?: string | null,
+) {
+  if (!provider) return null;
+  return (
+    API_PROVIDER_PRESETS.find(
+      (preset) =>
+        preset.provider === provider &&
+        preset.wireApi === (wireApi ?? "responses") &&
+        preset.baseUrl === (baseUrl ?? ""),
+    )?.id ??
+    API_PROVIDER_PRESETS.find(
+      (preset) => preset.provider === provider && preset.wireApi === wireApi,
+    )?.id ??
+    null
+  );
+}
+
 function ApiProfileSheet({
   busy,
+  profile,
   onClose,
   onSubmit,
 }: {
   busy: boolean;
+  profile?: MaskedProfile;
   onClose: () => void;
   onSubmit: (input: Record<string, unknown>) => Promise<void>;
 }) {
-  const [alias, setAlias] = useState("");
-  const [presetId, setPresetId] = useState(API_PROVIDER_PRESETS[0].id);
-  const [provider, setProvider] = useState<GatewayProvider>("openai_compatible");
-  const [wireApi, setWireApi] = useState<GatewayWireApi>("responses");
-  const [baseUrl, setBaseUrl] = useState("");
+  const isEditing = Boolean(profile);
+  const [alias, setAlias] = useState(profile?.alias ?? "");
+  const [presetId, setPresetId] = useState(
+    findPresetId(profile?.provider, profile?.wire_api, profile?.base_url) ??
+      API_PROVIDER_PRESETS[0].id,
+  );
+  const [provider, setProvider] = useState<GatewayProvider>(
+    profile?.provider ?? "openai_compatible",
+  );
+  const [wireApi, setWireApi] = useState<GatewayWireApi>(
+    profile?.wire_api ?? "responses",
+  );
+  const [baseUrl, setBaseUrl] = useState(profile?.base_url ?? "");
   const [apiKey, setApiKey] = useState("");
-  const [mappings, setMappings] = useState<GatewayModelMapping[]>([]);
+  const [mappings, setMappings] = useState<GatewayModelMapping[]>(
+    profile?.model_mappings?.length
+      ? profile.model_mappings
+      : profile?.models
+        ? identityMappings(profile.models)
+        : [],
+  );
+  const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [report, setReport] = useState<ApiServiceTestReport | null>(null);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -1194,17 +1240,32 @@ function ApiProfileSheet({
     setTesting(true);
     setLocalError(null);
     try {
-      const nextReport = await api.testApiServiceProfile({
-        provider,
-        base_url: baseUrl,
-        api_key: apiKey,
-      });
+      const usesSavedCredential =
+        isEditing &&
+        !apiKey.trim() &&
+        provider === profile?.provider &&
+        wireApi === (profile?.wire_api ?? "responses") &&
+        baseUrl === (profile?.base_url ?? "");
+      if (!usesSavedCredential && !apiKey.trim()) {
+        setLocalError("修改连接参数后请重新输入 API Key 再测试。");
+        return;
+      }
+      const nextReport = usesSavedCredential
+        ? await api.testExistingApiServiceProfile(profile?.id ?? "")
+        : await api.testApiServiceProfile({
+            provider,
+            base_url: baseUrl,
+            api_key: apiKey,
+          });
       setReport(nextReport);
       if (nextReport.status === "verified") {
-        setMappings(identityMappings(nextReport.models));
+        setDiscoveredModels(nextReport.models);
+      } else {
+        setDiscoveredModels([]);
       }
     } catch (error) {
       setReport(null);
+      setDiscoveredModels([]);
       setLocalError(error instanceof Error ? error.message : "连接测试未完成。");
     } finally {
       setTesting(false);
@@ -1231,6 +1292,24 @@ function ApiProfileSheet({
       current.filter((_, candidateIndex) => candidateIndex !== index),
     );
   };
+  const isDiscoveredSelected = (model: string) =>
+    mappings.some((mapping) => mapping.upstream_model === model);
+  const toggleDiscoveredModel = (model: string) => {
+    setMappings((current) => {
+      if (current.some((mapping) => mapping.upstream_model === model)) {
+        return current.filter((mapping) => mapping.upstream_model !== model);
+      }
+      return [
+        ...current,
+        {
+          model,
+          upstream_model: model,
+          display_name: model,
+          context_window: null,
+        },
+      ];
+    });
+  };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -1254,11 +1333,13 @@ function ApiProfileSheet({
         provider,
         wire_api: wireApi,
         base_url: baseUrl,
-        api_key: apiKey,
+        api_key: apiKey.trim() || null,
         model_mappings: normalizedMappings,
-        in_pool: false,
-        priority: 0,
-        weight: 1,
+        models: normalizedMappings.map((mapping) => mapping.model),
+        enabled: profile?.enabled ?? true,
+        in_pool: profile?.in_pool ?? false,
+        priority: profile?.priority ?? 0,
+        weight: profile?.weight ?? 1,
       });
       onClose();
     } catch (error) {
@@ -1275,7 +1356,9 @@ function ApiProfileSheet({
       <div className="form-sheet-heading">
         <div>
           <p className="section-kicker">Third-party provider</p>
-          <h2 id="api-profile-title">添加第三方模型提供商</h2>
+          <h2 id="api-profile-title">
+            {isEditing ? "编辑第三方模型提供商" : "添加第三方模型提供商"}
+          </h2>
         </div>
         <button className="text-button" type="button" onClick={onClose}>
           取消
@@ -1314,7 +1397,7 @@ function ApiProfileSheet({
               setMappings([]);
             }}
             options={[
-              { value: "responses", label: "OpenAI Responses · 可直连" },
+              { value: "responses", label: "OpenAI Responses · Relay 透传" },
               {
                 value: "chat_completions",
                 label: "Chat Completions · 需要 Relay 本地路由",
@@ -1358,19 +1441,20 @@ function ApiProfileSheet({
         <label>
           API Key
           <input
-            required
+            required={!isEditing}
             type="password"
             value={apiKey}
             onChange={(event) => {
               setApiKey(event.target.value);
               setReport(null);
             }}
+            placeholder={isEditing ? "留空沿用已保存密钥" : "sk-..."}
           />
         </label>
         <p className="form-note">{PROVIDER_CAPABILITY_NOTES[provider]}</p>
         <p className="form-note">
           模型映射会生成 Codex model_catalog_json，并决定网关对客户端暴露的 Model
-          ID；修改后需重启 Codex 刷新 /model 列表。
+          ID；测试发现模型后请选择需要映射的模型，修改后需重启 Codex 刷新 /model 列表。
         </p>
         {localError && <p className="form-note error-note">{localError}</p>}
         {report && (
@@ -1388,6 +1472,21 @@ function ApiProfileSheet({
               {report.http_status ? ` · HTTP ${report.http_status}` : ""}
             </p>
           </div>
+        )}
+        {discoveredModels.length > 0 && (
+          <fieldset className="model-discovery-picker" aria-label="发现的上游模型">
+            <legend>发现的上游模型</legend>
+            {discoveredModels.map((model) => (
+              <label key={model}>
+                <input
+                  checked={isDiscoveredSelected(model)}
+                  onChange={() => toggleDiscoveredModel(model)}
+                  type="checkbox"
+                />
+                <span>{model}</span>
+              </label>
+            ))}
+          </fieldset>
         )}
         <div className="model-mapping-editor" aria-label="模型映射">
           <div className="model-mapping-heading">
@@ -1466,7 +1565,7 @@ function ApiProfileSheet({
             </div>
           ) : (
             <p className="form-note">
-              测试连接后会按上游返回模型自动生成 identity mapping。
+              测试连接后会显示上游模型清单；勾选模型后会生成可编辑映射。
             </p>
           )}
         </div>
@@ -1476,7 +1575,7 @@ function ApiProfileSheet({
           </button>
           <button
             className="quiet-button"
-            disabled={busy || testing || saving || !baseUrl || !apiKey}
+            disabled={busy || testing || saving || !baseUrl || (!isEditing && !apiKey)}
             type="button"
             onClick={() => void test()}
           >
@@ -1487,7 +1586,7 @@ function ApiProfileSheet({
             disabled={busy || testing || saving || !mappings.length}
             type="submit"
           >
-            {saving ? "正在保存…" : "测试并保存"}
+            {saving ? "正在保存…" : isEditing ? "保存修改" : "测试并保存"}
           </button>
         </div>
       </form>
@@ -1624,6 +1723,25 @@ function authModeLabel(mode: "oauth" | "agent_identity" | "personal_access_token
   }[mode];
 }
 
+function oauthStartErrorMessage(error: unknown) {
+  if (error instanceof RelayError) {
+    if (error.code === "oauth_callback_port_unavailable") {
+      return "无法启动官方登录：127.0.0.1:1455 回调端口已被占用。请关闭占用进程或重启 Codex Relay 后重试。";
+    }
+    if (error.code === "oauth_browser_launch_failed") {
+      return "无法启动官方登录：未能打开默认浏览器。请在系统设置中重新选择默认浏览器；Linux 可安装 xdg-utils/gio 后重试。";
+    }
+    if (error.code === "browser_launch_failed") {
+      return "无法启动官方登录：未检测到可用的系统浏览器打开入口。请设置默认浏览器或按环境检查提示安装 xdg-utils/gio。";
+    }
+    if (error.code === "secret_store_unavailable") {
+      return "无法启动官方登录：Relay 本地加密凭据库不可用，请确认应用数据目录可写后重试。";
+    }
+    return error.message;
+  }
+  return "无法启动官方登录。请确认默认浏览器、本地回调端口与 Relay 数据目录可用后重试。";
+}
+
 function isGatewayCapableProfile(profile: MaskedProfile) {
   return profile.kind === "api_key" || profile.kind === "codex_oauth";
 }
@@ -1636,6 +1754,7 @@ function ProfileCard({
   onSyncAccount,
   onTogglePool,
   onActivateApiProfile,
+  onEditApiProfile,
   refreshing,
   onDelete,
 }: {
@@ -1646,6 +1765,7 @@ function ProfileCard({
   onSyncAccount: () => Promise<void>;
   onTogglePool: () => Promise<void>;
   onActivateApiProfile: () => Promise<void>;
+  onEditApiProfile: () => void;
   refreshing: boolean;
   onDelete: (id: string, alias: string) => void;
 }) {
@@ -1714,9 +1834,9 @@ function ProfileCard({
           </div>
         </dl>
       )}
-      {!supportsManagedCurrentProfile && (
+      {profile.kind === "codex_oauth" && !supportsManagedCurrentProfile && (
         <p className="profile-runtime-note">
-          {profile.kind === "codex_oauth" && !profile.credential_configured
+          {!profile.credential_configured
             ? "此档案的旧凭据无法迁移；请重新授权后再切换。"
             : "当前仅支持凭据已保存的 Codex 档案作为受管当前档案。"}
         </p>
@@ -1742,30 +1862,46 @@ function ProfileCard({
         )}
         {profile.kind === "api_key" && (
           <button
-            className="icon-button"
-            aria-label={`激活 API 服务：${profile.alias}`}
+            className="quiet-button compact-action"
+            aria-label={`编辑 API 服务：${profile.alias}`}
+            disabled={busy}
+            title="编辑第三方模型提供商"
+            type="button"
+            onClick={onEditApiProfile}
+          >
+            <PencilSimple size={16} />
+            编辑
+          </button>
+        )}
+        {profile.kind === "api_key" && (
+          <button
+            className="primary-button compact-action"
+            aria-label={`切换到 Codex：${profile.alias}`}
             disabled={busy || profile.health !== "healthy" || !profile.models.length}
-            title="测试通过后，将此 API 服务激活到 Codex"
+            title="测试通过后，将此 API 服务切换到 Codex"
             onClick={() => void onActivateApiProfile()}
+          >
+            <UserSwitch size={17} />
+            切换到 Codex
+          </button>
+        )}
+        {profile.kind === "codex_oauth" && (
+          <button
+            className="icon-button"
+            aria-label={`设为当前档案：${profile.alias}`}
+            title={
+              !supportsManagedCurrentProfile
+                ? "当前仅支持凭据已保存的 Codex 档案用于受管会话"
+                : profile.is_current
+                  ? "重新应用当前档案并启动独立 ChatGPT/Codex 工作区"
+                  : undefined
+            }
+            disabled={busy || !supportsManagedCurrentProfile}
+            onClick={() => void onSelect(profile.id)}
           >
             <UserSwitch size={19} />
           </button>
         )}
-        <button
-          className="icon-button"
-          aria-label={`设为当前档案：${profile.alias}`}
-          title={
-            !supportsManagedCurrentProfile
-              ? "当前仅支持凭据已保存的 Codex 档案用于受管会话"
-              : profile.is_current
-                ? "重新应用当前档案并启动独立 ChatGPT/Codex 工作区"
-                : undefined
-          }
-          disabled={busy || !supportsManagedCurrentProfile}
-          onClick={() => void onSelect(profile.id)}
-        >
-          <UserSwitch size={19} />
-        </button>
         {profile.kind === "codex_oauth" && (
           <button
             className="icon-button"

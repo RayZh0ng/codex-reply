@@ -334,10 +334,87 @@ pub struct ApiServiceTestReport {
     pub models: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentReport {
+    pub platform: String,
+    pub codex_home: Option<String>,
+    pub can_install: bool,
+    pub message: String,
+    pub last_checked_at_ms: i64,
+    pub summary: CodexEnvironmentSummary,
+    pub checks: Vec<CodexEnvironmentCheck>,
+    pub install_steps: Vec<CodexEnvironmentInstallStep>,
+    pub manual_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentSummary {
+    pub status: String,
+    pub ok_count: usize,
+    pub warning_count: usize,
+    pub missing_count: usize,
+    pub failed_count: usize,
+    pub fixable_count: usize,
+    pub health_percent: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentCheck {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+    pub command: Option<String>,
+    pub description: Option<String>,
+    pub next_action: Option<String>,
+    pub automatic: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentInstallStep {
+    pub id: String,
+    pub label: String,
+    pub available: bool,
+    pub command: Option<String>,
+    pub requires_privilege: bool,
+    pub next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallCodexEnvironmentInput {
+    pub confirmed: bool,
+    #[serde(default)]
+    pub steps: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentInstallReport {
+    pub status: String,
+    pub message: String,
+    pub logs: Vec<CodexEnvironmentInstallLog>,
+    pub environment: CodexEnvironmentReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentInstallLog {
+    pub step_id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+    pub command: Option<String>,
+    pub next_action: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateProfileInput {
     pub id: String,
     pub alias: String,
+    #[serde(default)]
+    pub provider: Option<GatewayProvider>,
+    #[serde(default)]
+    pub wire_api: Option<GatewayWireApi>,
+    #[serde(default)]
+    pub base_url: Option<String>,
     pub enabled: bool,
     pub in_pool: bool,
     pub priority: i64,

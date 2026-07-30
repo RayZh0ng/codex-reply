@@ -206,6 +206,26 @@ pub async fn update_profile(
     stored.profile.in_pool = input.in_pool;
     stored.profile.priority = input.priority;
     stored.profile.weight = input.weight;
+    if stored.profile.kind == ProfileKind::ApiKey {
+        if let Some(provider) = input.provider {
+            stored.profile.provider = provider;
+        }
+        if let Some(wire_api) = input.wire_api {
+            stored.profile.wire_api = wire_api;
+        }
+        if let Some(base_url) = input.base_url {
+            let normalized = normalize_base_url(&stored.profile.provider, &base_url)?;
+            let parsed = Url::parse(&normalized).map_err(|_| AppError::ValidationFailed)?;
+            if !valid_upstream_scheme(&stored.profile.provider, &parsed)
+                || parsed.host_str().is_none()
+            {
+                return Err(AppError::ValidationFailed);
+            }
+            stored.profile.base_url = Some(normalized);
+        }
+    } else if input.provider.is_some() || input.wire_api.is_some() || input.base_url.is_some() {
+        return Err(AppError::ValidationFailed);
+    }
     let model_mappings = match input.model_mappings {
         Some(mappings) => normalized_model_mappings(input.models, mappings)?,
         None => {

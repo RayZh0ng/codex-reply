@@ -1,14 +1,22 @@
 import { ArrowCounterClockwise } from "@phosphor-icons/react/ArrowCounterClockwise";
+import { Browser } from "@phosphor-icons/react/Browser";
+import { CheckCircle } from "@phosphor-icons/react/CheckCircle";
 import { Desktop } from "@phosphor-icons/react/Desktop";
 import { Moon } from "@phosphor-icons/react/Moon";
+import { ShieldCheck } from "@phosphor-icons/react/ShieldCheck";
 import { Sun } from "@phosphor-icons/react/Sun";
+import { TerminalWindow } from "@phosphor-icons/react/TerminalWindow";
 import { Trash } from "@phosphor-icons/react/Trash";
 import { Warning } from "@phosphor-icons/react/Warning";
+import { Wrench } from "@phosphor-icons/react/Wrench";
+import { XCircle } from "@phosphor-icons/react/XCircle";
 
 import {
   type AppUpdateChannel,
   type AppUpdateInfo,
   type AppUpdateSettings,
+  type CodexEnvironmentInstallReport,
+  type CodexEnvironmentReport,
   type DesktopWorkspaceHistoryItem,
   type DesktopWorkspaceMode,
   type DesktopWorkspaceSettings,
@@ -74,11 +82,16 @@ interface SettingsProps {
   availableUpdate: AppUpdateInfo | null;
   updateStatus: string | null;
   updateBusy: boolean;
+  codexEnvironment: CodexEnvironmentReport | null;
+  codexEnvironmentInstall: CodexEnvironmentInstallReport | null;
+  codexEnvironmentBusy: boolean;
   onChangeMode: (mode: DesktopWorkspaceMode) => Promise<void>;
   onThemePreferenceChange: (preference: ThemePreference) => void;
   onChangeUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
   onCheckUpdate: () => Promise<void>;
   onInstallUpdate: () => Promise<void>;
+  onRefreshCodexEnvironment: () => Promise<void>;
+  onInstallCodexEnvironment: () => Promise<void>;
   onRestore: (id: string) => Promise<void>;
   onDelete: (id: string, alias: string) => void;
 }
@@ -92,14 +105,41 @@ export function Settings({
   availableUpdate,
   updateStatus,
   updateBusy,
+  codexEnvironment,
+  codexEnvironmentInstall,
+  codexEnvironmentBusy,
   onChangeMode,
   onThemePreferenceChange,
   onChangeUpdateSettings,
   onCheckUpdate,
   onInstallUpdate,
+  onRefreshCodexEnvironment,
+  onInstallCodexEnvironment,
   onRestore,
   onDelete,
 }: SettingsProps) {
+  const installableMissingIds = new Set(
+    codexEnvironment?.install_steps
+      .filter((step) => step.available)
+      .map((step) => step.id) ?? [],
+  );
+  const hasInstallableMissing =
+    codexEnvironment?.checks.some(
+      (check) => check.status === "missing" && installableMissingIds.has(check.id),
+    ) ?? false;
+  const hasManualCommands = Boolean(codexEnvironment?.manual_commands.length);
+  const canAutoInstall = Boolean(
+    codexEnvironment?.can_install && hasInstallableMissing,
+  );
+  const environmentTone = codexEnvironment
+    ? environmentSummaryTone(codexEnvironment.summary.status)
+    : "neutral";
+  const copyManualCommands = () => {
+    const commands = codexEnvironment?.manual_commands ?? [];
+    if (!commands.length) return;
+    void navigator.clipboard?.writeText(commands.join("\n"));
+  };
+
   return (
     <div className="page settings-page">
       <header className="page-heading" data-animate="heading">
@@ -223,6 +263,147 @@ export function Settings({
           )}
         </div>
       </section>
+      <section
+        className={`surface-card codex-environment-settings environment-${environmentTone}`}
+        data-animate="cards"
+      >
+        <div className="environment-hero">
+          <div className="environment-hero-copy">
+            <p className="section-kicker">Environment</p>
+            <h2>Codex 环境检查</h2>
+            <p>
+              覆盖 Windows / macOS / Linux：Node.js LTS、npm、Codex CLI、Git、 Codex
+              home、OAuth 回调、默认浏览器与 Relay CA。
+            </p>
+          </div>
+          {codexEnvironment ? (
+            <div className={`environment-score-card is-${environmentTone}`}>
+              <span>{codexEnvironment.summary.health_percent}</span>
+              <small>健康分</small>
+            </div>
+          ) : (
+            <div className="environment-score-card is-neutral">
+              <span>--</span>
+              <small>未检查</small>
+            </div>
+          )}
+        </div>
+        {codexEnvironment ? (
+          <>
+            <article className={`environment-summary-panel is-${environmentTone}`}>
+              <EnvironmentSummaryIcon status={codexEnvironment.summary.status} />
+              <div>
+                <strong>{codexEnvironment.message}</strong>
+                <p>
+                  平台：{formatEnvironmentPlatform(codexEnvironment.platform)}
+                  {codexEnvironment.codex_home
+                    ? ` · Codex home：${codexEnvironment.codex_home}`
+                    : ""}
+                  {codexEnvironment.last_checked_at_ms
+                    ? ` · 上次检查：${formatTimestamp(codexEnvironment.last_checked_at_ms)}`
+                    : ""}
+                </p>
+              </div>
+              <div className="environment-summary-metrics" aria-label="环境检查统计">
+                <span>{codexEnvironment.summary.ok_count} 正常</span>
+                <span>{codexEnvironment.summary.warning_count} 提示</span>
+                <span>{codexEnvironment.summary.missing_count} 缺失</span>
+                <span>{codexEnvironment.summary.failed_count} 失败</span>
+              </div>
+            </article>
+            <ul className="environment-check-grid" aria-label="Codex 环境检查结果">
+              {codexEnvironment.checks.map((check) => (
+                <li
+                  key={check.id}
+                  className={`environment-check-card is-${check.status}`}
+                >
+                  <div className="environment-check-topline">
+                    <span
+                      className={`environment-check-icon ${environmentStatusTone(check.status)}`}
+                    >
+                      <EnvironmentCheckIcon id={check.id} status={check.status} />
+                    </span>
+                    <span
+                      className={`status-pill compact ${environmentStatusTone(check.status)}`}
+                    >
+                      <i />
+                      {environmentStatusLabel(check.status)}
+                    </span>
+                  </div>
+                  <div className="environment-check-body">
+                    <strong>{check.label}</strong>
+                    {check.description && <small>{check.description}</small>}
+                    <p>{check.detail}</p>
+                  </div>
+                  {(check.command || check.next_action) && (
+                    <details className="environment-check-detail">
+                      <summary>修复详情</summary>
+                      {check.next_action && <span>{check.next_action}</span>}
+                      {check.command && <code>{check.command}</code>}
+                    </details>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <div className="environment-empty-state">
+            <TerminalWindow size={24} weight="duotone" />
+            <p>点击“重新检查”获取当前 Codex 本机环境状态。</p>
+          </div>
+        )}
+        {codexEnvironmentInstall && (
+          <details
+            className="environment-install-report"
+            open={codexEnvironmentInstall.status !== "completed"}
+          >
+            <summary>
+              <strong>{codexEnvironmentInstall.message}</strong>
+              <span>{codexEnvironmentInstall.logs.length} 个步骤</span>
+            </summary>
+            <ul>
+              {codexEnvironmentInstall.logs.map((log) => (
+                <li key={log.step_id} className={`is-${log.status}`}>
+                  <div>
+                    <strong>{log.label}</strong>
+                    <span>
+                      {environmentStatusLabel(log.status)} · {log.detail}
+                    </span>
+                    {log.next_action && <em>{log.next_action}</em>}
+                    {log.command && <code>{log.command}</code>}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+        <div className="environment-actions">
+          <button
+            className="quiet-button"
+            disabled={busy || codexEnvironmentBusy}
+            onClick={() => void onRefreshCodexEnvironment()}
+            type="button"
+          >
+            {codexEnvironmentBusy ? "正在检查…" : "重新检查"}
+          </button>
+          <button
+            className="primary-button"
+            disabled={busy || codexEnvironmentBusy || !canAutoInstall}
+            onClick={() => void onInstallCodexEnvironment()}
+            type="button"
+          >
+            {codexEnvironmentBusy ? "正在部署…" : "一键部署缺失项"}
+          </button>
+          <button
+            className="quiet-button"
+            disabled={busy || codexEnvironmentBusy || !hasManualCommands}
+            onClick={copyManualCommands}
+            type="button"
+          >
+            复制修复命令
+          </button>
+        </div>
+      </section>
       <div className="section-heading compact-section-heading">
         <div>
           <h2>工作区模式</h2>
@@ -310,6 +491,23 @@ export function Settings({
   );
 }
 
+function EnvironmentSummaryIcon({ status }: { status: string }) {
+  if (status === "healthy") return <CheckCircle size={24} weight="fill" />;
+  if (status === "action_required") return <XCircle size={24} weight="fill" />;
+  return <Warning size={24} weight="fill" />;
+}
+
+function EnvironmentCheckIcon({ id, status }: { id: string; status: string }) {
+  if (status === "ok") return <CheckCircle size={18} weight="fill" />;
+  if (status === "failed" || status === "missing") {
+    return <XCircle size={18} weight="fill" />;
+  }
+  if (id === "browser") return <Browser size={18} weight="duotone" />;
+  if (id === "relay_ca") return <ShieldCheck size={18} weight="duotone" />;
+  if (id === "codex_home") return <Wrench size={18} weight="duotone" />;
+  return <TerminalWindow size={18} weight="duotone" />;
+}
+
 function formatTimestamp(value: number) {
   return new Intl.DateTimeFormat("zh-CN", {
     dateStyle: "medium",
@@ -319,4 +517,45 @@ function formatTimestamp(value: number) {
 
 function formatUpdateChannel(channel: AppUpdateChannel) {
   return channel === "beta" ? "Beta" : "稳定版";
+}
+
+function environmentStatusLabel(status: string) {
+  return (
+    {
+      ok: "正常",
+      missing: "缺失",
+      warning: "需处理",
+      failed: "失败",
+      completed: "已完成",
+      skipped: "已跳过",
+      needs_privilege: "需授权",
+      unsupported: "需手动",
+    }[status] ?? status
+  );
+}
+
+function environmentStatusTone(status: string) {
+  if (status === "ok" || status === "completed") return "success";
+  if (status === "warning" || status === "needs_privilege") return "warning";
+  if (status === "missing" || status === "failed" || status === "unsupported")
+    return "danger";
+  return "neutral";
+}
+
+function environmentSummaryTone(status: string) {
+  if (status === "healthy") return "success";
+  if (status === "warning") return "warning";
+  if (status === "action_required") return "danger";
+  return "neutral";
+}
+
+function formatEnvironmentPlatform(platform: string) {
+  return (
+    {
+      windows: "Windows",
+      macos: "macOS",
+      linux: "Linux",
+      other: "其它平台",
+    }[platform] ?? platform
+  );
 }

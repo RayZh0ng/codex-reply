@@ -24,6 +24,8 @@ import {
   type AppUpdateInfo,
   type AppUpdateSettings,
   type CurrentProfileActivation,
+  type CodexEnvironmentInstallReport,
+  type CodexEnvironmentReport,
   type DesktopWorkspaceHistoryItem,
   type DesktopWorkspaceMode,
   type DesktopWorkspaceSettings,
@@ -132,6 +134,11 @@ function App() {
   const [workspaceHistory, setWorkspaceHistory] = useState<
     DesktopWorkspaceHistoryItem[]
   >([]);
+  const [codexEnvironment, setCodexEnvironment] =
+    useState<CodexEnvironmentReport | null>(null);
+  const [codexEnvironmentInstall, setCodexEnvironmentInstall] =
+    useState<CodexEnvironmentInstallReport | null>(null);
+  const [codexEnvironmentBusy, setCodexEnvironmentBusy] = useState(false);
   const [topbarScrolled, setTopbarScrolled] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
@@ -176,9 +183,27 @@ function App() {
   }, []);
   const refreshWorkspaceHistory = useCallback(async () => {
     try {
-      setWorkspaceHistory(await api.listDesktopWorkspaces());
+      const [history, environment] = await Promise.all([
+        api.listDesktopWorkspaces(),
+        api.codexEnvironmentStatus(),
+      ]);
+      setWorkspaceHistory(history);
+      setCodexEnvironment(environment);
     } catch (reason) {
       setError(errorMessage(reason));
+    }
+  }, []);
+  const installCodexEnvironment = useCallback(async () => {
+    setCodexEnvironmentBusy(true);
+    try {
+      const report = await api.installCodexEnvironment();
+      setCodexEnvironmentInstall(report);
+      setCodexEnvironment(report.environment);
+      setNotice(report.message);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setCodexEnvironmentBusy(false);
     }
   }, []);
   const installAppUpdate = useCallback(async (channel: AppUpdateChannel) => {
@@ -559,6 +584,9 @@ function App() {
       appUpdateStatus={appUpdateStatus}
       appUpdateBusy={appUpdateBusy}
       workspaceHistory={workspaceHistory}
+      codexEnvironment={codexEnvironment}
+      codexEnvironmentInstall={codexEnvironmentInstall}
+      codexEnvironmentBusy={codexEnvironmentBusy}
       themePreference={themePreference}
       collaborationBots={collaborationBots}
       collaborationBindings={collaborationBindings}
@@ -579,6 +607,15 @@ function App() {
       onInstallAppUpdate={async () => {
         if (availableAppUpdate) requestAppUpdateInstall(availableAppUpdate);
       }}
+      onRefreshCodexEnvironment={async () => {
+        setCodexEnvironmentBusy(true);
+        try {
+          setCodexEnvironment(await api.codexEnvironmentStatus());
+        } finally {
+          setCodexEnvironmentBusy(false);
+        }
+      }}
+      onInstallCodexEnvironment={installCodexEnvironment}
       onRestoreWorkspace={async (id) => {
         const activation = await api.restoreDesktopWorkspace(id);
         if (activation.status === "switching") {
@@ -780,6 +817,9 @@ function PageContent({
   appUpdateStatus,
   appUpdateBusy,
   workspaceHistory,
+  codexEnvironment,
+  codexEnvironmentInstall,
+  codexEnvironmentBusy,
   themePreference,
   collaborationBots,
   collaborationBindings,
@@ -790,6 +830,8 @@ function PageContent({
   onChangeAppUpdateSettings,
   onCheckAppUpdate,
   onInstallAppUpdate,
+  onRefreshCodexEnvironment,
+  onInstallCodexEnvironment,
   onRestoreWorkspace,
   onThemePreferenceChange,
   onRefresh,
@@ -823,6 +865,9 @@ function PageContent({
   appUpdateStatus: string | null;
   appUpdateBusy: boolean;
   workspaceHistory: DesktopWorkspaceHistoryItem[];
+  codexEnvironment: CodexEnvironmentReport | null;
+  codexEnvironmentInstall: CodexEnvironmentInstallReport | null;
+  codexEnvironmentBusy: boolean;
   themePreference: ThemePreference;
   collaborationBots: MaskedCollaborationBot[];
   collaborationBindings: CollaborationProjectBinding[];
@@ -833,6 +878,8 @@ function PageContent({
   onChangeAppUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
   onCheckAppUpdate: () => Promise<void>;
   onInstallAppUpdate: () => Promise<void>;
+  onRefreshCodexEnvironment: () => Promise<void>;
+  onInstallCodexEnvironment: () => Promise<void>;
   onRestoreWorkspace: (id: string) => Promise<void>;
   onThemePreferenceChange: (preference: ThemePreference) => void;
   onRefresh: () => Promise<void>;
@@ -882,7 +929,14 @@ function PageContent({
         onCreateApiProfile={(input) =>
           api.createApiServiceProfile(input).then(async () => {
             await onRefresh();
-            notify("第三方模型提供商已保存，模型目录已刷新。");
+            notify("第三方模型提供商已保存，已保留你选择的模型映射。");
+          })
+        }
+        onUpdateApiProfile={(input) =>
+          api.updateProfile(input).then(async () => {
+            await onRefresh();
+            await onRefreshCollaboration();
+            notify("第三方模型提供商已更新。");
           })
         }
         onTogglePool={(profile) =>
@@ -1024,6 +1078,9 @@ function PageContent({
       <Settings
         settings={workspaceSettings}
         workspaces={workspaceHistory}
+        codexEnvironment={codexEnvironment}
+        codexEnvironmentInstall={codexEnvironmentInstall}
+        codexEnvironmentBusy={codexEnvironmentBusy}
         busy={busy}
         themePreference={themePreference}
         updateSettings={appUpdateSettings}
@@ -1035,6 +1092,8 @@ function PageContent({
         onChangeUpdateSettings={onChangeAppUpdateSettings}
         onCheckUpdate={onCheckAppUpdate}
         onInstallUpdate={onInstallAppUpdate}
+        onRefreshCodexEnvironment={onRefreshCodexEnvironment}
+        onInstallCodexEnvironment={onInstallCodexEnvironment}
         onRestore={onRestoreWorkspace}
         onDelete={(id, alias) =>
           requestDelete(

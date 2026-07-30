@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -1785,7 +1785,13 @@ impl CollaborationManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|_| AppError::RuntimeUnavailable)?;
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                AppError::CodexCliMissing
+            } else {
+                AppError::RuntimeUnavailable
+            }
+        })?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(codex_instruction.as_bytes())
@@ -4673,6 +4679,9 @@ fn collaboration_error_message(error: &AppError) -> String {
         }
         AppError::RuntimeUnavailable => {
             "本机运行时或项目目录不可用，请确认工作目录存在且 Codex CLI 可启动。"
+        }
+        AppError::CodexCliMissing => {
+            "未检测到 Codex CLI，请在设置页运行环境检查并安装 @openai/codex。"
         }
         AppError::LocalStateUnavailable => {
             "本机会话状态暂不可读，请在 Codex Relay 客户端协作页刷新机器人连接；若仍出现，请重启 Codex Relay 并保留该错误码。"

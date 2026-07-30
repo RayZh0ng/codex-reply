@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::process::Command;
 
 use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
@@ -556,7 +556,7 @@ impl GatewayManager {
         Ok(())
     }
 
-    pub fn trust_ca_in_macos_keychain(&self) -> AppResult<()> {
+    pub fn trust_ca_in_system_store(&self) -> AppResult<()> {
         let source = self.certificate_dir.join("gateway-ca.pem");
         if !source.exists() {
             return Err(AppError::NotFound);
@@ -576,7 +576,59 @@ impl GatewayManager {
             }
             Err(AppError::KeychainInteractionRequired)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            let output = Command::new("certutil.exe")
+                .args(["-user", "-addstore", "Root"])
+                .arg(source)
+                .output()
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            if output.status.success() {
+                return Ok(());
+            }
+            Err(AppError::CaTrustFailed)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let has_update_ca = Command::new("sh")
+                .args(["-lc", "command -v update-ca-certificates"])
+                .output()
+                .is_ok_and(|output| output.status.success());
+            let has_update_ca_trust = Command::new("sh")
+                .args(["-lc", "command -v update-ca-trust"])
+                .output()
+                .is_ok_and(|output| output.status.success());
+            let has_pkexec = Command::new("sh")
+                .args(["-lc", "command -v pkexec"])
+                .output()
+                .is_ok_and(|output| output.status.success());
+            if !has_pkexec {
+                return Err(AppError::EnvironmentPrivilegeRequired);
+            }
+            let source_text = source.display().to_string();
+            let script = if has_update_ca {
+                format!(
+                    "cp '{}' /usr/local/share/ca-certificates/codex-relay-gateway-ca.crt && update-ca-certificates",
+                    source_text.replace('\'', "'\\''")
+                )
+            } else if has_update_ca_trust {
+                format!(
+                    "cp '{}' /etc/pki/ca-trust/source/anchors/codex-relay-gateway-ca.crt && update-ca-trust extract",
+                    source_text.replace('\'', "'\\''")
+                )
+            } else {
+                return Err(AppError::CaTrustFailed);
+            };
+            let output = Command::new("pkexec")
+                .args(["sh", "-lc", &script])
+                .output()
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            if output.status.success() {
+                return Ok(());
+            }
+            Err(AppError::CaTrustFailed)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
             Err(AppError::RuntimeUnavailable)
         }

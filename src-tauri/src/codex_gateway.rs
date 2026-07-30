@@ -21,12 +21,12 @@ use toml_edit::{value, Array, DocumentMut, Item, Table};
 use uuid::Uuid;
 
 use crate::{
+    codex_environment::default_codex_home,
     database::{Repository, StoredProfile},
     domain::{
         CodexAuthMode, GatewayCodexConfigStatus, GatewayModelMapping, GatewayOAuthProfileOption,
-        GatewayStatus, GatewayWireApi, MaskedClientKey, ProfileKind,
-        SetCodexGatewayOAuthProfileInput, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
-        GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
+        GatewayStatus, MaskedClientKey, ProfileKind, SetCodexGatewayOAuthProfileInput,
+        GATEWAY_CODEX_CLIENT_KEY_REF_SETTING, GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
     },
     error::{AppError, AppResult},
     oauth_credentials::{CredentialAccess, OAuthCredentialStore},
@@ -526,24 +526,10 @@ async fn enable_api_profile_at_path(
 ) -> AppResult<GatewayCodexConfigStatus> {
     let mut stored = repository.profile(id)?;
     if stored.profile.kind != crate::domain::ProfileKind::ApiKey
-        || !matches!(
-            stored.profile.provider,
-            crate::domain::GatewayProvider::OpenAi
-                | crate::domain::GatewayProvider::OpenAiCompatible
-        )
         || stored.profile.health != "healthy"
     {
         return Err(AppError::UpstreamUnavailable);
     }
-    let direct_base_url = stored
-        .profile
-        .base_url
-        .clone()
-        .ok_or(AppError::ValidationFailed)?;
-    let direct_secret_ref = stored
-        .secret_ref
-        .clone()
-        .ok_or(AppError::ValidationFailed)?;
     let model = stored
         .profile
         .models
@@ -559,29 +545,17 @@ async fn enable_api_profile_at_path(
     let mut document = original
         .parse::<DocumentMut>()
         .map_err(|_| AppError::ValidationFailed)?;
-    let (base_url, auth_secret_ref, service_url, message) =
-        if stored.profile.wire_api == GatewayWireApi::ChatCompletions {
-            if !gateway.running || !gateway.certificate_ready {
-                return Err(AppError::GatewayNotRunning);
-            }
-            if !stored.profile.in_pool {
-                stored.profile.in_pool = true;
-                repository.update_profile(&stored)?;
-            }
-            (
-                format!("{}/v1", gateway.service_url),
-                ensure_codex_client_key(repository, secrets.clone()).await?,
-                Some(gateway.service_url.clone()),
-                "Codex 已切换到 Relay 本地路由的第三方模型提供商。请重启 Codex 以刷新模型列表。",
-            )
-        } else {
-            (
-                direct_base_url,
-                direct_secret_ref,
-                None,
-                "Codex 已切换到已验证的 API 服务档案。请重启 Codex 以刷新模型列表。",
-            )
-        };
+    if !gateway.running || !gateway.certificate_ready {
+        return Err(AppError::GatewayNotRunning);
+    }
+    if !stored.profile.in_pool {
+        stored.profile.in_pool = true;
+        repository.update_profile(&stored)?;
+    }
+    let base_url = format!("{}/v1", gateway.service_url);
+    let auth_secret_ref = ensure_codex_client_key(repository, secrets.clone()).await?;
+    let service_url = Some(gateway.service_url.clone());
+    let message = "Codex 已切换到 Relay 本地路由的第三方模型提供商。请重启 Codex 以刷新模型列表。";
     document["model_provider"] = value("codex_relay_direct");
     document["model"] = value(model);
     document["model_catalog_json"] = value(CODEX_RELAY_MODEL_CATALOG_FILENAME);
@@ -794,8 +768,7 @@ fn remove_relay_config(current: &mut DocumentMut, original: &DocumentMut) {
 }
 
 fn config_path() -> AppResult<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or(AppError::RuntimeUnavailable)?;
-    Ok(PathBuf::from(home).join(".codex/config.toml"))
+    Ok(default_codex_home()?.join("config.toml"))
 }
 
 fn content_hash(content: &str) -> String {
@@ -1053,8 +1026,11 @@ mod tests {
         );
         assert_eq!(
             document["model_providers"]["codex_relay_direct"]["base_url"].as_str(),
-            Some("https://api.example.com/v1")
+            Some("https://10.12.14.248:53765/v1")
         );
+        let auth = relay_auth_config(&document, "codex_relay_direct").unwrap();
+        assert!(auth.secret_ref.starts_with("client-key:"));
+        assert!(repository.profile("api").unwrap().profile.in_pool);
         let catalog_path = root.join("home/.codex/codex-relay-model-catalog.json");
         let catalog: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();

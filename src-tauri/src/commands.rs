@@ -20,28 +20,30 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use uuid::Uuid;
 
 use crate::{
-    codex_gateway,
+    codex_environment, codex_gateway,
     codex_runtime::{CodexRuntime, DesktopWorkspaceLaunch},
     collaboration::CollaborationManager,
     database::Repository,
     domain::{
         AppUpdateChannel, AppUpdateInfo, AppUpdateSettings, CancelCodexSessionInput,
         CancelManagedTaskInput, CheckAppUpdateInput, ClientKeySecretInput, CodexAuthMode,
-        CodexSessionSummary, CollaborationCallbackStatus, CollaborationContextSummary,
-        CollaborationProjectBinding, CollaborationProvider, CommitJsonProfileImportInput,
-        CompleteOAuthImportInput, ContinueCodexSessionInput, CreateApiServiceProfileInput,
-        CreateClientKeyInput, CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
+        CodexEnvironmentInstallReport, CodexEnvironmentReport, CodexSessionSummary,
+        CollaborationCallbackStatus, CollaborationContextSummary, CollaborationProjectBinding,
+        CollaborationProvider, CommitJsonProfileImportInput, CompleteOAuthImportInput,
+        ContinueCodexSessionInput, CreateApiServiceProfileInput, CreateClientKeyInput,
+        CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
         CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCollaborationBotInput,
         DeleteCollaborationProjectBindingInput, DeleteDesktopWorkspaceInput, DeleteFeishuBotInput,
         DeleteFeishuProjectBindingInput, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
         DesktopWorkspaceSettings, DiscardJsonProfileImportInput, FeishuProjectBinding,
-        GatewayCodexConfigStatus, GatewayStatus, InstallAppUpdateInput, JsonProfileImportPreview,
-        JsonProfileImportResult, ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey,
-        MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile, OAuthImportStatus,
-        PreviewJsonProfileImportInput, ProfileQuotaRefreshReport, ResetCollaborationContextInput,
-        RestoreDesktopWorkspaceInput, RetryJsonProfileImportInput, SelectCurrentProfileInput,
-        SetCodexGatewayOAuthProfileInput, StartManagedTaskInput, StartOAuthImportInput,
-        TestApiServiceInput, UpdateAppUpdateSettingsInput, UpdateCollaborationContextInput,
+        GatewayCodexConfigStatus, GatewayStatus, InstallAppUpdateInput,
+        InstallCodexEnvironmentInput, JsonProfileImportPreview, JsonProfileImportResult,
+        ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey, MaskedCollaborationBot,
+        MaskedFeishuBot, MaskedProfile, OAuthImportStatus, PreviewJsonProfileImportInput,
+        ProfileQuotaRefreshReport, ResetCollaborationContextInput, RestoreDesktopWorkspaceInput,
+        RetryJsonProfileImportInput, SelectCurrentProfileInput, SetCodexGatewayOAuthProfileInput,
+        StartManagedTaskInput, StartOAuthImportInput, TestApiServiceInput,
+        UpdateAppUpdateSettingsInput, UpdateCollaborationContextInput,
         UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput, UpdateProfileInput,
         UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput, UpsertFeishuBotInput,
         UpsertFeishuProjectBindingInput,
@@ -612,7 +614,7 @@ pub fn export_gateway_ca(destination: String, state: State<'_, AppState>) -> App
 
 #[tauri::command]
 pub fn trust_gateway_ca(state: State<'_, AppState>) -> AppResult<()> {
-    state.gateway.trust_ca_in_macos_keychain()
+    state.gateway.trust_ca_in_system_store()
 }
 
 #[tauri::command]
@@ -661,12 +663,20 @@ pub async fn activate_api_service_profile(
     id: String,
     state: State<'_, AppState>,
 ) -> AppResult<GatewayCodexConfigStatus> {
+    let mut gateway_status = state.gateway.status()?;
+    if !gateway_status.running || !gateway_status.certificate_ready {
+        gateway_status = state.gateway.start().await?;
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        state.gateway.trust_ca_in_system_store()?;
+    }
     codex_gateway::enable_api_profile(
         &state.repository,
         state.secrets.clone(),
         &id,
         &state.data_dir,
-        state.gateway.status()?,
+        gateway_status,
     )
     .await
 }
@@ -709,6 +719,41 @@ pub async fn test_api_service_profile(
     input: TestApiServiceInput,
 ) -> AppResult<crate::domain::ApiServiceTestReport> {
     test_api_service(&input.provider, &input.base_url, &input.api_key).await
+}
+
+#[tauri::command]
+pub async fn test_existing_api_service_profile(
+    id: String,
+    state: State<'_, AppState>,
+) -> AppResult<crate::domain::ApiServiceTestReport> {
+    let profile = state.repository.profile(&id)?;
+    if profile.profile.kind != crate::domain::ProfileKind::ApiKey {
+        return Err(AppError::ValidationFailed);
+    }
+    let base_url = profile
+        .profile
+        .base_url
+        .as_deref()
+        .ok_or(AppError::ValidationFailed)?;
+    let secret_ref = profile
+        .secret_ref
+        .as_deref()
+        .ok_or(AppError::ValidationFailed)?;
+    let key = state.secrets.get(secret_ref).await?;
+    test_api_service(&profile.profile.provider, base_url, &key).await
+}
+
+#[tauri::command]
+pub fn codex_environment_status(state: State<'_, AppState>) -> AppResult<CodexEnvironmentReport> {
+    codex_environment::status(Some(state.data_dir.join("certs/gateway-ca.pem")))
+}
+
+#[tauri::command]
+pub fn install_codex_environment(
+    input: InstallCodexEnvironmentInput,
+    state: State<'_, AppState>,
+) -> AppResult<CodexEnvironmentInstallReport> {
+    codex_environment::install(input, Some(state.data_dir.join("certs/gateway-ca.pem")))
 }
 
 #[tauri::command]

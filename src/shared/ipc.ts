@@ -184,6 +184,65 @@ export interface ApiServiceTestReport {
   models: string[];
 }
 
+export interface CodexEnvironmentReport {
+  platform: string;
+  codex_home: string | null;
+  can_install: boolean;
+  message: string;
+  last_checked_at_ms: number;
+  summary: CodexEnvironmentSummary;
+  checks: CodexEnvironmentCheck[];
+  install_steps: CodexEnvironmentInstallStep[];
+  manual_commands: string[];
+}
+
+export interface CodexEnvironmentSummary {
+  status: "healthy" | "warning" | "action_required" | string;
+  ok_count: number;
+  warning_count: number;
+  missing_count: number;
+  failed_count: number;
+  fixable_count: number;
+  health_percent: number;
+}
+
+export interface CodexEnvironmentCheck {
+  id: string;
+  label: string;
+  status: "ok" | "missing" | "warning" | "failed" | string;
+  detail: string;
+  command: string | null;
+  description: string | null;
+  next_action: string | null;
+  automatic: boolean;
+}
+
+export interface CodexEnvironmentInstallStep {
+  id: string;
+  label: string;
+  available: boolean;
+  command: string | null;
+  requires_privilege: boolean;
+  next_action: string | null;
+}
+
+export interface CodexEnvironmentInstallReport {
+  status: "completed" | "failed" | string;
+  message: string;
+  logs: CodexEnvironmentInstallLog[];
+  environment: CodexEnvironmentReport;
+}
+
+export interface CodexEnvironmentInstallLog {
+  step_id: string;
+  label: string;
+  status:
+    "completed" | "failed" | "skipped" | "needs_privilege" | "unsupported" | string;
+  detail: string;
+  command: string | null;
+  next_action: string | null;
+}
+
 export interface MetricsSnapshot {
   total_requests: number;
   successful_requests: number;
@@ -474,7 +533,21 @@ function recoveryFor(code: string) {
       internal: "请重启 Codex Relay；若仍出现，请保留该错误码后重试。",
       local_state_unavailable:
         "请在协作页刷新机器人连接；若仍出现，请重启 Codex Relay 并保留该错误码。",
-      runtime_unavailable: "请确认 Codex CLI 可用后重试。",
+      runtime_unavailable:
+        "请在设置页运行 Codex 环境检查，确认 CLI、PATH 与本机目录可用后重试。",
+      oauth_callback_port_unavailable:
+        "请关闭占用 127.0.0.1:1455 的进程，或重启 Codex Relay 后重试。",
+      oauth_browser_launch_failed:
+        "请检查系统默认浏览器设置；Linux 可安装 xdg-utils/gio 后重试。",
+      browser_launch_failed:
+        "请设置系统默认浏览器；Linux 可安装 xdg-utils/gio 后重试。",
+      environment_privilege_required:
+        "该步骤需要系统授权；请按环境检查日志中的命令在终端执行。",
+      environment_package_manager_missing:
+        "未检测到可用包管理器；请按环境检查中的手动命令安装依赖。",
+      ca_trust_failed:
+        "Relay CA 未能写入系统信任；请在网关页导出 CA 后按系统提示手动信任。",
+      codex_cli_missing: "请在设置页运行 Codex 环境检查并安装 Codex CLI。",
       secret_store_unavailable: "请解锁系统安全存储后重试。",
       keychain_interaction_required:
         "请在 macOS 系统弹窗中输入登录钥匙串密码，并选择“始终允许”。",
@@ -564,6 +637,14 @@ export const api = {
     relayInvoke<MaskedProfile>("refresh_profile_models", { id }),
   testApiServiceProfile: (input: Record<string, unknown>) =>
     relayInvoke<ApiServiceTestReport>("test_api_service_profile", { input }),
+  testExistingApiServiceProfile: (id: string) =>
+    relayInvoke<ApiServiceTestReport>("test_existing_api_service_profile", { id }),
+  codexEnvironmentStatus: () =>
+    relayInvoke<CodexEnvironmentReport>("codex_environment_status"),
+  installCodexEnvironment: (steps?: string[]) =>
+    relayInvoke<CodexEnvironmentInstallReport>("install_codex_environment", {
+      input: { confirmed: true, steps: steps ?? null },
+    }),
   codexGatewayConfigStatus: () =>
     relayInvoke<GatewayCodexConfigStatus>("codex_gateway_config_status"),
   enableCodexGateway: () =>

@@ -453,7 +453,7 @@ describe("Profiles OAuth import", () => {
       .getByRole("heading", { name: "添加第三方模型提供商" })
       .closest("section") as HTMLElement;
     const form = within(sheet);
-    expect(form.getByText(/OpenAI 兼容 direct/)).toBeInTheDocument();
+    expect(form.getByText(/OpenAI 兼容 Relay/)).toBeInTheDocument();
     expect(
       form.getByText(/模型映射会生成 Codex model_catalog_json/),
     ).toBeInTheDocument();
@@ -469,6 +469,7 @@ describe("Profiles OAuth import", () => {
     fireEvent.click(form.getByRole("button", { name: "测试连接并发现模型" }));
 
     expect(await screen.findByText("连接已验证")).toBeInTheDocument();
+    fireEvent.click(form.getByRole("checkbox", { name: "third-party-coder" }));
     expect(form.getByLabelText("Model ID")).toHaveValue("third-party-coder");
     fireEvent.change(form.getByLabelText("Model ID"), {
       target: { value: "codex-visible-coder" },
@@ -541,7 +542,7 @@ describe("Profiles OAuth import", () => {
     expect(screen.queryByText(/internal/)).not.toBeInTheDocument();
   });
 
-  it("marks API Key profiles as unavailable for the managed Codex current profile", () => {
+  it("shows API Key profiles with a dedicated Codex activation action", () => {
     render(
       <Profiles
         profiles={[
@@ -573,8 +574,14 @@ describe("Profiles OAuth import", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "设为当前档案：Gateway only" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "设为当前档案：Gateway only" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "编辑 API 服务：Gateway only" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "切换到 Codex：Gateway only" }),
+    ).toBeEnabled();
   });
 
   it("lets personal OAuth profiles refresh models and join the weighted gateway pool", () => {

@@ -188,7 +188,7 @@ export function Gateway({
   const trustCa = async () => {
     try {
       await api.trustGatewayCa();
-      onNotice("Relay CA 已加入 macOS 登录钥匙串。请重新启动 Codex 会话后重试。");
+      onNotice("Relay CA 已加入当前系统信任存储。请重新启动 Codex 会话后重试。");
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "无法安装 Relay CA。");
     }

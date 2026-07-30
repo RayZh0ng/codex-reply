@@ -22,6 +22,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    codex_environment::default_codex_home,
     database::StoredProfile,
     domain::{
         CurrentProfileActivation, DesktopWorkspaceMode, ManagedTaskStatus, OAuthImportStatus,
@@ -94,7 +95,7 @@ impl CodexRunner for SystemCodexRunner {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = command.spawn().map_err(|_| AppError::RuntimeUnavailable)?;
+        let mut child = command.spawn().map_err(codex_spawn_error)?;
         let Some(mut stdin) = child.stdin.take() else {
             let _ = child.kill();
             return Err(AppError::RuntimeUnavailable);
@@ -132,30 +133,52 @@ impl BrowserLauncher for SystemBrowserLauncher {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .map_err(|_| AppError::RuntimeUnavailable)?;
+                .map_err(|_| AppError::OAuthBrowserLaunchFailed)?;
             status
                 .success()
                 .then_some(())
-                .ok_or(AppError::RuntimeUnavailable)
+                .ok_or(AppError::OAuthBrowserLaunchFailed)
         }
         #[cfg(target_os = "windows")]
         {
-            let status = Command::new("explorer.exe")
-                .arg(url)
+            if Command::new("cmd.exe")
+                .args(["/C", "start", "", url])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
-                .map_err(|_| AppError::RuntimeUnavailable)?;
-            status
-                .success()
-                .then_some(())
-                .ok_or(AppError::RuntimeUnavailable)
+                .is_ok_and(|status| status.success())
+            {
+                return Ok(());
+            }
+            Command::new("explorer.exe")
+                .arg(url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|_| ())
+                .map_err(|_| AppError::OAuthBrowserLaunchFailed)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            let _ = url;
-            Err(AppError::RuntimeUnavailable)
+            for (program, args) in [
+                ("xdg-open", vec![url]),
+                ("gio", vec!["open", url]),
+                ("sensible-browser", vec![url]),
+            ] {
+                if Command::new(program)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            Err(AppError::BrowserLaunchFailed)
         }
     }
 }
@@ -555,7 +578,7 @@ fn read_rate_limits_from_app_server(home: &Path) -> AppResult<AppServerAccountSn
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(|_| AppError::RuntimeUnavailable)?;
+    let mut child = command.spawn().map_err(codex_spawn_error)?;
     let result = (|| -> AppResult<AppServerAccountSnapshot> {
         let mut stdin = child.stdin.take().ok_or(AppError::RuntimeUnavailable)?;
         for request in [
@@ -668,7 +691,7 @@ fn read_models_from_app_server(home: &Path) -> AppResult<Vec<String>> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(|_| AppError::RuntimeUnavailable)?;
+    let mut child = command.spawn().map_err(codex_spawn_error)?;
     let result = (|| -> AppResult<Vec<String>> {
         let mut stdin = child.stdin.take().ok_or(AppError::RuntimeUnavailable)?;
         for request in [
@@ -1877,7 +1900,7 @@ impl CodexRuntime {
             return Err(AppError::Conflict);
         }
         let listener = TcpListener::bind(("127.0.0.1", OAUTH_CALLBACK_PORT))
-            .map_err(|_| AppError::RuntimeUnavailable)?;
+            .map_err(|_| AppError::OAuthCallbackPortUnavailable)?;
         let attempt_id = Uuid::new_v4().to_string();
         let verifier = random_token();
         let state = random_token();
@@ -2529,36 +2552,12 @@ fn build_authorization_url(redirect: &str, verifier: &str, state: &str) -> AppRe
         .append_pair("originator", "codex_vscode");
     Ok(url.into())
 }
-fn default_codex_home() -> AppResult<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let userprofile = std::env::var_os("USERPROFILE").map(PathBuf::from);
-    let homedrive = std::env::var_os("HOMEDRIVE").map(PathBuf::from);
-    let homepath = std::env::var_os("HOMEPATH").map(PathBuf::from);
-    default_codex_home_from_values(
-        cfg!(target_os = "windows"),
-        home,
-        userprofile,
-        homedrive,
-        homepath,
-    )
-    .ok_or(AppError::RuntimeUnavailable)
-}
-fn default_codex_home_from_values(
-    windows: bool,
-    home: Option<PathBuf>,
-    userprofile: Option<PathBuf>,
-    homedrive: Option<PathBuf>,
-    homepath: Option<PathBuf>,
-) -> Option<PathBuf> {
-    let base = if windows {
-        userprofile.or_else(|| match (homedrive, homepath) {
-            (Some(drive), Some(path)) => Some(drive.join(path)),
-            _ => home,
-        })
+fn codex_spawn_error(error: std::io::Error) -> AppError {
+    if error.kind() == ErrorKind::NotFound {
+        AppError::CodexCliMissing
     } else {
-        home
-    }?;
-    Some(base.join(".codex"))
+        AppError::RuntimeUnavailable
+    }
 }
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -3469,28 +3468,8 @@ mod tests {
     }
 
     #[test]
-    fn resolves_default_codex_home_for_macos_and_windows() {
+    fn keeps_desktop_app_candidate_order_stable() {
         assert_eq!(DESKTOP_APP_CANDIDATES, ["ChatGPT", "Codex"]);
-        assert_eq!(
-            default_codex_home_from_values(
-                false,
-                Some(PathBuf::from("/Users/example")),
-                None,
-                None,
-                None,
-            ),
-            Some(PathBuf::from("/Users/example/.codex"))
-        );
-        assert_eq!(
-            default_codex_home_from_values(
-                true,
-                None,
-                Some(PathBuf::from(r"C:\\Users\\example")),
-                None,
-                None,
-            ),
-            Some(PathBuf::from(r"C:\\Users\\example/.codex"))
-        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+mod codex_environment;
 mod codex_gateway;
 mod codex_runtime;
 mod collaboration;
@@ -63,6 +64,9 @@ pub fn run() {
             commands::trust_gateway_ca,
             commands::refresh_profile_models,
             commands::test_api_service_profile,
+            commands::test_existing_api_service_profile,
+            commands::codex_environment_status,
+            commands::install_codex_environment,
             commands::codex_gateway_config_status,
             commands::enable_codex_gateway,
             commands::disable_codex_gateway,
