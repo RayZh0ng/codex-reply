@@ -16,12 +16,15 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 
 import { Dashboard } from "../features/dashboard/Dashboard";
 import {
+  APP_UPDATE_PROGRESS_EVENT,
   api,
   type AppUpdateChannel,
   type AppUpdateInfo,
+  type AppUpdateProgressEvent,
   type AppUpdateSettings,
   type CurrentProfileActivation,
   type CodexEnvironmentInstallReport,
@@ -131,6 +134,8 @@ function App() {
   );
   const [appUpdateStatus, setAppUpdateStatus] = useState<string | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
+  const [appUpdateProgress, setAppUpdateProgress] =
+    useState<AppUpdateProgressEvent | null>(null);
   const [workspaceHistory, setWorkspaceHistory] = useState<
     DesktopWorkspaceHistoryItem[]
   >([]);
@@ -206,13 +211,52 @@ function App() {
       setCodexEnvironmentBusy(false);
     }
   }, []);
-  const installAppUpdate = useCallback(async (channel: AppUpdateChannel) => {
+  const installAppUpdate = useCallback(async (update: AppUpdateInfo) => {
     setAppUpdateBusy(true);
+    setAppUpdateStatus(null);
+    setAppUpdateProgress({
+      phase: "checking",
+      channel: update.channel,
+      version: update.version,
+      current_version: update.current_version,
+      downloaded_bytes: 0,
+      content_length: null,
+      progress_percent: null,
+      message: "正在准备下载更新。",
+      updated_at_ms: Date.now(),
+    });
     try {
-      await api.installAppUpdate(channel);
+      await api.installAppUpdate(update.channel);
+      setAppUpdateProgress((current) =>
+        current?.phase === "restarting"
+          ? current
+          : {
+              phase: "restarting",
+              channel: update.channel,
+              version: update.version,
+              current_version: update.current_version,
+              downloaded_bytes: current?.downloaded_bytes ?? 0,
+              content_length: current?.content_length ?? null,
+              progress_percent: 100,
+              message: "更新已安装，应用即将重启。",
+              updated_at_ms: Date.now(),
+            },
+      );
       setNotice("更新已安装，应用将重启。");
     } catch (reason) {
-      setAppUpdateStatus(errorMessage(reason));
+      const message = errorMessage(reason);
+      setAppUpdateStatus(message);
+      setAppUpdateProgress((current) => ({
+        phase: "failed",
+        channel: update.channel,
+        version: update.version,
+        current_version: update.current_version,
+        downloaded_bytes: current?.downloaded_bytes ?? 0,
+        content_length: current?.content_length ?? null,
+        progress_percent: current?.progress_percent ?? null,
+        message,
+        updated_at_ms: Date.now(),
+      }));
       throw reason;
     } finally {
       setAppUpdateBusy(false);
@@ -227,7 +271,7 @@ function App() {
           "安装完成后应用会重启，Windows 可能会在安装阶段自动退出。",
         confirmLabel: "安装并重启",
         successMessage: "正在安装更新，应用将重启。",
-        action: () => installAppUpdate(update.channel),
+        action: () => installAppUpdate(update),
         refresh: async () => {},
       });
     },
@@ -236,6 +280,7 @@ function App() {
   const checkForAppUpdate = useCallback(
     async (channel: AppUpdateChannel, prompt = false, showStatus = true) => {
       setAppUpdateBusy(true);
+      setAppUpdateProgress(null);
       try {
         const update = await api.checkAppUpdate(channel);
         setAvailableAppUpdate(update);
@@ -253,6 +298,7 @@ function App() {
   );
   const changeAppUpdateSettings = useCallback(async (settings: AppUpdateSettings) => {
     setAppUpdateBusy(true);
+    setAppUpdateProgress(null);
     try {
       const saved = await api.updateAppUpdateSettings(settings);
       setAppUpdateSettings(saved);
@@ -310,6 +356,31 @@ function App() {
       cancelled = true;
     };
   }, [checkForAppUpdate]);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let mounted = true;
+    void listen<AppUpdateProgressEvent>(APP_UPDATE_PROGRESS_EVENT, (event) => {
+      if (!mounted) return;
+      setAppUpdateProgress(event.payload);
+      if (event.payload.phase === "failed") {
+        setAppUpdateStatus(event.payload.message);
+        setAppUpdateBusy(false);
+      } else {
+        setAppUpdateStatus(null);
+      }
+    })
+      .then((nextUnlisten) => {
+        unlisten = nextUnlisten;
+        if (!mounted) unlisten();
+      })
+      .catch(() => {
+        // Progress events are available only inside the Tauri runtime.
+      });
+    return () => {
+      mounted = false;
+      unlisten?.();
+    };
+  }, []);
   useEffect(() => {
     const media = window.matchMedia(COMPACT_SIDEBAR_QUERY);
     const update = (event: MediaQueryListEvent | MediaQueryList) => {
@@ -545,6 +616,10 @@ function App() {
       setRefreshing(false);
     }
   }, [page, refresh, refreshCollaboration, refreshWorkspaceHistory]);
+  const appUpdateProgressActive = Boolean(
+    appUpdateProgress && appUpdateProgress.phase !== "failed",
+  );
+  const appUpdateWorkBusy = appUpdateBusy || appUpdateProgressActive;
   const sidebarExpanded = compactSidebar ? sidebarDrawerOpen : !sidebarCollapsed;
   const toggleSidebar = () => {
     if (compactSidebar) {
@@ -582,7 +657,8 @@ function App() {
       appUpdateSettings={appUpdateSettings}
       availableAppUpdate={availableAppUpdate}
       appUpdateStatus={appUpdateStatus}
-      appUpdateBusy={appUpdateBusy}
+      appUpdateBusy={appUpdateWorkBusy}
+      appUpdateProgress={appUpdateProgress}
       workspaceHistory={workspaceHistory}
       codexEnvironment={codexEnvironment}
       codexEnvironmentInstall={codexEnvironmentInstall}
@@ -791,6 +867,12 @@ function App() {
           execute={execute}
         />
       )}
+      {appUpdateProgress && (
+        <AppUpdateProgressDialog
+          progress={appUpdateProgress}
+          onClose={() => setAppUpdateProgress(null)}
+        />
+      )}
       {profileActivation?.status === "switching" && (
         <ProfileActivationDialog activation={profileActivation} />
       )}
@@ -816,6 +898,7 @@ function PageContent({
   availableAppUpdate,
   appUpdateStatus,
   appUpdateBusy,
+  appUpdateProgress,
   workspaceHistory,
   codexEnvironment,
   codexEnvironmentInstall,
@@ -864,6 +947,7 @@ function PageContent({
   availableAppUpdate: AppUpdateInfo | null;
   appUpdateStatus: string | null;
   appUpdateBusy: boolean;
+  appUpdateProgress: AppUpdateProgressEvent | null;
   workspaceHistory: DesktopWorkspaceHistoryItem[];
   codexEnvironment: CodexEnvironmentReport | null;
   codexEnvironmentInstall: CodexEnvironmentInstallReport | null;
@@ -1087,6 +1171,7 @@ function PageContent({
         availableUpdate={availableAppUpdate}
         updateStatus={appUpdateStatus}
         updateBusy={appUpdateBusy}
+        updateProgress={appUpdateProgress}
         onChangeMode={onChangeWorkspaceMode}
         onThemePreferenceChange={onThemePreferenceChange}
         onChangeUpdateSettings={onChangeAppUpdateSettings}
@@ -1229,6 +1314,94 @@ function ConfirmDialog({
       title={confirmation.title}
     />
   );
+}
+
+function AppUpdateProgressDialog({
+  progress,
+  onClose,
+}: {
+  progress: AppUpdateProgressEvent;
+  onClose: () => void;
+}) {
+  const failed = progress.phase === "failed";
+  return (
+    <Dialog
+      description={progress.message}
+      footer={
+        failed ? (
+          <Button onClick={onClose} variant="quiet">
+            关闭
+          </Button>
+        ) : undefined
+      }
+      onClose={failed ? onClose : undefined}
+      open
+      title={`正在更新到 Codex Relay ${progress.version}`}
+    >
+      <div className={`update-progress-dialog is-${progress.phase}`}>
+        <UpdateProgressMeter progress={progress} />
+        <p>
+          {formatAppUpdateChannel(progress.channel)} 通道 · 当前版本{" "}
+          {progress.current_version}
+        </p>
+        {!failed && <p>请保持应用打开；安装完成后会自动重启。</p>}
+      </div>
+    </Dialog>
+  );
+}
+
+function UpdateProgressMeter({ progress }: { progress: AppUpdateProgressEvent }) {
+  const percent = progress.progress_percent;
+  return (
+    <div className="update-progress-meter" role="status">
+      <div className="update-progress-meter-heading">
+        <strong>{appUpdateProgressPhaseLabel(progress.phase)}</strong>
+        <span>
+          {percent === null ? formatBytes(progress.downloaded_bytes) : `${percent}%`}
+        </span>
+      </div>
+      <progress
+        aria-label="更新进度"
+        max={100}
+        value={percent === null ? undefined : percent}
+      />
+      <small>{formatAppUpdateByteSummary(progress)}</small>
+    </div>
+  );
+}
+
+function appUpdateProgressPhaseLabel(phase: AppUpdateProgressEvent["phase"]) {
+  return (
+    {
+      checking: "准备下载",
+      downloading: "正在下载",
+      downloaded: "下载完成",
+      installing: "正在安装",
+      restarting: "准备重启",
+      failed: "更新失败",
+    }[phase] ?? phase
+  );
+}
+
+function formatAppUpdateByteSummary(progress: AppUpdateProgressEvent) {
+  if (progress.content_length && progress.content_length > 0) {
+    return `${formatBytes(progress.downloaded_bytes)} / ${formatBytes(progress.content_length)}`;
+  }
+  if (progress.phase === "checking") return "正在连接更新服务…";
+  return `${formatBytes(progress.downloaded_bytes)} 已下载`;
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let next = value;
+  let unitIndex = 0;
+  while (next >= 1024 && unitIndex < units.length - 1) {
+    next /= 1024;
+    unitIndex += 1;
+  }
+  const precision = unitIndex === 0 || Number.isInteger(next) || next >= 10 ? 0 : 1;
+  return `${next.toFixed(precision)} ${units[unitIndex]}`;
 }
 
 function ProfileActivationDialog({

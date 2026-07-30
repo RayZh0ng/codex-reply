@@ -809,7 +809,7 @@ fn command_available(
 fn browser_available(executor: &dyn CommandExecutor, platform: EnvironmentPlatform) -> bool {
     match platform {
         EnvironmentPlatform::Windows => {
-            command_available(executor, platform, "cmd.exe")
+            command_available(executor, platform, "rundll32.exe")
                 || command_available(executor, platform, "explorer.exe")
         }
         EnvironmentPlatform::Macos => command_available(executor, platform, "open"),
@@ -1251,7 +1251,9 @@ fn browser_fix_command(platform: EnvironmentPlatform) -> String {
 
 fn browser_detail(platform: EnvironmentPlatform) -> String {
     match platform {
-        EnvironmentPlatform::Windows => "已检测到 Windows URL 打开入口。".to_owned(),
+        EnvironmentPlatform::Windows => {
+            "已检测到 Windows URL 打开入口（rundll32/explorer）。".to_owned()
+        }
         EnvironmentPlatform::Macos => "已检测到 macOS open 命令。".to_owned(),
         EnvironmentPlatform::Linux => "已检测到 Linux URL 打开入口。".to_owned(),
         EnvironmentPlatform::Other => "已检测到浏览器入口。".to_owned(),

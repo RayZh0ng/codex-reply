@@ -1,3 +1,5 @@
+import { cleanup } from "@testing-library/react";
+import { afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 
 Object.defineProperty(window, "matchMedia", {
@@ -12,4 +14,8 @@ Object.defineProperty(window, "matchMedia", {
     removeListener: () => undefined,
     dispatchEvent: () => false,
   }),
+});
+
+afterEach(() => {
+  cleanup();
 });

@@ -77,6 +77,7 @@ describe("Settings", () => {
         }}
         updateStatus={null}
         updateBusy={false}
+        updateProgress={null}
         onChangeMode={changeMode}
         onThemePreferenceChange={changeTheme}
         onChangeUpdateSettings={changeUpdateSettings}
@@ -213,6 +214,7 @@ describe("Settings", () => {
         availableUpdate={null}
         updateStatus={null}
         updateBusy={false}
+        updateProgress={null}
         onChangeMode={vi.fn().mockResolvedValue(undefined)}
         onThemePreferenceChange={vi.fn()}
         onChangeUpdateSettings={vi.fn().mockResolvedValue(undefined)}
@@ -234,5 +236,153 @@ describe("Settings", () => {
     const copyButtons = screen.getAllByRole("button", { name: "复制修复命令" });
     expect(deployButtons[deployButtons.length - 1]).toBeDisabled();
     expect(copyButtons[copyButtons.length - 1]).toBeEnabled();
+  });
+
+  it("renders determinate and indeterminate update progress states", () => {
+    const baseProps = {
+      settings: { mode: "per_profile" as const },
+      workspaces: [],
+      codexEnvironment: null,
+      codexEnvironmentInstall: null,
+      codexEnvironmentBusy: false,
+      busy: false,
+      themePreference: "system" as const,
+      updateSettings: { channel: "beta" as const, auto_check: true },
+      availableUpdate: {
+        version: "0.2.0-beta.2",
+        current_version: "0.2.0-beta.1",
+        body: null,
+        date: null,
+        channel: "beta" as const,
+      },
+      updateStatus: null,
+      updateBusy: true,
+      onChangeMode: vi.fn().mockResolvedValue(undefined),
+      onThemePreferenceChange: vi.fn(),
+      onChangeUpdateSettings: vi.fn().mockResolvedValue(undefined),
+      onCheckUpdate: vi.fn().mockResolvedValue(undefined),
+      onInstallUpdate: vi.fn().mockResolvedValue(undefined),
+      onRefreshCodexEnvironment: vi.fn().mockResolvedValue(undefined),
+      onInstallCodexEnvironment: vi.fn().mockResolvedValue(undefined),
+      onRestore: vi.fn().mockResolvedValue(undefined),
+      onDelete: vi.fn(),
+    };
+
+    const { rerender } = render(
+      <Settings
+        {...baseProps}
+        updateProgress={{
+          phase: "downloading",
+          channel: "beta",
+          version: "0.2.0-beta.2",
+          current_version: "0.2.0-beta.1",
+          downloaded_bytes: 512,
+          content_length: 1024,
+          progress_percent: 50,
+          message: "正在下载更新。",
+          updated_at_ms: 1_700_000_000_000,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("正在下载")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+    expect(screen.getByText("512 B / 1 KB")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "更新进度" })).toHaveAttribute(
+      "value",
+      "50",
+    );
+    expect(screen.getAllByRole("button", { name: "正在更新…" })).toEqual(
+      expect.arrayContaining([expect.objectContaining({ disabled: true })]),
+    );
+    expect(screen.getAllByRole("button", { name: "正在更新…" })).toHaveLength(2);
+
+    rerender(
+      <Settings
+        {...baseProps}
+        updateProgress={{
+          phase: "downloading",
+          channel: "beta",
+          version: "0.2.0-beta.2",
+          current_version: "0.2.0-beta.1",
+          downloaded_bytes: 2048,
+          content_length: null,
+          progress_percent: null,
+          message: "正在下载更新。",
+          updated_at_ms: 1_700_000_000_000,
+        }}
+      />,
+    );
+    expect(screen.getByText("2 KB")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "更新进度" })).not.toHaveAttribute(
+      "value",
+    );
+  });
+
+  it("renders installing and failed update progress states", () => {
+    const props = {
+      settings: { mode: "per_profile" as const },
+      workspaces: [],
+      codexEnvironment: null,
+      codexEnvironmentInstall: null,
+      codexEnvironmentBusy: false,
+      busy: false,
+      themePreference: "system" as const,
+      updateSettings: { channel: "stable" as const, auto_check: false },
+      availableUpdate: null,
+      updateStatus: null,
+      updateBusy: true,
+      onChangeMode: vi.fn().mockResolvedValue(undefined),
+      onThemePreferenceChange: vi.fn(),
+      onChangeUpdateSettings: vi.fn().mockResolvedValue(undefined),
+      onCheckUpdate: vi.fn().mockResolvedValue(undefined),
+      onInstallUpdate: vi.fn().mockResolvedValue(undefined),
+      onRefreshCodexEnvironment: vi.fn().mockResolvedValue(undefined),
+      onInstallCodexEnvironment: vi.fn().mockResolvedValue(undefined),
+      onRestore: vi.fn().mockResolvedValue(undefined),
+      onDelete: vi.fn(),
+    };
+
+    const { rerender } = render(
+      <Settings
+        {...props}
+        updateProgress={{
+          phase: "installing",
+          channel: "stable",
+          version: "0.3.0",
+          current_version: "0.2.0",
+          downloaded_bytes: 4096,
+          content_length: 4096,
+          progress_percent: 100,
+          message: "正在安装更新。",
+          updated_at_ms: 1_700_000_000_000,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("正在安装")).toBeInTheDocument();
+    expect(screen.getByText("正在安装更新。")).toBeInTheDocument();
+
+    rerender(
+      <Settings
+        {...props}
+        updateBusy={false}
+        updateProgress={{
+          phase: "failed",
+          channel: "stable",
+          version: "0.3.0",
+          current_version: "0.2.0",
+          downloaded_bytes: 1024,
+          content_length: 4096,
+          progress_percent: 25,
+          message: "更新下载或安装失败，请稍后重试。",
+          updated_at_ms: 1_700_000_000_000,
+        }}
+      />,
+    );
+
+    expect(screen.getByText("更新失败")).toBeInTheDocument();
+    expect(screen.getByText("更新下载或安装失败，请稍后重试。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "立即检查更新" })).toBeEnabled();
   });
 });

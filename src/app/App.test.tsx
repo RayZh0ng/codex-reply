@@ -6,13 +6,15 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
+const events = vi.hoisted(() => ({ listen: vi.fn() }));
 
 vi.mock("@tauri-apps/api/core", () => native);
+vi.mock("@tauri-apps/api/event", () => events);
 
 class ResizeObserver {
   observe() {}
@@ -21,6 +23,18 @@ class ResizeObserver {
 }
 
 vi.stubGlobal("ResizeObserver", ResizeObserver);
+
+let eventHandlers: Record<string, (event: { payload: unknown }) => void> = {};
+
+beforeEach(() => {
+  eventHandlers = {};
+  events.listen.mockImplementation(
+    (event: string, handler: (event: { payload: unknown }) => void) => {
+      eventHandlers[event] = handler;
+      return Promise.resolve(vi.fn());
+    },
+  );
+});
 
 const snapshot = {
   workspace_mode: "per_profile" as const,
@@ -91,6 +105,7 @@ afterEach(() => {
   window.localStorage.clear();
   vi.useRealTimers();
   native.invoke.mockReset();
+  events.listen.mockReset();
   vi.restoreAllMocks();
   delete (window as typeof window & { __TAURI_INTERNALS__?: unknown })
     .__TAURI_INTERNALS__;
@@ -184,6 +199,70 @@ describe("App", () => {
         input: { channel: "beta" },
       }),
     );
+  });
+
+  it("shows updater progress events in the global dialog and settings page", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    native.invoke.mockImplementation((command: string) => {
+      if (command === "dashboard_snapshot") return Promise.resolve(snapshot);
+      if (command === "managed_task_status")
+        return Promise.resolve(idleTaskStatusForTest());
+      if (command === "app_update_settings")
+        return Promise.resolve({ channel: "beta", auto_check: false });
+      if (command === "list_desktop_workspaces") return Promise.resolve([]);
+      if (command === "codex_environment_status")
+        return Promise.resolve(emptyCodexEnvironmentForTest());
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+
+    act(() => {
+      emitTauriEvent("app-update-progress", {
+        phase: "downloading",
+        channel: "beta",
+        version: "0.2.0-beta.2",
+        current_version: "0.2.0-beta.1",
+        downloaded_bytes: 2048,
+        content_length: 5120,
+        progress_percent: 40,
+        message: "正在下载更新。",
+        updated_at_ms: 1_700_000_000_000,
+      });
+    });
+
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "正在更新到 Codex Relay 0.2.0-beta.2",
+    );
+    expect(screen.getByRole("dialog")).toHaveTextContent("40%");
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(
+      await screen.findByRole("heading", { name: "软件更新" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("40%").length).toBeGreaterThanOrEqual(2);
+
+    act(() => {
+      emitTauriEvent("app-update-progress", {
+        phase: "failed",
+        channel: "beta",
+        version: "0.2.0-beta.2",
+        current_version: "0.2.0-beta.1",
+        downloaded_bytes: 2048,
+        content_length: 5120,
+        progress_percent: 40,
+        message: "更新下载或安装失败，请稍后重试。",
+        updated_at_ms: 1_700_000_001_000,
+      });
+    });
+
+    expect(screen.getByRole("dialog")).toHaveTextContent("更新下载或安装失败");
+    expect(screen.getByRole("button", { name: "关闭" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "立即检查更新" })).toBeEnabled();
   });
 
   it("refreshes app and collaboration state after collaboration operations", async () => {
@@ -808,6 +887,34 @@ describe("App", () => {
 
 function commandCalls(command: string) {
   return native.invoke.mock.calls.filter(([name]) => name === command);
+}
+
+function emitTauriEvent(event: string, payload: unknown) {
+  const handler = eventHandlers[event];
+  if (!handler) throw new Error(`No Tauri listener registered for ${event}`);
+  handler({ payload });
+}
+
+function emptyCodexEnvironmentForTest() {
+  return {
+    platform: "macos",
+    codex_home: "/Users/dev/.codex",
+    can_install: false,
+    message: "Codex 三端最小运行环境检查通过。",
+    last_checked_at_ms: 1_700_000_000_000,
+    summary: {
+      status: "healthy",
+      ok_count: 1,
+      warning_count: 0,
+      missing_count: 0,
+      failed_count: 0,
+      fixable_count: 0,
+      health_percent: 100,
+    },
+    checks: [],
+    install_steps: [],
+    manual_commands: [],
+  };
 }
 
 function idleTaskStatusForTest() {

@@ -458,6 +458,23 @@ export interface AppUpdateInfo {
   channel: AppUpdateChannel;
 }
 
+export const APP_UPDATE_PROGRESS_EVENT = "app-update-progress";
+
+export type AppUpdateProgressPhase =
+  "checking" | "downloading" | "downloaded" | "installing" | "restarting" | "failed";
+
+export interface AppUpdateProgressEvent {
+  phase: AppUpdateProgressPhase;
+  channel: AppUpdateChannel;
+  version: string;
+  current_version: string;
+  downloaded_bytes: number;
+  content_length: number | null;
+  progress_percent: number | null;
+  message: string;
+  updated_at_ms: number;
+}
+
 export interface DesktopWorkspaceHistoryItem {
   id: string;
   profile_id: string;

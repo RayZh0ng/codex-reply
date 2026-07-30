@@ -14,6 +14,7 @@ import { XCircle } from "@phosphor-icons/react/XCircle";
 import {
   type AppUpdateChannel,
   type AppUpdateInfo,
+  type AppUpdateProgressEvent,
   type AppUpdateSettings,
   type CodexEnvironmentInstallReport,
   type CodexEnvironmentReport,
@@ -82,6 +83,7 @@ interface SettingsProps {
   availableUpdate: AppUpdateInfo | null;
   updateStatus: string | null;
   updateBusy: boolean;
+  updateProgress: AppUpdateProgressEvent | null;
   codexEnvironment: CodexEnvironmentReport | null;
   codexEnvironmentInstall: CodexEnvironmentInstallReport | null;
   codexEnvironmentBusy: boolean;
@@ -105,6 +107,7 @@ export function Settings({
   availableUpdate,
   updateStatus,
   updateBusy,
+  updateProgress,
   codexEnvironment,
   codexEnvironmentInstall,
   codexEnvironmentBusy,
@@ -131,6 +134,8 @@ export function Settings({
   const canAutoInstall = Boolean(
     codexEnvironment?.can_install && hasInstallableMissing,
   );
+  const updateInProgress = Boolean(updateProgress && updateProgress.phase !== "failed");
+  const updateControlsDisabled = busy || updateBusy || updateInProgress;
   const environmentTone = codexEnvironment
     ? environmentSummaryTone(codexEnvironment.summary.status)
     : "neutral";
@@ -197,7 +202,7 @@ export function Settings({
             >
               <input
                 checked={updateSettings.channel === option.value}
-                disabled={busy || updateBusy}
+                disabled={updateControlsDisabled}
                 name="app-update-channel"
                 onChange={() =>
                   void onChangeUpdateSettings({
@@ -216,7 +221,7 @@ export function Settings({
         <label className="update-toggle">
           <input
             checked={updateSettings.auto_check}
-            disabled={busy || updateBusy}
+            disabled={updateControlsDisabled}
             onChange={(event) =>
               void onChangeUpdateSettings({
                 ...updateSettings,
@@ -242,23 +247,24 @@ export function Settings({
         ) : (
           updateStatus && <p className="form-note">{updateStatus}</p>
         )}
+        {updateProgress && <UpdateProgressPanel progress={updateProgress} />}
         <div className="update-actions">
           <button
             className="quiet-button"
-            disabled={busy || updateBusy}
+            disabled={updateControlsDisabled}
             onClick={() => void onCheckUpdate()}
             type="button"
           >
-            {updateBusy ? "正在检查…" : "立即检查更新"}
+            {updateInProgress ? "正在更新…" : updateBusy ? "正在检查…" : "立即检查更新"}
           </button>
           {availableUpdate && (
             <button
               className="primary-button"
-              disabled={busy || updateBusy}
+              disabled={updateControlsDisabled}
               onClick={() => void onInstallUpdate()}
               type="button"
             >
-              安装并重启
+              {updateInProgress ? "正在更新…" : "安装并重启"}
             </button>
           )}
         </div>
@@ -489,6 +495,61 @@ export function Settings({
       </section>
     </div>
   );
+}
+
+function UpdateProgressPanel({ progress }: { progress: AppUpdateProgressEvent }) {
+  const percent = progress.progress_percent;
+  return (
+    <article className={`update-progress-panel is-${progress.phase}`} role="status">
+      <div className="update-progress-meter-heading">
+        <strong>{updateProgressPhaseLabel(progress.phase)}</strong>
+        <span>
+          {percent === null ? formatBytes(progress.downloaded_bytes) : `${percent}%`}
+        </span>
+      </div>
+      <progress
+        aria-label="更新进度"
+        max={100}
+        value={percent === null ? undefined : percent}
+      />
+      <p>{progress.message}</p>
+      <small>{formatUpdateByteSummary(progress)}</small>
+    </article>
+  );
+}
+
+function updateProgressPhaseLabel(phase: AppUpdateProgressEvent["phase"]) {
+  return (
+    {
+      checking: "准备下载",
+      downloading: "正在下载",
+      downloaded: "下载完成",
+      installing: "正在安装",
+      restarting: "准备重启",
+      failed: "更新失败",
+    }[phase] ?? phase
+  );
+}
+
+function formatUpdateByteSummary(progress: AppUpdateProgressEvent) {
+  if (progress.content_length && progress.content_length > 0) {
+    return `${formatBytes(progress.downloaded_bytes)} / ${formatBytes(progress.content_length)}`;
+  }
+  if (progress.phase === "checking") return "正在连接更新服务…";
+  return `${formatBytes(progress.downloaded_bytes)} 已下载`;
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let next = value;
+  let unitIndex = 0;
+  while (next >= 1024 && unitIndex < units.length - 1) {
+    next /= 1024;
+    unitIndex += 1;
+  }
+  const precision = unitIndex === 0 || Number.isInteger(next) || next >= 10 ? 0 : 1;
+  return `${next.toFixed(precision)} ${units[unitIndex]}`;
 }
 
 function EnvironmentSummaryIcon({ status }: { status: string }) {

@@ -12,11 +12,11 @@
   <a href="https://github.com/RayZh0ng/codex-reply/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RayZh0ng/codex-reply/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="https://github.com/RayZh0ng/codex-reply/actions/workflows/release.yml"><img alt="Release" src="https://github.com/RayZh0ng/codex-reply/actions/workflows/release.yml/badge.svg" /></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/RayZh0ng/codex-reply" /></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-v0.2.0--beta.5-blue" />
+  <img alt="Version" src="https://img.shields.io/badge/version-v0.2.0--beta.6-blue" />
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2-24C8DB" />
 </p>
 
-> 当前版本：`v0.2.0-beta.5`。项目处于 MVP beta 阶段，功能边界以 [docs/PRD.md](docs/PRD.md) 为准。
+> 当前版本：`v0.2.0-beta.6`。项目处于 MVP beta 阶段，功能边界以 [docs/PRD.md](docs/PRD.md) 为准。
 
 ## 目录
 
@@ -293,9 +293,9 @@ git commit -m "feat(collaboration): add memory contexts"
 本仓库的 release workflow 监听 `v*` tag：
 
 ```bash
-git tag v0.2.0-beta.5
+git tag v0.2.0-beta.6
 git push origin <release-branch>
-git push origin v0.2.0-beta.5
+git push origin v0.2.0-beta.6
 ```
 
 `vX.Y.Z-beta.N` 会生成 GitHub prerelease，并覆盖 updater Release 中的 `beta.json` manifest；正式版 `vX.Y.Z` 覆盖 `stable.json`。

@@ -1,6 +1,6 @@
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +15,7 @@ use argon2::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use uuid::Uuid;
 
@@ -25,13 +25,13 @@ use crate::{
     collaboration::CollaborationManager,
     database::Repository,
     domain::{
-        AppUpdateChannel, AppUpdateInfo, AppUpdateSettings, CancelCodexSessionInput,
-        CancelManagedTaskInput, CheckAppUpdateInput, ClientKeySecretInput, CodexAuthMode,
-        CodexEnvironmentInstallReport, CodexEnvironmentReport, CodexSessionSummary,
-        CollaborationCallbackStatus, CollaborationContextSummary, CollaborationProjectBinding,
-        CollaborationProvider, CommitJsonProfileImportInput, CompleteOAuthImportInput,
-        ContinueCodexSessionInput, CreateApiServiceProfileInput, CreateClientKeyInput,
-        CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
+        AppUpdateChannel, AppUpdateInfo, AppUpdateProgressEvent, AppUpdateProgressPhase,
+        AppUpdateSettings, CancelCodexSessionInput, CancelManagedTaskInput, CheckAppUpdateInput,
+        ClientKeySecretInput, CodexAuthMode, CodexEnvironmentInstallReport, CodexEnvironmentReport,
+        CodexSessionSummary, CollaborationCallbackStatus, CollaborationContextSummary,
+        CollaborationProjectBinding, CollaborationProvider, CommitJsonProfileImportInput,
+        CompleteOAuthImportInput, ContinueCodexSessionInput, CreateApiServiceProfileInput,
+        CreateClientKeyInput, CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
         CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCollaborationBotInput,
         DeleteCollaborationProjectBindingInput, DeleteDesktopWorkspaceInput, DeleteFeishuBotInput,
         DeleteFeishuProjectBindingInput, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
@@ -46,7 +46,7 @@ use crate::{
         UpdateAppUpdateSettingsInput, UpdateCollaborationContextInput,
         UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput, UpdateProfileInput,
         UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput, UpsertFeishuBotInput,
-        UpsertFeishuProjectBindingInput,
+        UpsertFeishuProjectBindingInput, APP_UPDATE_PROGRESS_EVENT,
     },
     error::{AppError, AppResult},
     gateway::{
@@ -405,10 +405,92 @@ pub async fn install_app_update(
     let Some(update) = check_update_for_channel(&app, channel).await? else {
         return Err(AppError::NotFound);
     };
-    update
-        .download_and_install(|_, _| {}, || {})
-        .await
-        .map_err(|_| AppError::AppUpdateUnavailable)?;
+    let update_info = app_update_info(channel, &update);
+    emit_app_update_progress(
+        &app,
+        app_update_progress_event(
+            AppUpdateProgressPhase::Checking,
+            &update_info,
+            AppUpdateDownloadProgress::default(),
+            false,
+            "正在准备下载更新。",
+        ),
+    );
+
+    let progress = Arc::new(Mutex::new(AppUpdateDownloadProgress::default()));
+    let app_for_chunk = app.clone();
+    let update_for_chunk = update_info.clone();
+    let progress_for_chunk = Arc::clone(&progress);
+    let app_for_finish = app.clone();
+    let update_for_finish = update_info.clone();
+    let progress_for_finish = Arc::clone(&progress);
+
+    let result = update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                let snapshot =
+                    record_app_update_chunk(&progress_for_chunk, chunk_length, content_length);
+                emit_app_update_progress(
+                    &app_for_chunk,
+                    app_update_progress_event(
+                        AppUpdateProgressPhase::Downloading,
+                        &update_for_chunk,
+                        snapshot,
+                        false,
+                        "正在下载更新。",
+                    ),
+                );
+            },
+            move || {
+                let snapshot = app_update_progress_snapshot(&progress_for_finish);
+                emit_app_update_progress(
+                    &app_for_finish,
+                    app_update_progress_event(
+                        AppUpdateProgressPhase::Downloaded,
+                        &update_for_finish,
+                        snapshot,
+                        true,
+                        "更新包已下载，正在校验并准备安装。",
+                    ),
+                );
+                emit_app_update_progress(
+                    &app_for_finish,
+                    app_update_progress_event(
+                        AppUpdateProgressPhase::Installing,
+                        &update_for_finish,
+                        snapshot,
+                        true,
+                        "正在安装更新。",
+                    ),
+                );
+            },
+        )
+        .await;
+
+    if result.is_err() {
+        emit_app_update_progress(
+            &app,
+            app_update_progress_event(
+                AppUpdateProgressPhase::Failed,
+                &update_info,
+                app_update_progress_snapshot(&progress),
+                false,
+                "更新下载或安装失败，请稍后重试。",
+            ),
+        );
+        return Err(AppError::AppUpdateUnavailable);
+    }
+
+    emit_app_update_progress(
+        &app,
+        app_update_progress_event(
+            AppUpdateProgressPhase::Restarting,
+            &update_info,
+            app_update_progress_snapshot(&progress),
+            true,
+            "更新已安装，应用即将重启。",
+        ),
+    );
     app.restart();
 }
 
@@ -436,6 +518,77 @@ fn app_update_info(channel: AppUpdateChannel, update: &Update) -> AppUpdateInfo 
         date: update.date.as_ref().map(ToString::to_string),
         channel,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AppUpdateDownloadProgress {
+    downloaded_bytes: u64,
+    content_length: Option<u64>,
+}
+
+fn record_app_update_chunk(
+    progress: &Mutex<AppUpdateDownloadProgress>,
+    chunk_length: usize,
+    content_length: Option<u64>,
+) -> AppUpdateDownloadProgress {
+    let mut progress = progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    progress.downloaded_bytes = progress
+        .downloaded_bytes
+        .saturating_add(chunk_length as u64);
+    if content_length.is_some() {
+        progress.content_length = content_length;
+    }
+    *progress
+}
+
+fn app_update_progress_snapshot(
+    progress: &Mutex<AppUpdateDownloadProgress>,
+) -> AppUpdateDownloadProgress {
+    *progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn app_update_progress_event(
+    phase: AppUpdateProgressPhase,
+    update: &AppUpdateInfo,
+    progress: AppUpdateDownloadProgress,
+    complete: bool,
+    message: impl Into<String>,
+) -> AppUpdateProgressEvent {
+    AppUpdateProgressEvent {
+        phase,
+        channel: update.channel,
+        version: update.version.clone(),
+        current_version: update.current_version.clone(),
+        downloaded_bytes: progress.downloaded_bytes,
+        content_length: progress.content_length,
+        progress_percent: app_update_progress_percent(
+            progress.downloaded_bytes,
+            progress.content_length,
+            complete,
+        ),
+        message: message.into(),
+        updated_at_ms: now_ms(),
+    }
+}
+
+fn emit_app_update_progress(app: &AppHandle, event: AppUpdateProgressEvent) {
+    let _ = app.emit(APP_UPDATE_PROGRESS_EVENT, event);
+}
+
+fn app_update_progress_percent(
+    downloaded_bytes: u64,
+    content_length: Option<u64>,
+    complete: bool,
+) -> Option<u8> {
+    if complete {
+        return Some(100);
+    }
+    let total = content_length.filter(|total| *total > 0)?;
+    Some(((downloaded_bytes.min(total) * 100) / total).min(100) as u8)
 }
 
 #[tauri::command]
@@ -1346,6 +1499,60 @@ mod tests {
         path::PathBuf,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn app_update_progress_percent_handles_known_unknown_and_complete_downloads() {
+        assert_eq!(
+            app_update_progress_percent(512, Some(1024), false),
+            Some(50)
+        );
+        assert_eq!(
+            app_update_progress_percent(2048, Some(1024), false),
+            Some(100)
+        );
+        assert_eq!(app_update_progress_percent(512, None, false), None);
+        assert_eq!(app_update_progress_percent(0, Some(0), false), None);
+        assert_eq!(app_update_progress_percent(0, None, true), Some(100));
+    }
+
+    #[test]
+    fn app_update_progress_event_marks_complete_and_failed_phases() {
+        let update = AppUpdateInfo {
+            version: "0.2.0-beta.6".to_owned(),
+            current_version: "0.2.0-beta.5".to_owned(),
+            body: None,
+            date: None,
+            channel: AppUpdateChannel::Beta,
+        };
+
+        let downloaded = app_update_progress_event(
+            AppUpdateProgressPhase::Downloaded,
+            &update,
+            AppUpdateDownloadProgress {
+                downloaded_bytes: 900,
+                content_length: None,
+            },
+            true,
+            "下载完成",
+        );
+        assert_eq!(downloaded.progress_percent, Some(100));
+        assert_eq!(downloaded.phase, AppUpdateProgressPhase::Downloaded);
+        assert_eq!(downloaded.channel, AppUpdateChannel::Beta);
+
+        let failed = app_update_progress_event(
+            AppUpdateProgressPhase::Failed,
+            &update,
+            AppUpdateDownloadProgress {
+                downloaded_bytes: 250,
+                content_length: Some(1000),
+            },
+            false,
+            "更新失败",
+        );
+        assert_eq!(failed.progress_percent, Some(25));
+        assert_eq!(failed.phase, AppUpdateProgressPhase::Failed);
+        assert_eq!(failed.message, "更新失败");
+    }
 
     fn activation(status: &str) -> CurrentProfileActivation {
         CurrentProfileActivation {

@@ -123,6 +123,27 @@ trait BrowserLauncher: Send + Sync {
 
 struct SystemBrowserLauncher;
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserOpenCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_browser_open_commands(url: &str) -> Vec<BrowserOpenCommand> {
+    vec![
+        BrowserOpenCommand {
+            program: "rundll32.exe",
+            args: vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()],
+        },
+        BrowserOpenCommand {
+            program: "explorer.exe",
+            args: vec![url.to_owned()],
+        },
+    ]
+}
+
 impl BrowserLauncher for SystemBrowserLauncher {
     fn open(&self, url: &str) -> AppResult<()> {
         #[cfg(target_os = "macos")]
@@ -141,24 +162,19 @@ impl BrowserLauncher for SystemBrowserLauncher {
         }
         #[cfg(target_os = "windows")]
         {
-            if Command::new("cmd.exe")
-                .args(["/C", "start", "", url])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                return Ok(());
+            for command in windows_browser_open_commands(url) {
+                if Command::new(command.program)
+                    .args(&command.args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
+                    return Ok(());
+                }
             }
-            Command::new("explorer.exe")
-                .arg(url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map(|_| ())
-                .map_err(|_| AppError::OAuthBrowserLaunchFailed)
+            Err(AppError::OAuthBrowserLaunchFailed)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -3160,12 +3176,54 @@ mod tests {
     }
 
     #[test]
-    fn authorization_url_has_pkce_and_cockpit_originator() {
+    fn authorization_url_has_required_pkce_parameters_and_originator() {
         let url =
             build_authorization_url("http://localhost:1455/auth/callback", "verifier", "state")
                 .unwrap();
-        assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("originator=codex_vscode"));
+        let parsed = Url::parse(&url).unwrap();
+        let params = parsed.query_pairs().into_owned().collect::<HashMap<_, _>>();
+
+        assert_eq!(parsed.as_str().split('?').next(), Some(OAUTH_AUTHORIZE_URL));
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some(OAUTH_CLIENT_ID)
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some("http://localhost:1455/auth/callback")
+        );
+        assert_eq!(params.get("scope").map(String::as_str), Some(OAUTH_SCOPES));
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert!(params
+            .get("code_challenge")
+            .is_some_and(|value| !value.is_empty()));
+        assert_eq!(params.get("state").map(String::as_str), Some("state"));
+        assert_eq!(
+            params.get("originator").map(String::as_str),
+            Some("codex_vscode")
+        );
+    }
+
+    #[test]
+    fn windows_browser_open_commands_preserve_the_full_oauth_url() {
+        let url = "https://auth.openai.com/oauth/authorize?client_id=codex&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=state";
+        let commands = windows_browser_open_commands(url);
+
+        assert!(commands.iter().all(|command| command.program != "cmd.exe"));
+        assert_eq!(commands[0].program, "rundll32.exe");
+        assert_eq!(
+            commands[0].args,
+            vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()]
+        );
+        assert_eq!(commands[1].program, "explorer.exe");
+        assert_eq!(commands[1].args, vec![url.to_owned()]);
     }
 
     #[test]

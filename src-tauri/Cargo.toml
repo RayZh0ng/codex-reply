@@ -1,6 +1,6 @@
 [package]
 name = "codex-relay"
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 description = "A local Codex multi-account and collaboration desktop application"
 authors = ["Codex Relay Contributors"]
 license = "MIT"

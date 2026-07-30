@@ -6,6 +6,7 @@ pub const APP_UPDATE_STABLE_ENDPOINT: &str =
     "https://github.com/RayZh0ng/codex-reply/releases/download/updater/stable.json";
 pub const APP_UPDATE_BETA_ENDPOINT: &str =
     "https://github.com/RayZh0ng/codex-reply/releases/download/updater/beta.json";
+pub const APP_UPDATE_PROGRESS_EVENT: &str = "app-update-progress";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +87,30 @@ impl AppUpdateChannel {
             Self::Beta => "beta",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppUpdateProgressPhase {
+    Checking,
+    Downloading,
+    Downloaded,
+    Installing,
+    Restarting,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AppUpdateProgressEvent {
+    pub phase: AppUpdateProgressPhase,
+    pub channel: AppUpdateChannel,
+    pub version: String,
+    pub current_version: String,
+    pub downloaded_bytes: u64,
+    pub content_length: Option<u64>,
+    pub progress_percent: Option<u8>,
+    pub message: String,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

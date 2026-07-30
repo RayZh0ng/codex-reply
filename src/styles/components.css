@@ -4697,6 +4697,99 @@ input[type="number"]::-webkit-outer-spin-button {
   font-size: 12px;
 }
 
+.update-progress-panel,
+.update-progress-dialog {
+  display: grid;
+  gap: 10px;
+}
+
+.update-progress-panel {
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 22%, var(--color-border));
+  border-radius: var(--radius-md);
+  background: color-mix(
+    in srgb,
+    var(--color-accent-soft) 72%,
+    var(--color-surface-elevated)
+  );
+}
+
+.update-progress-panel.is-failed {
+  border-color: color-mix(in srgb, var(--color-danger) 24%, var(--color-border));
+  background: color-mix(
+    in srgb,
+    var(--color-danger-soft) 72%,
+    var(--color-surface-elevated)
+  );
+}
+
+.update-progress-meter {
+  display: grid;
+  gap: 10px;
+}
+
+.update-progress-meter-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  color: var(--color-text-primary);
+  font-size: 13px;
+}
+
+.update-progress-meter-heading strong {
+  font-weight: 800;
+}
+
+.update-progress-meter-heading span {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.update-progress-panel progress,
+.update-progress-meter progress {
+  width: 100%;
+  height: 10px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: var(--color-surface-muted);
+}
+
+.update-progress-panel progress::-webkit-progress-bar,
+.update-progress-meter progress::-webkit-progress-bar {
+  border-radius: 999px;
+  background: var(--color-surface-muted);
+}
+
+.update-progress-panel progress::-webkit-progress-value,
+.update-progress-meter progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--color-accent), #63a4ff);
+}
+
+.update-progress-panel progress::-moz-progress-bar,
+.update-progress-meter progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--color-accent), #63a4ff);
+}
+
+.update-progress-panel p,
+.update-progress-dialog p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.update-progress-panel small,
+.update-progress-meter small {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
 .update-actions {
   display: flex;
   flex-wrap: wrap;
