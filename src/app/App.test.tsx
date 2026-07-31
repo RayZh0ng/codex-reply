@@ -37,7 +37,7 @@ beforeEach(() => {
 });
 
 const snapshot = {
-  workspace_mode: "per_profile" as const,
+  workspace_mode: "shared" as const,
   collaboration: {
     enabled_bots: 0,
     bound_chats: 0,
@@ -519,7 +519,7 @@ describe("App", () => {
             profile_id: "next",
             attempt_id: "switch-1",
             status: "switching",
-            message: "正在写入已保存的 Codex 凭据，并启动档案独立工作区。",
+            message: "正在写入已保存的 Codex 凭据，并复用原 Codex 客户端状态。",
           });
         }
         if (command === "current_profile_activation_status") {
@@ -527,8 +527,7 @@ describe("App", () => {
             profile_id: "next",
             attempt_id: "switch-1",
             status: "activated",
-            message:
-              "Codex 凭据已切换，档案独立工作区的 ChatGPT/Codex 桌面实例已启动。",
+            message: "Codex 凭据已切换，并已复用原 Codex 客户端状态。",
           });
         }
         return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -541,14 +540,18 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
 
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent(
-        "Codex 凭据已切换，档案独立工作区的 ChatGPT/Codex 桌面实例已启动。",
+        "Codex 凭据已切换，并已复用原 Codex 客户端状态。",
       ),
     );
     expect(native.invoke).toHaveBeenCalledWith("select_current_profile", {
-      input: { id: "next", confirmed_desktop_restart: false },
+      input: { id: "next", confirmed_desktop_restart: true },
     });
   });
 
@@ -570,8 +573,7 @@ describe("App", () => {
           profile_id: "next",
           attempt_id: "switch-1",
           status: "switching",
-          message:
-            "正在写入已保存的 Codex 凭据，并启动该档案专属的 ChatGPT/Codex 工作区。",
+          message: "正在写入已保存的 Codex 凭据，并复用原 Codex 客户端状态。",
         });
       }
       if (command === "current_profile_activation_status") {
@@ -579,8 +581,7 @@ describe("App", () => {
           profile_id: "next",
           attempt_id: "switch-1",
           status: "switching",
-          message:
-            "正在写入已保存的 Codex 凭据，并启动该档案专属的 ChatGPT/Codex 工作区。",
+          message: "正在写入已保存的 Codex 凭据，并复用原 Codex 客户端状态。",
         });
       }
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -591,6 +592,10 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
     expect(await screen.findByRole("dialog")).toHaveTextContent("正在切换已保存的账号");
     expect(screen.queryByRole("button", { name: "取消登录" })).not.toBeInTheDocument();
   });
@@ -629,7 +634,9 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
-    expect(await screen.findByRole("dialog")).toHaveTextContent("关闭并重启原客户端？");
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
     expect(native.invoke).not.toHaveBeenCalledWith(
       "select_current_profile",
       expect.anything(),
@@ -643,7 +650,7 @@ describe("App", () => {
     );
   });
 
-  it("reports a keychain failure without suggesting the generic ChatGPT login flow", async () => {
+  it("reports an auth file failure without suggesting the generic ChatGPT login flow", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
       value: {},
@@ -669,9 +676,8 @@ describe("App", () => {
         return Promise.resolve({
           profile_id: "next",
           attempt_id: "switch-1",
-          status: "codex_keychain_write_failed",
-          message:
-            "Codex 凭据已写入，但无法更新 macOS 的 Codex Auth 钥匙串；未启动桌面实例，请解锁钥匙串后重试。",
+          status: "auth_file_write_failed",
+          message: "无法更新默认 Codex auth.json；请确认文件权限后重试。",
         });
       }
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -682,9 +688,13 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent(
-        "无法更新 macOS 的 Codex Auth 钥匙串；未启动桌面实例",
+        "无法更新默认 Codex auth.json；请确认文件权限后重试",
       ),
     );
   });
@@ -727,8 +737,12 @@ describe("App", () => {
     const target = await screen.findByRole("button", {
       name: "设为当前档案：目标账号",
     });
-    vi.useFakeTimers();
     fireEvent.click(target);
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();

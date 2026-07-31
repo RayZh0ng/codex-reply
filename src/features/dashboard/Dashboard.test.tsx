@@ -17,7 +17,7 @@ vi.stubGlobal("ResizeObserver", ResizeObserver);
 afterEach(() => cleanup());
 
 const snapshot = {
-  workspace_mode: "per_profile" as const,
+  workspace_mode: "shared" as const,
   collaboration: {
     enabled_bots: 0,
     bound_chats: 0,
@@ -57,6 +57,7 @@ const snapshot = {
       priority: 0,
       weight: 1,
       models: [],
+      codex_oauth_profile_id: null,
       health: "unknown",
       cooldown_until_ms: null,
       credential_configured: true,

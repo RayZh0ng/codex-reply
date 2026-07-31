@@ -18,15 +18,16 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
 } from "react";
 
 import type {
-  DesktopWorkspaceMode,
   ApiServiceTestReport,
   GatewayModelMapping,
+  GatewayOAuthProfileOption,
   GatewayProvider,
   GatewayWireApi,
   JsonProfileImportPreview,
@@ -62,7 +63,6 @@ interface ProfilesProps {
   onActivateApiProfile?: (profile: MaskedProfile) => Promise<void>;
   onDelete: (id: string, alias: string) => void;
   onJsonImportComplete?: () => Promise<void>;
-  workspaceMode?: DesktopWorkspaceMode;
 }
 
 type ImportFlow =
@@ -84,6 +84,7 @@ interface FilterMenuOption<T extends string> {
 
 const ALL_SUBSCRIPTIONS = "all";
 const UNSYNCED_SUBSCRIPTION = "unsynced";
+const NO_CODEX_OAUTH_PROFILE = "__none__";
 const PROFILE_SORT_OPTIONS: FilterMenuOption<ProfileSortKey>[] = [
   { value: "default", label: "默认顺序" },
   { value: "quota", label: "剩余额度" },
@@ -106,7 +107,6 @@ export function Profiles({
   onActivateApiProfile = async () => undefined,
   onDelete,
   onJsonImportComplete = async () => undefined,
-  workspaceMode = "per_profile",
 }: ProfilesProps) {
   const [flow, setFlow] = useState<ImportFlow>(null);
   const [nameQuery, setNameQuery] = useState("");
@@ -186,6 +186,15 @@ export function Profiles({
     Boolean(nameQuery || emailQuery) ||
     subscriptionFilter !== ALL_SUBSCRIPTIONS ||
     sortKey !== "default";
+  const oauthProfileAliases = useMemo(
+    () =>
+      new Map(
+        profiles
+          .filter((profile) => profile.kind === "codex_oauth")
+          .map((profile) => [profile.id, profile.alias]),
+      ),
+    [profiles],
+  );
 
   const clearFilters = () => {
     setNameQuery("");
@@ -535,11 +544,11 @@ export function Profiles({
       <section className="privacy-banner" data-animate="notice">
         <CloudArrowUp size={23} weight="fill" />
         <div>
-          <strong>当前档案会按所选模式启动 Codex 工作区</strong>
+          <strong>当前档案会复用原 Codex 客户端状态</strong>
           <p>
-            添加账号时会保存认证凭据。当前模式为“{workspaceModeLabel(workspaceMode)}
-            ”；切换会更新默认 .codex/auth.json 与 Codex Auth 钥匙串，不会迁移 ChatGPT
-            Chat/Work 的独立登录会话。
+            添加账号时会保存认证凭据。切换账号会更新默认 .codex/auth.json， 不写入 macOS
+            Codex Auth 钥匙串；同时复用原客户端数据目录，
+            保留本机聊天记录、记忆、设置与状态。
           </p>
         </div>
       </section>
@@ -617,6 +626,11 @@ export function Profiles({
           <ProfileCard
             key={profile.id}
             profile={profile}
+            codexOAuthAlias={
+              profile.codex_oauth_profile_id
+                ? (oauthProfileAliases.get(profile.codex_oauth_profile_id) ?? null)
+                : null
+            }
             busy={busy}
             onSelect={onSelect}
             onReauthorize={() => void beginOAuth(profile.id)}
@@ -882,14 +896,6 @@ function quotaWindows(quota: ProfileQuota | null | undefined) {
     ? bucketWindows
     : [quota?.primary, quota?.secondary];
   return windows.filter((window): window is ProfileQuotaWindow => Boolean(window));
-}
-
-function workspaceModeLabel(mode: DesktopWorkspaceMode) {
-  return {
-    fresh: "每次全新启动",
-    per_profile: "账号独立工作区",
-    shared: "共享原客户端状态",
-  }[mode];
 }
 
 function OAuthImportSheet({
@@ -1223,6 +1229,74 @@ function ApiProfileSheet({
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [oauthOptions, setOAuthOptions] = useState<GatewayOAuthProfileOption[]>([]);
+  const [codexOAuthProfileId, setCodexOAuthProfileId] = useState(
+    profile?.codex_oauth_profile_id ?? NO_CODEX_OAUTH_PROFILE,
+  );
+  const discoveredModelOptions = useMemo(() => {
+    const seen = new Set<string>();
+    return discoveredModels
+      .map((model) => model.trim())
+      .filter((model) => {
+        if (!model || seen.has(model)) return false;
+        seen.add(model);
+        return true;
+      });
+  }, [discoveredModels]);
+  const selectedDiscoveredModels = useMemo(() => {
+    const discovered = new Set(discoveredModelOptions);
+    const selected = new Set<string>();
+    for (const mapping of mappings) {
+      const upstreamModel = mapping.upstream_model.trim();
+      if (discovered.has(upstreamModel)) selected.add(upstreamModel);
+    }
+    return discoveredModelOptions.filter((model) => selected.has(model));
+  }, [discoveredModelOptions, mappings]);
+  const oauthProfileOptions = useMemo(() => {
+    const selectedOAuthMissing =
+      codexOAuthProfileId !== NO_CODEX_OAUTH_PROFILE &&
+      !oauthOptions.some((option) => option.id === codexOAuthProfileId);
+    return [
+      {
+        value: NO_CODEX_OAUTH_PROFILE,
+        label: "不绑定登录档案",
+        description: "只写第三方模型路由，不改写 Codex 登录态",
+      },
+      ...oauthOptions.map((option) => ({
+        value: option.id,
+        label: option.alias,
+        disabled: !option.available,
+        description: option.available
+          ? "切换到 Codex 时投影此 OAuth 登录态"
+          : (option.reason ?? "需要重新检查登录状态"),
+      })),
+      ...(selectedOAuthMissing
+        ? [
+            {
+              value: codexOAuthProfileId,
+              label: "已绑定登录档案",
+              disabled: true,
+              description: "该 OAuth 档案当前不可读，请重新授权或清空绑定",
+            },
+          ]
+        : []),
+    ];
+  }, [codexOAuthProfileId, oauthOptions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .codexGatewayConfigStatus()
+      .then((status) => {
+        if (!cancelled) setOAuthOptions(status.oauth_profile_options ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setOAuthOptions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const applyPreset = (id: string) => {
     const preset = API_PROVIDER_PRESETS.find((candidate) => candidate.id === id);
@@ -1292,12 +1366,10 @@ function ApiProfileSheet({
       current.filter((_, candidateIndex) => candidateIndex !== index),
     );
   };
-  const isDiscoveredSelected = (model: string) =>
-    mappings.some((mapping) => mapping.upstream_model === model);
   const toggleDiscoveredModel = (model: string) => {
     setMappings((current) => {
-      if (current.some((mapping) => mapping.upstream_model === model)) {
-        return current.filter((mapping) => mapping.upstream_model !== model);
+      if (current.some((mapping) => mapping.upstream_model.trim() === model)) {
+        return current.filter((mapping) => mapping.upstream_model.trim() !== model);
       }
       return [
         ...current,
@@ -1310,6 +1382,43 @@ function ApiProfileSheet({
       ];
     });
   };
+  const selectAllDiscoveredModels = () => {
+    setMappings((current) => {
+      const mappedModels = new Set(
+        current.map((mapping) => mapping.upstream_model.trim()).filter(Boolean),
+      );
+      return [
+        ...current,
+        ...discoveredModelOptions
+          .filter((model) => !mappedModels.has(model))
+          .map((model) => ({
+            model,
+            upstream_model: model,
+            display_name: model,
+            context_window: null,
+          })),
+      ];
+    });
+  };
+  const clearDiscoveredModels = () => {
+    const discovered = new Set(discoveredModelOptions);
+    setMappings((current) =>
+      current.filter((mapping) => !discovered.has(mapping.upstream_model.trim())),
+    );
+  };
+  const resetMappingSourceModels = () => {
+    const sourceModels = (
+      discoveredModelOptions.length
+        ? discoveredModelOptions
+        : mappings.map((mapping) => mapping.upstream_model.trim())
+    ).filter(Boolean);
+    const uniqueModels = Array.from(new Set(sourceModels));
+    if (!uniqueModels.length) return;
+    setMappings(identityMappings(uniqueModels));
+  };
+  const canResetMappings =
+    discoveredModelOptions.length > 0 ||
+    mappings.some((mapping) => mapping.upstream_model.trim());
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -1336,6 +1445,8 @@ function ApiProfileSheet({
         api_key: apiKey.trim() || null,
         model_mappings: normalizedMappings,
         models: normalizedMappings.map((mapping) => mapping.model),
+        codex_oauth_profile_id:
+          codexOAuthProfileId === NO_CODEX_OAUTH_PROFILE ? null : codexOAuthProfileId,
         enabled: profile?.enabled ?? true,
         in_pool: profile?.in_pool ?? false,
         priority: profile?.priority ?? 0,
@@ -1451,6 +1562,20 @@ function ApiProfileSheet({
             placeholder={isEditing ? "留空沿用已保存密钥" : "sk-..."}
           />
         </label>
+        <label>
+          OAuth 登录档案（可选）
+          <Select
+            ariaLabel="OAuth 登录档案（可选）"
+            onValueChange={setCodexOAuthProfileId}
+            options={oauthProfileOptions}
+            placeholder="不绑定登录档案"
+            value={codexOAuthProfileId}
+          />
+        </label>
+        <p className="form-note">
+          该档案只用于切换到 Codex
+          时解锁官方登录态；所有模型请求仍发送到当前第三方模型供应商服务。
+        </p>
         <p className="form-note">{PROVIDER_CAPABILITY_NOTES[provider]}</p>
         <p className="form-note">
           模型映射会生成 Codex model_catalog_json，并决定网关对客户端暴露的 Model
@@ -1473,20 +1598,14 @@ function ApiProfileSheet({
             </p>
           </div>
         )}
-        {discoveredModels.length > 0 && (
-          <fieldset className="model-discovery-picker" aria-label="发现的上游模型">
-            <legend>发现的上游模型</legend>
-            {discoveredModels.map((model) => (
-              <label key={model}>
-                <input
-                  checked={isDiscoveredSelected(model)}
-                  onChange={() => toggleDiscoveredModel(model)}
-                  type="checkbox"
-                />
-                <span>{model}</span>
-              </label>
-            ))}
-          </fieldset>
+        {discoveredModelOptions.length > 0 && (
+          <DiscoveredModelSelector
+            models={discoveredModelOptions}
+            selectedModels={selectedDiscoveredModels}
+            onClear={clearDiscoveredModels}
+            onSelectAll={selectAllDiscoveredModels}
+            onToggle={toggleDiscoveredModel}
+          />
         )}
         <div className="model-mapping-editor" aria-label="模型映射">
           <div className="model-mapping-heading">
@@ -1498,6 +1617,14 @@ function ApiProfileSheet({
             </div>
             <button className="quiet-button" type="button" onClick={addMapping}>
               添加模型
+            </button>
+            <button
+              className="quiet-button"
+              disabled={!canResetMappings}
+              type="button"
+              onClick={resetMappingSourceModels}
+            >
+              重置映射
             </button>
           </div>
           {mappings.length ? (
@@ -1591,6 +1718,179 @@ function ApiProfileSheet({
         </div>
       </form>
     </section>
+  );
+}
+
+function DiscoveredModelSelector({
+  models,
+  selectedModels,
+  onToggle,
+  onSelectAll,
+  onClear,
+}: {
+  models: string[];
+  selectedModels: string[];
+  onToggle: (model: string) => void;
+  onSelectAll: () => void;
+  onClear: () => void;
+}) {
+  const panelId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const selectedModelSet = useMemo(() => new Set(selectedModels), [selectedModels]);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredModels = useMemo(
+    () =>
+      normalizedQuery
+        ? models.filter((model) => model.toLowerCase().includes(normalizedQuery))
+        : models,
+    [models, normalizedQuery],
+  );
+  const visibleChips = selectedModels.slice(0, 3);
+  const hiddenChipCount = Math.max(0, selectedModels.length - visibleChips.length);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !rootRef.current?.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", closeOnOutsidePointerDown);
+    return () => window.removeEventListener("pointerdown", closeOnOutsidePointerDown);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) setQuery("");
+  }, [open]);
+
+  useEffect(() => {
+    if (open) searchRef.current?.focus();
+  }, [open]);
+
+  return (
+    <div
+      className="model-discovery-select"
+      ref={rootRef}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setOpen(false);
+        }
+      }}
+    >
+      <button
+        aria-controls={panelId}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-label={`发现的上游模型，已选择 ${selectedModels.length}/${models.length}`}
+        className={`model-discovery-select-trigger ${open ? "is-open" : ""}`}
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="model-discovery-select-copy">
+          <strong>发现的上游模型</strong>
+          <span>
+            已选择 {selectedModels.length}/{models.length}
+          </span>
+        </span>
+        <span className="model-discovery-select-chips" aria-hidden="true">
+          {visibleChips.length ? (
+            <>
+              {visibleChips.map((model) => (
+                <span className="model-discovery-select-chip" key={model} title={model}>
+                  {model}
+                </span>
+              ))}
+              {hiddenChipCount > 0 && (
+                <span className="model-discovery-select-chip muted">
+                  +{hiddenChipCount}
+                </span>
+              )}
+            </>
+          ) : (
+            <span className="model-discovery-select-placeholder">
+              选择需要映射的模型
+            </span>
+          )}
+        </span>
+        <CaretDown
+          aria-hidden="true"
+          className="model-discovery-select-caret"
+          size={18}
+          weight="bold"
+        />
+      </button>
+      {open && (
+        <div
+          aria-label="发现的上游模型选择器"
+          className="model-discovery-select-panel"
+          id={panelId}
+          role="dialog"
+        >
+          <div className="model-discovery-select-toolbar">
+            <label className="model-discovery-select-search">
+              <span>搜索上游模型</span>
+              <input
+                aria-label="搜索上游模型"
+                placeholder="输入模型名称过滤"
+                ref={searchRef}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
+            </label>
+            <div className="model-discovery-select-actions">
+              <button
+                className="text-button"
+                disabled={selectedModels.length === models.length}
+                type="button"
+                onClick={onSelectAll}
+              >
+                全选
+              </button>
+              <button
+                className="text-button"
+                disabled={!selectedModels.length}
+                type="button"
+                onClick={onClear}
+              >
+                清空
+              </button>
+            </div>
+          </div>
+          <div className="model-discovery-select-list" role="list">
+            {filteredModels.length ? (
+              filteredModels.map((model) => (
+                <label
+                  className="model-discovery-select-option"
+                  key={model}
+                  title={model}
+                >
+                  <input
+                    aria-label={model}
+                    checked={selectedModelSet.has(model)}
+                    type="checkbox"
+                    onChange={() => onToggle(model)}
+                  />
+                  <span className="model-discovery-select-option-copy">
+                    <span className="model-discovery-select-option-name" title={model}>
+                      {model}
+                    </span>
+                    <span className="model-discovery-select-option-meta">
+                      {selectedModelSet.has(model) ? "已加入映射" : "点击加入映射"}
+                    </span>
+                  </span>
+                </label>
+              ))
+            ) : (
+              <p className="model-discovery-select-empty">没有匹配的模型。</p>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1746,8 +2046,26 @@ function isGatewayCapableProfile(profile: MaskedProfile) {
   return profile.kind === "api_key" || profile.kind === "codex_oauth";
 }
 
+function isCodexDirectCompatibleProfile(profile: MaskedProfile) {
+  const provider = profile.provider ?? "openai_compatible";
+  const wireApi = profile.wire_api ?? "responses";
+  return (
+    profile.kind === "api_key" &&
+    (provider === "openai" || provider === "openai_compatible") &&
+    wireApi === "responses"
+  );
+}
+
+function codexDirectUnsupportedReason(profile: MaskedProfile) {
+  if (profile.kind !== "api_key") return null;
+  return isCodexDirectCompatibleProfile(profile)
+    ? null
+    : "该供应商需要 Relay 本地路由或协议适配，不能直连 Codex";
+}
+
 function ProfileCard({
   profile,
+  codexOAuthAlias,
   busy,
   onSelect,
   onReauthorize,
@@ -1759,6 +2077,7 @@ function ProfileCard({
   onDelete,
 }: {
   profile: MaskedProfile;
+  codexOAuthAlias: string | null;
   busy: boolean;
   onSelect: (id: string) => Promise<void>;
   onReauthorize: () => void;
@@ -1773,6 +2092,8 @@ function ProfileCard({
     profile.kind === "codex_oauth" && profile.enabled && profile.credential_configured;
   const authMode = profile.auth_mode ?? "oauth";
   const gatewayCapable = isGatewayCapableProfile(profile);
+  const directUnsupportedReason = codexDirectUnsupportedReason(profile);
+  const directCompatible = profile.kind === "api_key" && !directUnsupportedReason;
   return (
     <article className={`profile-card ${profile.is_current ? "is-current" : ""}`}>
       <div className="profile-card-top">
@@ -1834,6 +2155,11 @@ function ProfileCard({
           </div>
         </dl>
       )}
+      {profile.kind === "api_key" && profile.codex_oauth_profile_id && (
+        <p className="profile-runtime-note profile-oauth-binding">
+          OAuth 登录档案：{codexOAuthAlias ?? "已绑定档案"}
+        </p>
+      )}
       {profile.kind === "codex_oauth" && !supportsManagedCurrentProfile && (
         <p className="profile-runtime-note">
           {!profile.credential_configured
@@ -1877,12 +2203,22 @@ function ProfileCard({
           <button
             className="primary-button compact-action"
             aria-label={`切换到 Codex：${profile.alias}`}
-            disabled={busy || profile.health !== "healthy" || !profile.models.length}
-            title="测试通过后，将此 API 服务切换到 Codex"
+            disabled={
+              busy ||
+              !profile.enabled ||
+              !profile.credential_configured ||
+              !directCompatible
+            }
+            title={
+              directUnsupportedReason ??
+              (profile.models.length
+                ? "将此 API 服务直连到 Codex；复用原客户端状态，保留聊天记录"
+                : "将自动测试连接并发现模型，随后直连到 Codex")
+            }
             onClick={() => void onActivateApiProfile()}
           >
             <UserSwitch size={17} />
-            切换到 Codex
+            {profile.models.length ? "切换到 Codex 直连" : "测试并直连"}
           </button>
         )}
         {profile.kind === "codex_oauth" && (
@@ -1893,7 +2229,7 @@ function ProfileCard({
               !supportsManagedCurrentProfile
                 ? "当前仅支持凭据已保存的 Codex 档案用于受管会话"
                 : profile.is_current
-                  ? "重新应用当前档案并启动独立 ChatGPT/Codex 工作区"
+                  ? "重新应用当前档案并复用原 Codex 客户端状态"
                   : undefined
             }
             disabled={busy || !supportsManagedCurrentProfile}

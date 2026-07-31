@@ -28,6 +28,7 @@ export interface MaskedProfile {
   weight: number;
   models: string[];
   model_mappings?: GatewayModelMapping[];
+  codex_oauth_profile_id: string | null;
   health: string;
   cooldown_until_ms: number | null;
   credential_configured: boolean;
@@ -162,15 +163,20 @@ export interface GatewayOAuthProfileOption {
 
 export interface GatewayCodexConfigStatus {
   enabled: boolean;
+  mode: "official" | "relay_gateway" | "third_party" | string;
   config_path: string;
   service_url: string | null;
   message: string;
   auth_status: "ok" | "missing" | "legacy" | "invalid";
   needs_repair: boolean;
+  direct_profile_id: string | null;
+  direct_profile_alias: string | null;
   oauth_profile_id: string | null;
   oauth_profile_alias: string | null;
   oauth_profile_available: boolean;
   oauth_profile_options: GatewayOAuthProfileOption[];
+  history_sync: CodexHistorySyncReport | null;
+  history_sync_status?: CodexHistoryTransitionStatus | null;
 }
 
 export interface ApiServiceTestReport {
@@ -399,6 +405,124 @@ export interface CodexSessionSummary {
   goal_status: string | null;
 }
 
+export interface CodexHistoryReport {
+  scanned_at_ms: number;
+  limit: number;
+  offset: number;
+  total_sessions: number;
+  selected_project_id: string | null;
+  projects: CodexHistoryProjectSummary[];
+  homes: CodexHistoryHomeSummary[];
+  sessions: CodexHistorySessionSummary[];
+  warnings: string[];
+}
+
+export interface ListCodexHistoryInput {
+  limit?: number;
+  offset?: number;
+  project_id?: string | null;
+}
+
+export interface CodexHistoryProjectSummary {
+  id: string;
+  name: string;
+  cwd: string | null;
+  session_count: number;
+  consistent_count: number;
+  missing_count: number;
+  conflict_count: number;
+  needs_repair_count: number;
+  updated_at_ms: number;
+}
+
+export interface CodexHistoryHomeSummary {
+  id: string;
+  kind: string;
+  label: string;
+  path: string;
+  sync_target: boolean;
+  session_count: number;
+}
+
+export interface CodexHistorySessionSummary {
+  id: string;
+  title: string | null;
+  cwd: string | null;
+  project_id: string;
+  project_name: string;
+  updated_at_ms: number;
+  status: "consistent" | "missing" | "conflict" | "needs_repair" | string;
+  source_count: number;
+  missing_target_count: number;
+  divergent_source_count: number;
+  sources: CodexHistorySourceSummary[];
+}
+
+export interface CodexHistorySourceSummary {
+  home_id: string;
+  home_label: string;
+  home_kind: string;
+  rollout_path: string;
+  archived: boolean;
+  updated_at_ms: number;
+  event_count: number;
+  sha256: string;
+}
+
+export interface CodexHistorySyncReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  homes_scanned: number;
+  sessions_seen: number;
+  sessions_synced: number;
+  files_written: number;
+  files_backed_up: number;
+  metadata_rebuilt: number;
+  warnings: string[];
+}
+
+export interface CodexHistoryTransitionStatus {
+  status: "queued" | "running" | "completed" | "warning" | string;
+  message: string;
+  queued_at_ms: number;
+  completed_at_ms: number | null;
+  warnings: string[];
+}
+
+export interface CodexHistoryMutationReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  sessions_affected: number;
+  files_removed: number;
+  files_backed_up: number;
+  metadata_updated: number;
+  metadata_rebuilt: number;
+  warnings: string[];
+}
+
+export interface CodexHistoryExportReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  sessions_exported: number;
+  files_exported: number;
+  destination_path: string;
+  warnings: string[];
+}
+
+export interface CodexHistoryImportReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  sessions_imported: number;
+  files_written: number;
+  files_backed_up: number;
+  metadata_rebuilt: number;
+  warnings: string[];
+}
+
 export interface DashboardSnapshot {
   gateway: GatewayStatus;
   profiles: MaskedProfile[];
@@ -434,11 +558,12 @@ export interface CurrentProfileActivation {
     | "switching"
     | "activated"
     | "auth_file_write_failed"
-    | "codex_keychain_write_failed"
     | "desktop_restart_failed"
     | "failed"
     | "cancelled";
   message: string;
+  history_sync: CodexHistorySyncReport | null;
+  history_sync_status?: CodexHistoryTransitionStatus | null;
 }
 
 export interface DesktopWorkspaceSettings {
@@ -459,6 +584,7 @@ export interface AppUpdateInfo {
 }
 
 export const APP_UPDATE_PROGRESS_EVENT = "app-update-progress";
+export const CODEX_HISTORY_SYNC_FINISHED_EVENT = "codex-history-sync-finished";
 
 export type AppUpdateProgressPhase =
   "checking" | "downloading" | "downloaded" | "installing" | "restarting" | "failed";
@@ -575,8 +701,6 @@ function recoveryFor(code: string) {
         "请刷新可用模型，并确认对应账号已启用且加入网关账号池。",
       app_update_unavailable: "请检查网络连接，或稍后在设置页手动检查软件更新。",
       auth_file_write_failed: "请确认默认 .codex 目录可写后重试。",
-      codex_keychain_unavailable:
-        "请解锁 macOS 钥匙串并允许 Codex Relay 写入“Codex Auth”后重试。",
     }[code] ?? "请检查本机配置后重试。"
   );
 }
@@ -661,6 +785,44 @@ export const api = {
   installCodexEnvironment: (steps?: string[]) =>
     relayInvoke<CodexEnvironmentInstallReport>("install_codex_environment", {
       input: { confirmed: true, steps: steps ?? null },
+    }),
+  listCodexHistory: (input: ListCodexHistoryInput = { limit: 100, offset: 0 }) =>
+    relayInvoke<CodexHistoryReport>("list_codex_history", { input }),
+  syncCodexHistory: () =>
+    relayInvoke<CodexHistorySyncReport>("sync_codex_history", {
+      input: { confirmed: true },
+    }),
+  deleteCodexHistory: (input: {
+    scope: "sessions" | "project";
+    session_ids?: string[];
+    project_id?: string | null;
+  }) =>
+    relayInvoke<CodexHistoryMutationReport>("delete_codex_history", {
+      input: {
+        scope: input.scope,
+        session_ids: input.session_ids ?? [],
+        project_id: input.project_id ?? null,
+        confirmed: true,
+      },
+    }),
+  exportCodexHistory: (input: {
+    scope: "sessions" | "project" | "all";
+    session_ids?: string[];
+    project_id?: string | null;
+    destination_path: string;
+  }) =>
+    relayInvoke<CodexHistoryExportReport>("export_codex_history", {
+      input: {
+        scope: input.scope,
+        session_ids: input.session_ids ?? [],
+        project_id: input.project_id ?? null,
+        destination_path: input.destination_path,
+        confirmed: true,
+      },
+    }),
+  importCodexHistory: (paths: string[]) =>
+    relayInvoke<CodexHistoryImportReport>("import_codex_history", {
+      input: { paths, confirmed: true },
     }),
   codexGatewayConfigStatus: () =>
     relayInvoke<GatewayCodexConfigStatus>("codex_gateway_config_status"),

@@ -38,6 +38,7 @@ const profile: MaskedProfile = {
   priority: 0,
   weight: 1,
   models: [],
+  codex_oauth_profile_id: null,
   health: "unknown",
   cooldown_until_ms: null,
   credential_configured: true,

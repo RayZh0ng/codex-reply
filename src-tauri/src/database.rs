@@ -16,6 +16,7 @@ use crate::{
         GatewayStatus, GatewayWireApi, MaskedClientKey, MaskedCollaborationBot, MaskedFeishuBot,
         MaskedProfile, MetricsSnapshot, ProfileAccountSummary, ProfileKind, ProfileQuota,
         ProfileSubscription, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+        GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
     },
     error::{AppError, AppResult},
 };
@@ -101,6 +102,7 @@ impl Repository {
                       weight INTEGER NOT NULL,
                       models_json TEXT NOT NULL,
                       model_mappings_json TEXT NOT NULL DEFAULT '[]',
+                      codex_oauth_profile_id TEXT,
                       health TEXT NOT NULL,
                       cooldown_until_ms INTEGER,
                       secret_ref TEXT,
@@ -323,6 +325,7 @@ impl Repository {
                 ("provider", "TEXT NOT NULL DEFAULT 'openai_compatible'"),
                 ("wire_api", "TEXT NOT NULL DEFAULT 'responses'"),
                 ("model_mappings_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("codex_oauth_profile_id", "TEXT"),
             ] {
                 if !profile_columns.iter().any(|column| column == name) {
                     connection
@@ -401,8 +404,8 @@ impl Repository {
         self.with_connection(|connection| {
             connection
                 .execute(
-                    "INSERT INTO profiles(id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                    "INSERT INTO profiles(id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
@@ -416,6 +419,7 @@ impl Repository {
                         stored.profile.weight,
                         serde_json::to_string(&stored.profile.models).map_err(|_| AppError::Internal)?,
                         serde_json::to_string(&stored.profile.model_mappings).map_err(|_| AppError::Internal)?,
+                        stored.profile.codex_oauth_profile_id,
                         stored.profile.health,
                         stored.profile.cooldown_until_ms,
                         stored.secret_ref,
@@ -449,7 +453,7 @@ impl Repository {
                 .optional()
                 .map_err(|_| AppError::Internal)?;
             let mut statement = connection
-                .prepare("SELECT id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json FROM profiles ORDER BY priority, alias")
+                .prepare("SELECT id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json FROM profiles ORDER BY priority, alias")
                 .map_err(|_| AppError::Internal)?;
             let rows = statement
                 .query_map([], |row| {
@@ -462,8 +466,8 @@ impl Repository {
                         serde_json::from_str(&mappings_json).unwrap_or_default();
                     let model_mappings = stored_or_identity_model_mappings(&models, parsed_mappings);
                     Ok(StoredProfile {
-                        secret_ref: row.get(14)?,
-                        credential_fingerprint: row.get(17)?,
+                        secret_ref: row.get(15)?,
+                        credential_fingerprint: row.get(18)?,
                         profile: MaskedProfile {
                             id: id.clone(),
                             alias: row.get(1)?,
@@ -477,19 +481,20 @@ impl Repository {
                             weight: row.get(9)?,
                             models,
                             model_mappings,
-                            health: row.get(12)?,
-                            cooldown_until_ms: row.get(13)?,
-                            credential_configured: row.get(15)?,
-                            auth_mode: parse_auth_mode(&row.get::<_, String>(16)?)
+                            codex_oauth_profile_id: row.get(12)?,
+                            health: row.get(13)?,
+                            cooldown_until_ms: row.get(14)?,
+                            credential_configured: row.get(16)?,
+                            auth_mode: parse_auth_mode(&row.get::<_, String>(17)?)
                                 .unwrap_or_default(),
                             is_current: current_id.as_deref() == Some(id.as_str()),
                             account: account_summary(
-                                row.get(18)?,
                                 row.get(19)?,
                                 row.get(20)?,
                                 row.get(21)?,
                                 row.get(22)?,
                                 row.get(23)?,
+                                row.get(24)?,
                             ),
                         },
                     })
@@ -510,7 +515,7 @@ impl Repository {
         self.with_connection(|connection| {
             let updated = connection
                 .execute(
-                    "UPDATE profiles SET alias = ?2, provider = ?3, wire_api = ?4, enabled = ?5, in_pool = ?6, priority = ?7, weight = ?8, models_json = ?9, model_mappings_json = ?10, secret_ref = ?11, credential_configured = ?12, auth_mode = ?13, credential_fingerprint = ?14, account_display_name = ?15, account_email = ?16, account_id = ?17, account_updated_at_ms = ?18, account_quota_json = ?19, account_subscription_json = ?20 WHERE id = ?1",
+                    "UPDATE profiles SET alias = ?2, provider = ?3, wire_api = ?4, enabled = ?5, in_pool = ?6, priority = ?7, weight = ?8, models_json = ?9, model_mappings_json = ?10, codex_oauth_profile_id = ?11, secret_ref = ?12, credential_configured = ?13, auth_mode = ?14, credential_fingerprint = ?15, account_display_name = ?16, account_email = ?17, account_id = ?18, account_updated_at_ms = ?19, account_quota_json = ?20, account_subscription_json = ?21, health = ?22, cooldown_until_ms = ?23 WHERE id = ?1",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
@@ -522,6 +527,7 @@ impl Repository {
                         stored.profile.weight,
                         serde_json::to_string(&stored.profile.models).map_err(|_| AppError::Internal)?,
                         serde_json::to_string(&stored.profile.model_mappings).map_err(|_| AppError::Internal)?,
+                        stored.profile.codex_oauth_profile_id,
                         stored.secret_ref,
                         stored.profile.credential_configured,
                         auth_mode_name(&stored.profile.auth_mode),
@@ -532,6 +538,8 @@ impl Repository {
                         stored.profile.account.as_ref().map(|account| account.updated_at_ms),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.quota).ok()),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.subscription).ok()),
+                        stored.profile.health,
+                        stored.profile.cooldown_until_ms,
                     ],
                 )
                 .map_err(|_| AppError::Internal)?;
@@ -552,6 +560,23 @@ impl Repository {
                     params![id],
                 )
                 .map_err(|_| AppError::Internal)?;
+            connection
+                .execute(
+                    "UPDATE profiles SET codex_oauth_profile_id = NULL WHERE codex_oauth_profile_id = ?1",
+                    params![id],
+                )
+                .map_err(|_| AppError::Internal)?;
+            for setting_key in [
+                GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
+                GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
+            ] {
+                connection
+                    .execute(
+                        "DELETE FROM app_settings WHERE key = ?1 AND value = ?2",
+                        params![setting_key, id],
+                    )
+                    .map_err(|_| AppError::Internal)?;
+            }
             Ok(stored.secret_ref)
         })
     }
@@ -622,20 +647,15 @@ impl Repository {
 
     pub fn desktop_workspace_mode(&self) -> AppResult<DesktopWorkspaceMode> {
         match self.setting("desktop_workspace_mode")?.as_deref() {
-            None | Some("per_profile") => Ok(DesktopWorkspaceMode::PerProfile),
-            Some("fresh") => Ok(DesktopWorkspaceMode::Fresh),
-            Some("shared") => Ok(DesktopWorkspaceMode::Shared),
+            None | Some("fresh") | Some("per_profile") | Some("shared") => {
+                Ok(DesktopWorkspaceMode::Shared)
+            }
             Some(_) => Err(AppError::ValidationFailed),
         }
     }
 
-    pub fn set_desktop_workspace_mode(&self, mode: &DesktopWorkspaceMode) -> AppResult<()> {
-        let value = match mode {
-            DesktopWorkspaceMode::Fresh => "fresh",
-            DesktopWorkspaceMode::PerProfile => "per_profile",
-            DesktopWorkspaceMode::Shared => "shared",
-        };
-        self.set_setting("desktop_workspace_mode", value)
+    pub fn set_desktop_workspace_mode(&self, _mode: &DesktopWorkspaceMode) -> AppResult<()> {
+        self.set_setting("desktop_workspace_mode", "shared")
     }
 
     pub fn app_update_settings(&self) -> AppResult<AppUpdateSettings> {
@@ -681,6 +701,7 @@ impl Repository {
         })
     }
 
+    #[cfg(test)]
     pub fn create_desktop_workspace(
         &self,
         id: &str,
@@ -2575,7 +2596,8 @@ mod tests {
             AppUpdateChannel, AppUpdateSettings, CodexSessionEvent, CodexSessionSummary,
             CollaborationProvider, CollaborationSummary, DesktopWorkspaceMode, GatewayProvider,
             GatewayWireApi, MaskedClientKey, MaskedProfile, ProfileKind,
-            GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+            GATEWAY_CODEX_CLIENT_KEY_REF_SETTING, GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
+            GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
         },
         error::AppError,
         profiles,
@@ -2603,6 +2625,7 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
             },
@@ -2740,6 +2763,43 @@ mod tests {
     }
 
     #[test]
+    fn deleting_oauth_profile_clears_api_unlock_bindings_and_gateway_settings() {
+        let repository = Repository::memory();
+        let oauth = stored_profile("oauth-login", ProfileKind::CodexOauth, "healthy");
+        repository.insert_profile(&oauth).unwrap();
+        let mut api = stored_profile("api-profile", ProfileKind::ApiKey, "healthy");
+        api.profile.codex_oauth_profile_id = Some("oauth-login".to_owned());
+        repository.insert_profile(&api).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING, "oauth-login")
+            .unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "oauth-login")
+            .unwrap();
+
+        let secret_ref = repository.delete_profile("oauth-login").unwrap();
+
+        assert_eq!(
+            secret_ref.as_deref(),
+            Some("profile:oauth-login:credential")
+        );
+        assert!(repository
+            .profile("api-profile")
+            .unwrap()
+            .profile
+            .codex_oauth_profile_id
+            .is_none());
+        assert!(repository
+            .setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)
+            .unwrap()
+            .is_none());
+        assert!(repository
+            .setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn migrates_legacy_profiles_without_account_columns() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -2777,6 +2837,7 @@ mod tests {
         assert!(columns.contains(&"account_subscription_json".to_owned()));
         assert!(columns.contains(&"wire_api".to_owned()));
         assert!(columns.contains(&"model_mappings_json".to_owned()));
+        assert!(columns.contains(&"codex_oauth_profile_id".to_owned()));
         let api_profile = repository.profile("legacy-api").unwrap().profile;
         assert_eq!(api_profile.wire_api, GatewayWireApi::Responses);
         assert_eq!(api_profile.model_mappings.len(), 1);
@@ -3074,6 +3135,7 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
             },
@@ -3138,14 +3200,32 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_a_per_profile_workspace_and_rejects_unknown_values() {
+    fn desktop_workspace_mode_is_fixed_to_shared_and_rejects_unknown_values() {
         let repository = Repository::memory();
         assert_eq!(
             repository.desktop_workspace_mode().unwrap(),
-            DesktopWorkspaceMode::PerProfile
+            DesktopWorkspaceMode::Shared
+        );
+        for legacy_mode in [
+            DesktopWorkspaceMode::Fresh,
+            DesktopWorkspaceMode::PerProfile,
+            DesktopWorkspaceMode::Shared,
+        ] {
+            repository.set_desktop_workspace_mode(&legacy_mode).unwrap();
+            assert_eq!(
+                repository.desktop_workspace_mode().unwrap(),
+                DesktopWorkspaceMode::Shared
+            );
+        }
+        repository
+            .set_setting("desktop_workspace_mode", "fresh")
+            .unwrap();
+        assert_eq!(
+            repository.desktop_workspace_mode().unwrap(),
+            DesktopWorkspaceMode::Shared
         );
         repository
-            .set_desktop_workspace_mode(&DesktopWorkspaceMode::Shared)
+            .set_setting("desktop_workspace_mode", "per_profile")
             .unwrap();
         assert_eq!(
             repository.desktop_workspace_mode().unwrap(),

@@ -31,7 +31,8 @@ use crate::{
     domain::{
         ApiServiceTestReport, GatewayHealthProviderSummary, GatewayHealthSummary,
         GatewayModelMapping, GatewayNetworkAddress, GatewayProvider, GatewayStatus, GatewayWireApi,
-        MaskedProfile, ProfileKind,
+        MaskedProfile, ProfileKind, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+        GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
     },
     error::{AppError, AppResult},
     oauth_credentials::{CredentialAccess, OAuthCredentialStore},
@@ -76,6 +77,11 @@ enum GatewayUpstreamProxy {
 struct ResponseAffinity {
     profile_id: String,
     expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizedClient {
+    codex_managed: bool,
 }
 
 #[derive(Default)]
@@ -845,11 +851,15 @@ async fn list_models(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorize(&state, peer.ip(), &headers) {
+    let Some(client) = authorize(&state, peer.ip(), &headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let candidates = match candidates_for_model(&state.repository, None) {
-        Ok(value) => value,
+    };
+    let candidates = match direct_profile_for_codex_client(&state, &client, None) {
+        Ok(Some(profile)) => vec![profile],
+        Ok(None) => match candidates_for_model(&state.repository, None) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let models = candidates
@@ -1185,11 +1195,15 @@ async fn ollama_tags(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorize(&state, peer.ip(), &headers) {
+    let Some(client) = authorize(&state, peer.ip(), &headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let models = candidates_for_model(&state.repository, None)
-        .unwrap_or_default()
+    };
+    let candidates = match direct_profile_for_codex_client(&state, &client, None) {
+        Ok(Some(profile)) => vec![profile],
+        Ok(None) => candidates_for_model(&state.repository, None).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let models = candidates
         .into_iter()
         .filter(|candidate| candidate.profile.provider == GatewayProvider::Ollama)
         .flat_map(|candidate| candidate.profile.models)
@@ -1212,39 +1226,56 @@ async fn forward(
     requested_provider: GatewayProvider,
     request_kind: Option<GatewayRequestKind>,
 ) -> Response {
-    if !authorize(&state, peer, &headers) {
+    let Some(client) = authorize(&state, peer, &headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     if request_kind == Some(GatewayRequestKind::ChatCompletions) {
         if let Err(message) = validate_chat_request(&payload) {
             return openai_bad_request(&message);
         }
     }
     let model = payload.get("model").and_then(Value::as_str);
-    let mut candidates = match candidates_for_model(&state.repository, model) {
-        Ok(value) => value
-            .into_iter()
-            .filter(|candidate| {
-                if candidate.profile.kind == ProfileKind::CodexOauth {
-                    request_kind.is_some()
+    let mut candidates = match direct_profile_for_codex_client(&state, &client, model) {
+        Ok(Some(profile)) => vec![profile],
+        Ok(None) => match candidates_for_model(&state.repository, model) {
+            Ok(value) => value
+                .into_iter()
+                .filter(|candidate| {
+                    if candidate.profile.kind == ProfileKind::CodexOauth {
+                        request_kind.is_some()
+                            && requested_provider == GatewayProvider::OpenAiCompatible
+                    } else if request_kind.is_some()
                         && requested_provider == GatewayProvider::OpenAiCompatible
-                } else if request_kind.is_some()
-                    && requested_provider == GatewayProvider::OpenAiCompatible
-                {
-                    true
-                } else {
-                    candidate.profile.provider == requested_provider
-                        || matches!(
-                            (&requested_provider, &candidate.profile.provider),
-                            (GatewayProvider::OpenAiCompatible, GatewayProvider::OpenAi)
-                        )
-                }
-            })
-            .collect::<Vec<_>>(),
-        _ => {
+                    {
+                        true
+                    } else {
+                        candidate.profile.provider == requested_provider
+                            || matches!(
+                                (&requested_provider, &candidate.profile.provider),
+                                (GatewayProvider::OpenAiCompatible, GatewayProvider::OpenAi)
+                            )
+                    }
+                })
+                .collect::<Vec<_>>(),
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": {"code": "model_not_available"}})),
+                )
+                    .into_response()
+            }
+        },
+        Err(AppError::GatewayModelUnavailable) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": {"code": "model_not_available"}})),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {"code": "direct_profile_unavailable"}})),
             )
                 .into_response()
         }
@@ -4514,9 +4545,13 @@ fn upstream_request(
     }
 }
 
-fn authorize(state: &GatewayApiState, peer: IpAddr, headers: &HeaderMap) -> bool {
+fn authorize(
+    state: &GatewayApiState,
+    peer: IpAddr,
+    headers: &HeaderMap,
+) -> Option<AuthorizedClient> {
     if !state.cidrs.is_empty() && !state.cidrs.iter().any(|network| network.contains(&peer)) {
-        return false;
+        return None;
     }
     let value = headers
         .get(header::AUTHORIZATION)
@@ -4532,24 +4567,60 @@ fn authorize(state: &GatewayApiState, peer: IpAddr, headers: &HeaderMap) -> bool
                 .get("x-goog-api-key")
                 .and_then(|value| value.to_str().ok())
         });
-    let Some(value) = value else {
-        return false;
-    };
+    let value = value?;
     let keys = match state.repository.valid_key_hashes() {
         Ok(keys) => keys,
-        Err(_) => return false,
+        Err(_) => return None,
     };
-    for (id, hash, _) in keys {
+    let codex_key_ref = state
+        .repository
+        .setting(GATEWAY_CODEX_CLIENT_KEY_REF_SETTING)
+        .ok()
+        .flatten();
+    for (id, hash, secret_ref) in keys {
         if PasswordHash::new(&hash).ok().is_some_and(|parsed| {
             Argon2::default()
                 .verify_password(value.as_bytes(), &parsed)
                 .is_ok()
         }) {
             let _ = state.repository.record_key_use(&id, timestamp_ms());
-            return true;
+            return Some(AuthorizedClient {
+                codex_managed: codex_key_ref.as_deref() == Some(secret_ref.as_str()),
+            });
         }
     }
-    false
+    None
+}
+
+fn direct_profile_for_codex_client(
+    state: &GatewayApiState,
+    client: &AuthorizedClient,
+    model: Option<&str>,
+) -> AppResult<Option<StoredProfile>> {
+    if !client.codex_managed {
+        return Ok(None);
+    }
+    let Some(profile_id) = state
+        .repository
+        .setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING)?
+    else {
+        return Ok(None);
+    };
+    let stored = state.repository.profile(&profile_id)?;
+    let profile = &stored.profile;
+    let now = timestamp_ms();
+    if profile.kind != ProfileKind::ApiKey
+        || !profile.enabled
+        || !profile.credential_configured
+        || profile.health != "healthy"
+        || profile.cooldown_until_ms.is_some_and(|until| until > now)
+    {
+        return Err(AppError::UpstreamUnavailable);
+    }
+    if model.is_some_and(|model| !profile.models.iter().any(|candidate| candidate == model)) {
+        return Err(AppError::GatewayModelUnavailable);
+    }
+    Ok(Some(stored))
 }
 
 #[cfg(test)]
@@ -4558,10 +4629,12 @@ mod tests {
         collections::HashMap,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         time::Duration,
     };
+
+    use url::Url;
 
     use axum::{
         body::{to_bytes, Body, Bytes},
@@ -4574,23 +4647,27 @@ mod tests {
 
     use super::{
         adapt_provider_chat_fanout_response, anthropic_chat_payload, build_upstream_url,
-        chat_choice_count, chat_to_responses, completed_response, gateway_http_client,
-        gemini_chat_payload, mask_proxy_url, model_discovery_route,
+        chat_choice_count, chat_to_responses, completed_response, direct_profile_for_codex_client,
+        gateway_http_client, gemini_chat_payload, mask_proxy_url, model_discovery_route,
         model_ids_from_provider_response, ollama_chat_payload_from_openai, payload_with_model,
         provider_usage_tokens, provider_value_to_chat, provider_value_to_response,
         response_to_chat_completion, responses_to_chat_completion, rewrite_model_fields,
         send_oauth_request, send_with_first_response_timeout_after, test_api_service,
         translate_ollama_event, upstream_model_for, upstream_response, validate_binding,
-        validate_manual_proxy_url, visible_model_for, GatewayRequestKind, GatewayUpstreamProxy,
-        ProviderSseState, WeightedScheduler,
+        validate_manual_proxy_url, visible_model_for, AuthorizedClient, GatewayApiState,
+        GatewayRequestKind, GatewayUpstreamProxy, ProviderSseState, WeightedScheduler,
+        CODEX_RESPONSES_URL,
     };
     use crate::error::AppError;
     use crate::{
         database::{Repository, StoredProfile},
         domain::{
             GatewayModelMapping, GatewayProvider, GatewayWireApi, MaskedProfile, ProfileKind,
+            GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
         },
+        oauth_credentials::OAuthCredentialStore,
         profiles::CodexOAuthCredential,
+        secrets::MemorySecretStore,
     };
 
     fn candidate(id: &str, weight: i64) -> StoredProfile {
@@ -4612,12 +4689,65 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
             },
             secret_ref: Some(format!("profile:{id}:oauth")),
             credential_fingerprint: None,
         }
+    }
+
+    #[test]
+    fn codex_managed_client_uses_direct_profile_without_affecting_user_keys() {
+        let repository = Arc::new(Repository::memory());
+        let mut direct = candidate("direct-api", 1);
+        direct.profile.kind = ProfileKind::ApiKey;
+        direct.profile.provider = GatewayProvider::OpenAiCompatible;
+        direct.profile.models = vec!["direct-model".to_owned()];
+        direct.secret_ref = Some("profile:direct-api:credential".to_owned());
+        repository.insert_profile(&direct).unwrap();
+        let mut pooled = candidate("pooled-api", 1);
+        pooled.profile.kind = ProfileKind::ApiKey;
+        pooled.profile.provider = GatewayProvider::OpenAiCompatible;
+        pooled.profile.models = vec!["pool-model".to_owned()];
+        pooled.secret_ref = Some("profile:pooled-api:credential".to_owned());
+        repository.insert_profile(&pooled).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "direct-api")
+            .unwrap();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let state = GatewayApiState {
+            repository: repository.clone(),
+            secrets: secrets.clone(),
+            oauth_credentials: Arc::new(OAuthCredentialStore::new(secrets)),
+            cidrs: Vec::new(),
+            oauth_responses_url: Url::parse(CODEX_RESPONSES_URL).unwrap(),
+            upstream_proxy: GatewayUpstreamProxy::Disabled,
+            certificate_ready: true,
+            scheduler: Arc::new(Mutex::new(WeightedScheduler::default())),
+            affinities: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let codex_client = AuthorizedClient {
+            codex_managed: true,
+        };
+        let user_client = AuthorizedClient {
+            codex_managed: false,
+        };
+
+        let selected = direct_profile_for_codex_client(&state, &codex_client, Some("direct-model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.profile.id, "direct-api");
+        assert!(matches!(
+            direct_profile_for_codex_client(&state, &codex_client, Some("pool-model")),
+            Err(AppError::GatewayModelUnavailable)
+        ));
+        assert!(
+            direct_profile_for_codex_client(&state, &user_client, Some("pool-model"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4913,6 +5043,7 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
             },

@@ -8,7 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 const webview = vi.hoisted(() => ({
   dragHandler: null as
@@ -30,6 +30,10 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({ onDragDropEvent: webview.onDragDropEvent }),
 }));
+
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+});
 
 const status = {
   attempt_id: "attempt-1",
@@ -161,6 +165,7 @@ function profileFixture({
     priority: 0,
     weight: 1,
     models: [],
+    codex_oauth_profile_id: null,
     health: "unknown",
     cooldown_until_ms: null,
     credential_configured: true,
@@ -189,13 +194,11 @@ describe("Profiles OAuth import", () => {
   it("states that profile switching uses saved credentials without reauthorization", () => {
     renderProfiles();
 
+    expect(screen.getByText("当前档案会复用原 Codex 客户端状态")).toBeInTheDocument();
     expect(
-      screen.getByText("当前档案会按所选模式启动 Codex 工作区"),
+      screen.getByText(/添加账号时会保存认证凭据。切换账号会更新默认/),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText(/添加账号时会保存认证凭据。当前模式为/),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/不会迁移 ChatGPT Chat\/Work/)).toBeInTheDocument();
+    expect(screen.getByText(/保留本机聊天记录、记忆、设置与状态/)).toBeInTheDocument();
   });
 
   it("opens distinct OAuth and JSON import cards from the page action", () => {
@@ -424,13 +427,36 @@ describe("Profiles OAuth import", () => {
     const onCreateApiProfile = vi.fn().mockResolvedValue(undefined);
     vi.spyOn(api, "testApiServiceProfile").mockResolvedValue({
       status: "verified",
-      message: "已发现 1 个模型。",
+      message: "已发现 2 个模型。",
       endpoint: "https://api.example.test/v1/models",
       latency_ms: 24,
       http_status: 200,
       category: "ok",
-      model_count: 1,
-      models: ["third-party-coder"],
+      model_count: 2,
+      models: ["third-party-coder", "second-party-coder"],
+    });
+    vi.spyOn(api, "codexGatewayConfigStatus").mockResolvedValue({
+      enabled: false,
+      mode: "official",
+      config_path: "/Users/test/.codex/config.toml",
+      service_url: null,
+      message: "Codex 尚未切换到 Relay 网关。",
+      auth_status: "missing",
+      needs_repair: false,
+      direct_profile_id: null,
+      direct_profile_alias: null,
+      oauth_profile_id: null,
+      oauth_profile_alias: null,
+      oauth_profile_available: false,
+      oauth_profile_options: [
+        {
+          id: "oauth-work",
+          alias: "Work Login",
+          available: true,
+          reason: null,
+        },
+      ],
+      history_sync: null,
     });
     render(
       <Profiles
@@ -457,6 +483,16 @@ describe("Profiles OAuth import", () => {
     expect(
       form.getByText(/模型映射会生成 Codex model_catalog_json/),
     ).toBeInTheDocument();
+    expect(
+      form.getByText(/所有模型请求仍发送到当前第三方模型供应商服务/),
+    ).toBeInTheDocument();
+    const oauthSelector = form.getByRole("combobox", {
+      name: "OAuth 登录档案（可选）",
+    });
+    expect(oauthSelector).toHaveTextContent("不绑定登录档案");
+    fireEvent.click(oauthSelector);
+    fireEvent.click(await screen.findByRole("option", { name: /Work Login/ }));
+    expect(oauthSelector).toHaveTextContent("Work Login");
     fireEvent.change(form.getByLabelText("档案名称"), {
       target: { value: "Third Party" },
     });
@@ -469,7 +505,17 @@ describe("Profiles OAuth import", () => {
     fireEvent.click(form.getByRole("button", { name: "测试连接并发现模型" }));
 
     expect(await screen.findByText("连接已验证")).toBeInTheDocument();
+    expect(
+      form.queryByRole("group", { name: "发现的上游模型" }),
+    ).not.toBeInTheDocument();
+    expect(
+      form.getByRole("button", { name: /发现的上游模型，已选择 0\/2/ }),
+    ).toHaveTextContent("选择需要映射的模型");
+    fireEvent.click(form.getByRole("button", { name: /发现的上游模型，已选择 0\/2/ }));
     fireEvent.click(form.getByRole("checkbox", { name: "third-party-coder" }));
+    expect(
+      form.getByRole("button", { name: /发现的上游模型，已选择 1\/2/ }),
+    ).toHaveTextContent("third-party-coder");
     expect(form.getByLabelText("Model ID")).toHaveValue("third-party-coder");
     fireEvent.change(form.getByLabelText("Model ID"), {
       target: { value: "codex-visible-coder" },
@@ -484,6 +530,7 @@ describe("Profiles OAuth import", () => {
           wire_api: "responses",
           base_url: "https://api.example.test/v1",
           api_key: "sk-test",
+          codex_oauth_profile_id: "oauth-work",
           model_mappings: [
             {
               model: "codex-visible-coder",
@@ -495,6 +542,142 @@ describe("Profiles OAuth import", () => {
         }),
       ),
     );
+  });
+
+  it("resets model mappings from discovered upstream models", async () => {
+    vi.spyOn(api, "testApiServiceProfile").mockResolvedValue({
+      status: "verified",
+      message: "已发现 2 个模型。",
+      endpoint: "https://api.example.test/v1/models",
+      latency_ms: 24,
+      http_status: 200,
+      category: "ok",
+      model_count: 2,
+      models: ["first-upstream", "second-upstream"],
+    });
+    render(
+      <Profiles
+        profiles={[]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onCreateApiProfile={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "添加提供商" }));
+    const sheet = screen
+      .getByRole("heading", { name: "添加第三方模型提供商" })
+      .closest("section") as HTMLElement;
+    const form = within(sheet);
+    fireEvent.change(form.getByLabelText("Base URL"), {
+      target: { value: "https://api.example.test/v1" },
+    });
+    fireEvent.change(form.getByLabelText("API Key"), {
+      target: { value: "sk-test" },
+    });
+    fireEvent.click(form.getByRole("button", { name: "测试连接并发现模型" }));
+
+    expect(await screen.findByText("连接已验证")).toBeInTheDocument();
+    fireEvent.click(form.getByRole("button", { name: /发现的上游模型，已选择 0\/2/ }));
+    fireEvent.click(form.getByRole("checkbox", { name: "first-upstream" }));
+    fireEvent.change(form.getByLabelText("Model ID"), {
+      target: { value: "codex-visible" },
+    });
+
+    fireEvent.click(form.getByRole("button", { name: "重置映射" }));
+
+    const modelInputs = form.getAllByLabelText("Model ID");
+    const upstreamInputs = form.getAllByLabelText("Upstream Model");
+    expect(modelInputs).toHaveLength(2);
+    expect(modelInputs[0]).toHaveValue("first-upstream");
+    expect(modelInputs[1]).toHaveValue("second-upstream");
+    expect(upstreamInputs[0]).toHaveValue("first-upstream");
+    expect(upstreamInputs[1]).toHaveValue("second-upstream");
+  });
+
+  it("filters and bulk manages discovered upstream models from the dropdown", async () => {
+    const longModel = "gpt-5.3-codex-spark-preview-super-long-provider-model-name";
+    vi.spyOn(api, "testApiServiceProfile").mockResolvedValue({
+      status: "verified",
+      message: "已发现 5 个模型。",
+      endpoint: "https://api.example.test/v1/models",
+      latency_ms: 24,
+      http_status: 200,
+      category: "ok",
+      model_count: 5,
+      models: ["alpha-model", "", "beta-model", "alpha-model", longModel],
+    });
+    render(
+      <Profiles
+        profiles={[]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onCreateApiProfile={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "添加提供商" }));
+    const sheet = screen
+      .getByRole("heading", { name: "添加第三方模型提供商" })
+      .closest("section") as HTMLElement;
+    const form = within(sheet);
+    fireEvent.change(form.getByLabelText("Base URL"), {
+      target: { value: "https://api.example.test/v1" },
+    });
+    fireEvent.change(form.getByLabelText("API Key"), {
+      target: { value: "sk-test" },
+    });
+    fireEvent.click(form.getByRole("button", { name: "测试连接并发现模型" }));
+
+    expect(await screen.findByText("连接已验证")).toBeInTheDocument();
+    fireEvent.click(form.getByRole("button", { name: /发现的上游模型，已选择 0\/3/ }));
+    expect(form.getAllByTitle(longModel).length).toBeGreaterThan(0);
+
+    fireEvent.change(form.getByLabelText("搜索上游模型"), {
+      target: { value: "spark" },
+    });
+    expect(
+      form.queryByRole("checkbox", { name: "alpha-model" }),
+    ).not.toBeInTheDocument();
+    expect(form.getByRole("checkbox", { name: longModel })).toBeInTheDocument();
+
+    fireEvent.change(form.getByLabelText("搜索上游模型"), {
+      target: { value: "missing" },
+    });
+    expect(form.getByText("没有匹配的模型。")).toBeInTheDocument();
+
+    fireEvent.change(form.getByLabelText("搜索上游模型"), {
+      target: { value: "" },
+    });
+    fireEvent.click(form.getByRole("button", { name: "全选" }));
+    const modelInputs = form.getAllByLabelText("Model ID");
+    expect(modelInputs).toHaveLength(3);
+    expect(modelInputs[0]).toHaveValue("alpha-model");
+    expect(modelInputs[1]).toHaveValue("beta-model");
+    expect(modelInputs[2]).toHaveValue(longModel);
+    expect(
+      form.getByRole("button", { name: /发现的上游模型，已选择 3\/3/ }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(form.getByRole("button", { name: "清空" }));
+    expect(form.queryByLabelText("Model ID")).not.toBeInTheDocument();
+    expect(
+      form.getByRole("button", { name: /发现的上游模型，已选择 0\/3/ }),
+    ).toBeInTheDocument();
   });
 
   it("shows the structured provider test failure report instead of a generic internal error", async () => {
@@ -546,6 +729,7 @@ describe("Profiles OAuth import", () => {
     render(
       <Profiles
         profiles={[
+          profileFixture({ id: "oauth-work", alias: "Work Login" }),
           {
             id: "api-profile",
             alias: "Gateway only",
@@ -556,6 +740,7 @@ describe("Profiles OAuth import", () => {
             priority: 0,
             weight: 1,
             models: ["gpt-5-codex"],
+            codex_oauth_profile_id: "oauth-work",
             health: "healthy",
             cooldown_until_ms: null,
             credential_configured: true,
@@ -582,6 +767,99 @@ describe("Profiles OAuth import", () => {
     expect(
       screen.getByRole("button", { name: "切换到 Codex：Gateway only" }),
     ).toBeEnabled();
+    expect(screen.getByText("OAuth 登录档案：Work Login")).toBeInTheDocument();
+  });
+
+  it("disables Codex direct activation for providers that need Relay routing", () => {
+    const onActivateApiProfile = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Profiles
+        profiles={[
+          {
+            id: "api-profile",
+            alias: "Chat Provider",
+            kind: "api_key",
+            base_url: "https://relay.example.com/v1",
+            provider: "openai_compatible",
+            wire_api: "chat_completions",
+            enabled: true,
+            in_pool: true,
+            priority: 0,
+            weight: 1,
+            models: ["chat-model"],
+            codex_oauth_profile_id: null,
+            health: "healthy",
+            cooldown_until_ms: null,
+            credential_configured: true,
+            is_current: false,
+          },
+        ]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onActivateApiProfile={onActivateApiProfile}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    const button = screen.getByRole("button", {
+      name: "切换到 Codex：Chat Provider",
+    });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute(
+      "title",
+      "该供应商需要 Relay 本地路由或协议适配，不能直连 Codex",
+    );
+    expect(button).toHaveTextContent("切换到 Codex 直连");
+    fireEvent.click(button);
+    expect(onActivateApiProfile).not.toHaveBeenCalled();
+  });
+
+  it("keeps API Key Codex activation available before pool join or model refresh", () => {
+    const onActivateApiProfile = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Profiles
+        profiles={[
+          {
+            id: "api-profile",
+            alias: "Needs setup",
+            kind: "api_key",
+            base_url: "https://relay.example.com/v1",
+            enabled: true,
+            in_pool: false,
+            priority: 0,
+            weight: 1,
+            models: [],
+            codex_oauth_profile_id: null,
+            health: "unhealthy",
+            cooldown_until_ms: null,
+            credential_configured: true,
+            is_current: false,
+          },
+        ]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onActivateApiProfile={onActivateApiProfile}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: "切换到 Codex：Needs setup" });
+    expect(button).toBeEnabled();
+    expect(button).toHaveTextContent("测试并直连");
+    fireEvent.click(button);
+    expect(onActivateApiProfile).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "api-profile" }),
+    );
   });
 
   it("lets personal OAuth profiles refresh models and join the weighted gateway pool", () => {
@@ -705,6 +983,7 @@ describe("Profiles OAuth import", () => {
             priority: 0,
             weight: 1,
             models: [],
+            codex_oauth_profile_id: null,
             health: "unknown",
             cooldown_until_ms: null,
             credential_configured: true,
@@ -724,10 +1003,7 @@ describe("Profiles OAuth import", () => {
 
     const retry = screen.getByRole("button", { name: "设为当前档案：Current OAuth" });
     expect(retry).toBeEnabled();
-    expect(retry).toHaveAttribute(
-      "title",
-      "重新应用当前档案并启动独立 ChatGPT/Codex 工作区",
-    );
+    expect(retry).toHaveAttribute("title", "重新应用当前档案并复用原 Codex 客户端状态");
     fireEvent.click(retry);
     expect(onSelect).toHaveBeenCalledWith("current-oauth");
   });
@@ -748,6 +1024,7 @@ describe("Profiles OAuth import", () => {
             priority: 0,
             weight: 1,
             models: [],
+            codex_oauth_profile_id: null,
             health: "unknown",
             cooldown_until_ms: null,
             credential_configured: true,
@@ -899,6 +1176,7 @@ describe("Profiles OAuth import", () => {
             priority: 0,
             weight: 1,
             models: [],
+            codex_oauth_profile_id: null,
             health: "unknown",
             cooldown_until_ms: null,
             credential_configured: true,
@@ -974,6 +1252,7 @@ describe("Profiles OAuth import", () => {
             priority: 0,
             weight: 1,
             models: [],
+            codex_oauth_profile_id: null,
             health: "unknown",
             cooldown_until_ms: null,
             credential_configured: true,

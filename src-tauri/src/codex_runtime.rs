@@ -41,7 +41,6 @@ const MANAGED_TASK_ARGS: [&str; 5] = ["exec", "--ephemeral", "--sandbox", "works
 const DESKTOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const DESKTOP_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_APP_CANDIDATES: [&str; 2] = ["ChatGPT", "Codex"];
-const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const OAUTH_CALLBACK_PORT: u16 = 1455;
 const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const PERSONAL_ACCESS_TOKEN_WHOAMI_URL: &str =
@@ -236,15 +235,8 @@ impl DesktopController for SystemDesktopController {
 struct SystemDesktopCredentialStore;
 impl DesktopCredentialStore for SystemDesktopCredentialStore {
     fn project(&self, codex_home: &Path, auth_json: &str) -> AppResult<()> {
-        #[cfg(target_os = "macos")]
-        {
-            write_macos_codex_keychain(codex_home, auth_json)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (codex_home, auth_json);
-            Ok(())
-        }
+        let _ = (codex_home, auth_json);
+        Ok(())
     }
 }
 
@@ -451,21 +443,6 @@ exit 1
         .map(PathBuf::from)
 }
 
-#[cfg(target_os = "macos")]
-fn write_macos_codex_keychain(codex_home: &Path, auth_json: &str) -> AppResult<()> {
-    let entry = keyring::Entry::new(CODEX_KEYCHAIN_SERVICE, &codex_keychain_account(codex_home))
-        .map_err(|_| AppError::CodexKeychainUnavailable)?;
-    entry
-        .set_password(auth_json)
-        .map_err(|_| AppError::CodexKeychainUnavailable)
-}
-
-fn codex_keychain_account(codex_home: &Path) -> String {
-    let resolved_home = fs::canonicalize(codex_home).unwrap_or_else(|_| codex_home.to_path_buf());
-    let digest = Sha256::digest(resolved_home.to_string_lossy().as_bytes());
-    format!("cli|{}", &format!("{digest:x}")[..16])
-}
-
 struct ManagedTask {
     profile_id: String,
     process: Box<dyn RuntimeProcess>,
@@ -516,7 +493,6 @@ enum CurrentProfileAttemptPhase {
     Switching,
     Activated,
     AuthFileWriteFailed,
-    CodexKeychainWriteFailed,
     DesktopRestartFailed,
     Failed,
 }
@@ -529,7 +505,6 @@ pub struct CompletedOAuthImport {
 #[derive(Debug, Clone)]
 pub enum DesktopWorkspaceLaunch {
     Fresh(String),
-    PerProfile,
     Shared,
 }
 
@@ -537,7 +512,6 @@ impl DesktopWorkspaceLaunch {
     fn mode(&self) -> DesktopWorkspaceMode {
         match self {
             Self::Fresh(_) => DesktopWorkspaceMode::Fresh,
-            Self::PerProfile => DesktopWorkspaceMode::PerProfile,
             Self::Shared => DesktopWorkspaceMode::Shared,
         }
     }
@@ -2036,7 +2010,6 @@ impl CodexRuntime {
         self.desktop_credentials.project(&home, &auth_json)?;
         let user_data_dir = match workspace {
             DesktopWorkspaceLaunch::Fresh(id) => Some(self.fresh_desktop_user_data(id)),
-            DesktopWorkspaceLaunch::PerProfile => Some(self.profile_desktop_user_data(profile_id)),
             DesktopWorkspaceLaunch::Shared => None,
         };
         if let Some(directory) = user_data_dir.as_deref() {
@@ -2056,7 +2029,6 @@ impl CodexRuntime {
         self.desktop_credentials.project(&home, auth_json)?;
         let user_data_dir = match workspace {
             DesktopWorkspaceLaunch::Fresh(id) => Some(self.fresh_desktop_user_data(id)),
-            DesktopWorkspaceLaunch::PerProfile => Some(self.profile_desktop_user_data(profile_id)),
             DesktopWorkspaceLaunch::Shared => None,
         };
         if let Some(directory) = user_data_dir.as_deref() {
@@ -2092,12 +2064,6 @@ impl CodexRuntime {
     fn profile_home(&self, id: &str) -> PathBuf {
         self.root.join("runtimes").join(id)
     }
-    fn profile_desktop_user_data(&self, id: &str) -> PathBuf {
-        self.root
-            .join("desktop-instances")
-            .join(id)
-            .join("electron")
-    }
     fn fresh_desktop_user_data(&self, id: &str) -> PathBuf {
         self.root
             .join("desktop-instances")
@@ -2107,6 +2073,10 @@ impl CodexRuntime {
     }
     pub fn quit_desktop_for_shared_switch(&self) -> AppResult<()> {
         self.desktop.quit_running()
+    }
+    pub fn restart_default_desktop_for_shared_switch(&self) -> AppResult<()> {
+        self.desktop.quit_running()?;
+        self.desktop.launch(&default_codex_home()?, None)
     }
     pub fn delete_fresh_desktop_workspace(&self, id: &str) -> AppResult<()> {
         Uuid::parse_str(id).map_err(|_| AppError::ValidationFailed)?;
@@ -2626,10 +2596,6 @@ fn current_profile_status(
             "auth_file_write_failed",
             "Codex 凭据未能写入默认 .codex/auth.json；请确认该目录可写后重试。".into(),
         ),
-        CurrentProfileAttemptPhase::CodexKeychainWriteFailed => (
-            "codex_keychain_write_failed",
-            "Codex 凭据已写入，但无法更新 macOS 的 Codex Auth 钥匙串；未启动桌面实例，请解锁钥匙串后重试。".into(),
-        ),
         CurrentProfileAttemptPhase::DesktopRestartFailed => (
             "desktop_restart_failed",
             format!("Codex 凭据已切换，但{workspace}的 ChatGPT/Codex 桌面实例未能启动；请确认应用已安装后重试。"),
@@ -2643,14 +2609,13 @@ fn current_profile_status(
         attempt_id,
         status: status.into(),
         message,
+        history_sync: None,
+        history_sync_status: None,
     }
 }
 fn desktop_switch_phase(result: AppResult<()>) -> CurrentProfileAttemptPhase {
     match result {
         Ok(()) => CurrentProfileAttemptPhase::Activated,
-        Err(AppError::CodexKeychainUnavailable) => {
-            CurrentProfileAttemptPhase::CodexKeychainWriteFailed
-        }
         Err(_) => CurrentProfileAttemptPhase::DesktopRestartFailed,
     }
 }
@@ -3065,7 +3030,6 @@ mod tests {
 
     struct RecordingDesktopCredentialStore {
         projections: Mutex<Vec<PathBuf>>,
-        fails: bool,
     }
 
     impl DesktopCredentialStore for RecordingDesktopCredentialStore {
@@ -3074,11 +3038,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(codex_home.to_path_buf());
-            if self.fails {
-                Err(AppError::CodexKeychainUnavailable)
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
     }
 
@@ -3315,11 +3275,11 @@ mod tests {
             "profile".into(),
             Some("attempt".into()),
             CurrentProfileAttemptPhase::Switching,
-            DesktopWorkspaceMode::PerProfile,
+            DesktopWorkspaceMode::Shared,
         );
         assert_eq!(status.status, "switching");
         assert!(!status.message.contains("授权"));
-        assert!(status.message.contains("档案独立工作区"));
+        assert!(status.message.contains("共享原客户端状态"));
     }
 
     #[test]
@@ -3329,7 +3289,7 @@ mod tests {
                 "profile".into(),
                 Some("attempt".into()),
                 desktop_switch_phase(Ok(())),
-                DesktopWorkspaceMode::PerProfile,
+                DesktopWorkspaceMode::Shared,
             )
             .status,
             "activated"
@@ -3343,7 +3303,7 @@ mod tests {
                 "profile".into(),
                 Some("attempt".into()),
                 CurrentProfileAttemptPhase::AuthFileWriteFailed,
-                DesktopWorkspaceMode::PerProfile,
+                DesktopWorkspaceMode::Shared,
             )
             .status,
             "auth_file_write_failed"
@@ -3351,12 +3311,11 @@ mod tests {
     }
 
     #[test]
-    fn projects_credentials_to_an_isolated_desktop_home_and_keychain_before_launching() {
+    fn projects_credentials_to_profile_home_before_launching() {
         let root = std::env::temp_dir().join(format!("codex-relay-test-{}", Uuid::new_v4()));
         let desktop = Arc::new(RecordingDesktop::default());
         let keychain = Arc::new(RecordingDesktopCredentialStore {
             projections: Mutex::new(Vec::new()),
-            fails: false,
         });
         let runtime = CodexRuntime::with_dependencies(
             root.clone(),
@@ -3378,14 +3337,9 @@ mod tests {
         };
 
         runtime
-            .launch_profile_desktop(
-                "profile-a",
-                &credential,
-                &DesktopWorkspaceLaunch::PerProfile,
-            )
+            .launch_profile_desktop("profile-a", &credential, &DesktopWorkspaceLaunch::Shared)
             .unwrap();
         let home = root.join("runtimes/profile-a");
-        let user_data = root.join("desktop-instances/profile-a/electron");
 
         assert_eq!(
             CodexOAuthCredential::from_auth_json(
@@ -3414,10 +3368,7 @@ mod tests {
             keychain.projections.lock().unwrap().as_slice(),
             std::slice::from_ref(&home)
         );
-        assert_eq!(
-            desktop.launches.lock().unwrap().as_slice(),
-            &[(home, Some(user_data))]
-        );
+        assert_eq!(desktop.launches.lock().unwrap().as_slice(), &[(home, None)]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3436,7 +3387,6 @@ mod tests {
             desktop.clone(),
             Arc::new(RecordingDesktopCredentialStore {
                 projections: Mutex::new(Vec::new()),
-                fails: false,
             }),
         );
         let credential = CodexOAuthCredential {
@@ -3475,57 +3425,6 @@ mod tests {
     }
 
     #[test]
-    fn keychain_failure_keeps_credentials_but_never_launches_the_desktop_instance() {
-        let root = std::env::temp_dir().join(format!("codex-relay-test-{}", Uuid::new_v4()));
-        let desktop = Arc::new(RecordingDesktop::default());
-        let runtime = CodexRuntime::with_dependencies(
-            root.clone(),
-            Arc::new(crate::secrets::MemorySecretStore::new()),
-            Arc::new(NoopRunner),
-            Arc::new(RecordingBrowser {
-                urls: Mutex::new(Vec::new()),
-                fails: false,
-            }),
-            desktop.clone(),
-            Arc::new(RecordingDesktopCredentialStore {
-                projections: Mutex::new(Vec::new()),
-                fails: true,
-            }),
-        );
-        let credential = CodexOAuthCredential {
-            id_token: "id".into(),
-            access_token: "access".into(),
-            refresh_token: Some("refresh".into()),
-            account_id: None,
-            last_refresh_ms: 1,
-        };
-
-        assert!(matches!(
-            runtime.launch_profile_desktop(
-                "profile-a",
-                &credential,
-                &DesktopWorkspaceLaunch::PerProfile,
-            ),
-            Err(AppError::CodexKeychainUnavailable)
-        ));
-        assert!(root.join("runtimes/profile-a/auth.json").exists());
-        assert!(desktop.launches.lock().unwrap().is_empty());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn derives_stable_distinct_keychain_accounts_for_each_codex_home() {
-        assert_eq!(
-            codex_keychain_account(Path::new("/relay/runtimes/a")),
-            codex_keychain_account(Path::new("/relay/runtimes/a"))
-        );
-        assert_ne!(
-            codex_keychain_account(Path::new("/relay/runtimes/a")),
-            codex_keychain_account(Path::new("/relay/runtimes/b"))
-        );
-    }
-
-    #[test]
     fn keeps_desktop_app_candidate_order_stable() {
         assert_eq!(DESKTOP_APP_CANDIDATES, ["ChatGPT", "Codex"]);
     }
@@ -3535,24 +3434,6 @@ mod tests {
         assert_eq!(
             desktop_switch_phase(Err(AppError::DesktopUnavailable)),
             CurrentProfileAttemptPhase::DesktopRestartFailed
-        );
-    }
-
-    #[test]
-    fn reports_keychain_failure_without_launching_a_login_prompt() {
-        assert_eq!(
-            desktop_switch_phase(Err(AppError::CodexKeychainUnavailable)),
-            CurrentProfileAttemptPhase::CodexKeychainWriteFailed
-        );
-        assert_eq!(
-            current_profile_status(
-                "profile".into(),
-                Some("attempt".into()),
-                CurrentProfileAttemptPhase::CodexKeychainWriteFailed,
-                DesktopWorkspaceMode::PerProfile,
-            )
-            .status,
-            "codex_keychain_write_failed"
         );
     }
 

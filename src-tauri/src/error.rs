@@ -53,8 +53,6 @@ pub enum AppError {
     ProfileRuntimeUnavailable,
     #[error("Codex 凭据已切换，但 ChatGPT/Codex 桌面端未能重启；请手动打开它")]
     DesktopUnavailable,
-    #[error("无法更新 macOS 的 Codex Auth 钥匙串")]
-    CodexKeychainUnavailable,
     #[error("请先选择一个已授权的 OAuth 档案，再启动受管 Codex 任务")]
     CurrentProfileRequired,
     #[error("本机会话状态暂不可读")]
@@ -90,7 +88,6 @@ impl AppError {
             Self::CodexCliMissing => "codex_cli_missing",
             Self::ProfileRuntimeUnavailable => "profile_runtime_unavailable",
             Self::DesktopUnavailable => "desktop_unavailable",
-            Self::CodexKeychainUnavailable => "codex_keychain_unavailable",
             Self::CurrentProfileRequired => "current_profile_required",
             Self::LocalStateUnavailable => "local_state_unavailable",
             Self::Internal => "internal",

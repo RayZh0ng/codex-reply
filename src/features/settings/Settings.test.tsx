@@ -4,9 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Settings } from "./Settings";
 
 describe("Settings", () => {
-  it("changes the desktop workspace mode and restores or removes fresh workspaces", () => {
-    const changeMode = vi.fn().mockResolvedValue(undefined);
-    const restore = vi.fn().mockResolvedValue(undefined);
+  it("removes workspace mode settings and keeps legacy workspace cleanup", () => {
     const remove = vi.fn();
     const changeTheme = vi.fn();
     const changeUpdateSettings = vi.fn().mockResolvedValue(undefined);
@@ -14,7 +12,6 @@ describe("Settings", () => {
     const installUpdate = vi.fn().mockResolvedValue(undefined);
     render(
       <Settings
-        settings={{ mode: "per_profile" }}
         workspaces={[
           {
             id: "workspace-1",
@@ -78,20 +75,22 @@ describe("Settings", () => {
         updateStatus={null}
         updateBusy={false}
         updateProgress={null}
-        onChangeMode={changeMode}
         onThemePreferenceChange={changeTheme}
         onChangeUpdateSettings={changeUpdateSettings}
         onCheckUpdate={checkUpdate}
         onInstallUpdate={installUpdate}
         onRefreshCodexEnvironment={vi.fn().mockResolvedValue(undefined)}
         onInstallCodexEnvironment={vi.fn().mockResolvedValue(undefined)}
-        onRestore={restore}
         onDelete={remove}
       />,
     );
 
-    fireEvent.click(screen.getByRole("radio", { name: /共享原客户端状态/ }));
-    expect(changeMode).toHaveBeenCalledWith("shared");
+    expect(
+      screen.queryByRole("heading", { name: "工作区模式" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("radio", { name: /共享原客户端状态/ }),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("radio", { name: "深色" }));
     expect(changeTheme).toHaveBeenCalledWith("dark");
     fireEvent.click(screen.getByRole("radio", { name: /Beta 版/ }));
@@ -109,16 +108,19 @@ describe("Settings", () => {
     expect(checkUpdate).toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "安装并重启" }));
     expect(installUpdate).toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "恢复" }));
-    expect(restore).toHaveBeenCalledWith("workspace-1");
-    fireEvent.click(screen.getByRole("button", { name: "删除 个人账号 的工作区" }));
+    expect(
+      screen.getByRole("heading", { name: "旧独立工作区清理" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "恢复" })).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "删除 个人账号 的旧独立工作区" }),
+    );
     expect(remove).toHaveBeenCalledWith("workspace-1", "个人账号");
   });
 
   it("renders cross-platform environment health, warnings, failures and install logs", () => {
     render(
       <Settings
-        settings={{ mode: "shared" }}
         workspaces={[]}
         codexEnvironment={{
           platform: "linux",
@@ -215,14 +217,12 @@ describe("Settings", () => {
         updateStatus={null}
         updateBusy={false}
         updateProgress={null}
-        onChangeMode={vi.fn().mockResolvedValue(undefined)}
         onThemePreferenceChange={vi.fn()}
         onChangeUpdateSettings={vi.fn().mockResolvedValue(undefined)}
         onCheckUpdate={vi.fn().mockResolvedValue(undefined)}
         onInstallUpdate={vi.fn().mockResolvedValue(undefined)}
         onRefreshCodexEnvironment={vi.fn().mockResolvedValue(undefined)}
         onInstallCodexEnvironment={vi.fn().mockResolvedValue(undefined)}
-        onRestore={vi.fn().mockResolvedValue(undefined)}
         onDelete={vi.fn()}
       />,
     );
@@ -240,7 +240,6 @@ describe("Settings", () => {
 
   it("renders determinate and indeterminate update progress states", () => {
     const baseProps = {
-      settings: { mode: "per_profile" as const },
       workspaces: [],
       codexEnvironment: null,
       codexEnvironmentInstall: null,
@@ -257,14 +256,12 @@ describe("Settings", () => {
       },
       updateStatus: null,
       updateBusy: true,
-      onChangeMode: vi.fn().mockResolvedValue(undefined),
       onThemePreferenceChange: vi.fn(),
       onChangeUpdateSettings: vi.fn().mockResolvedValue(undefined),
       onCheckUpdate: vi.fn().mockResolvedValue(undefined),
       onInstallUpdate: vi.fn().mockResolvedValue(undefined),
       onRefreshCodexEnvironment: vi.fn().mockResolvedValue(undefined),
       onInstallCodexEnvironment: vi.fn().mockResolvedValue(undefined),
-      onRestore: vi.fn().mockResolvedValue(undefined),
       onDelete: vi.fn(),
     };
 
@@ -321,7 +318,6 @@ describe("Settings", () => {
 
   it("renders installing and failed update progress states", () => {
     const props = {
-      settings: { mode: "per_profile" as const },
       workspaces: [],
       codexEnvironment: null,
       codexEnvironmentInstall: null,
@@ -332,14 +328,12 @@ describe("Settings", () => {
       availableUpdate: null,
       updateStatus: null,
       updateBusy: true,
-      onChangeMode: vi.fn().mockResolvedValue(undefined),
       onThemePreferenceChange: vi.fn(),
       onChangeUpdateSettings: vi.fn().mockResolvedValue(undefined),
       onCheckUpdate: vi.fn().mockResolvedValue(undefined),
       onInstallUpdate: vi.fn().mockResolvedValue(undefined),
       onRefreshCodexEnvironment: vi.fn().mockResolvedValue(undefined),
       onInstallCodexEnvironment: vi.fn().mockResolvedValue(undefined),
-      onRestore: vi.fn().mockResolvedValue(undefined),
       onDelete: vi.fn(),
     };
 

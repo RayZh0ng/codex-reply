@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const GATEWAY_CODEX_CLIENT_KEY_REF_SETTING: &str = "gateway_codex_client_key_ref";
+pub const GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING: &str = "gateway_codex_direct_profile_id";
 pub const GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING: &str = "gateway_codex_oauth_profile_id";
 pub const APP_UPDATE_STABLE_ENDPOINT: &str =
     "https://github.com/RayZh0ng/codex-reply/releases/download/updater/stable.json";
@@ -174,6 +175,7 @@ pub struct MaskedProfile {
     pub credential_configured: bool,
     #[serde(default)]
     pub auth_mode: CodexAuthMode,
+    pub codex_oauth_profile_id: Option<String>,
     pub is_current: bool,
     pub account: Option<ProfileAccountSummary>,
 }
@@ -312,6 +314,8 @@ pub struct CreateProfileInput {
     pub models: Vec<String>,
     #[serde(default)]
     pub model_mappings: Vec<GatewayModelMapping>,
+    #[serde(default)]
+    pub codex_oauth_profile_id: Option<String>,
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
@@ -328,6 +332,8 @@ pub struct CreateApiServiceProfileInput {
     pub api_key: String,
     #[serde(default)]
     pub model_mappings: Vec<GatewayModelMapping>,
+    #[serde(default)]
+    pub codex_oauth_profile_id: Option<String>,
     #[serde(default)]
     pub in_pool: bool,
     #[serde(default)]
@@ -447,6 +453,8 @@ pub struct UpdateProfileInput {
     pub models: Vec<String>,
     #[serde(default)]
     pub model_mappings: Option<Vec<GatewayModelMapping>>,
+    #[serde(default)]
+    pub codex_oauth_profile_id: Option<Option<String>>,
     pub api_key: Option<String>,
 }
 
@@ -525,15 +533,20 @@ pub struct GatewayNetworkAddress {
 #[derive(Debug, Clone, Serialize)]
 pub struct GatewayCodexConfigStatus {
     pub enabled: bool,
+    pub mode: String,
     pub config_path: String,
     pub service_url: Option<String>,
     pub message: String,
     pub auth_status: String,
     pub needs_repair: bool,
+    pub direct_profile_id: Option<String>,
+    pub direct_profile_alias: Option<String>,
     pub oauth_profile_id: Option<String>,
     pub oauth_profile_alias: Option<String>,
     pub oauth_profile_available: bool,
     pub oauth_profile_options: Vec<GatewayOAuthProfileOption>,
+    pub history_sync: Option<CodexHistorySyncReport>,
+    pub history_sync_status: Option<CodexHistoryTransitionStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -859,6 +872,172 @@ pub struct CodexSessionEvent {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryReport {
+    pub scanned_at_ms: i64,
+    pub limit: usize,
+    pub offset: usize,
+    pub total_sessions: usize,
+    pub selected_project_id: Option<String>,
+    pub projects: Vec<CodexHistoryProjectSummary>,
+    pub homes: Vec<CodexHistoryHomeSummary>,
+    pub sessions: Vec<CodexHistorySessionSummary>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListCodexHistoryInput {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryProjectSummary {
+    pub id: String,
+    pub name: String,
+    pub cwd: Option<String>,
+    pub session_count: usize,
+    pub consistent_count: usize,
+    pub missing_count: usize,
+    pub conflict_count: usize,
+    pub needs_repair_count: usize,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryHomeSummary {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub path: String,
+    pub sync_target: bool,
+    pub session_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistorySessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub updated_at_ms: i64,
+    pub status: String,
+    pub source_count: usize,
+    pub missing_target_count: usize,
+    pub divergent_source_count: usize,
+    pub sources: Vec<CodexHistorySourceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistorySourceSummary {
+    pub home_id: String,
+    pub home_label: String,
+    pub home_kind: String,
+    pub rollout_path: String,
+    pub archived: bool,
+    pub updated_at_ms: i64,
+    pub event_count: usize,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistorySyncReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub homes_scanned: usize,
+    pub sessions_seen: usize,
+    pub sessions_synced: usize,
+    pub files_written: usize,
+    pub files_backed_up: usize,
+    pub metadata_rebuilt: usize,
+    pub warnings: Vec<String>,
+}
+
+pub const CODEX_HISTORY_SYNC_FINISHED_EVENT: &str = "codex-history-sync-finished";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexHistoryTransitionStatus {
+    pub status: String,
+    pub message: String,
+    pub queued_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncCodexHistoryInput {
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteCodexHistoryInput {
+    pub scope: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportCodexHistoryInput {
+    pub scope: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    pub project_id: Option<String>,
+    pub destination_path: String,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportCodexHistoryInput {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryMutationReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub sessions_affected: usize,
+    pub files_removed: usize,
+    pub files_backed_up: usize,
+    pub metadata_updated: usize,
+    pub metadata_rebuilt: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryExportReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub sessions_exported: usize,
+    pub files_exported: usize,
+    pub destination_path: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryImportReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub sessions_imported: usize,
+    pub files_written: usize,
+    pub files_backed_up: usize,
+    pub metadata_rebuilt: usize,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListCodexSessionsInput {
     pub binding_id: Option<String>,
@@ -910,6 +1089,8 @@ pub struct CurrentProfileActivation {
     pub attempt_id: Option<String>,
     pub status: String,
     pub message: String,
+    pub history_sync: Option<CodexHistorySyncReport>,
+    pub history_sync_status: Option<CodexHistoryTransitionStatus>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

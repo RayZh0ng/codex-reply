@@ -152,8 +152,8 @@ function ManagedTaskCard({
       )}
       <p className="managed-task-note">
         任务仅控制由 Relay 启动的 CLI 子进程。切换当前档案会投影已保存的凭据到默认
-        .codex/auth.json，并启动{workspaceModeLabel(snapshot.workspace_mode)}
-        ；不会再次打开 OAuth，也不会迁移 ChatGPT Chat/Work 会话。
+        .codex/auth.json，并复用原 Codex
+        客户端数据目录，保留本机聊天记录、记忆、设置与状态。
       </p>
     </article>
   );
@@ -167,14 +167,6 @@ function taskPhaseLabel(phase: ManagedTaskStatus["phase"]) {
     cancelled: "已停止",
     running: "运行中",
   }[phase];
-}
-
-function workspaceModeLabel(mode: DashboardSnapshot["workspace_mode"]) {
-  return {
-    fresh: "本次全新 ChatGPT/Codex 工作区",
-    per_profile: "档案专属的 ChatGPT/Codex 工作区",
-    shared: "共享原客户端状态的 ChatGPT/Codex",
-  }[mode];
 }
 
 export function Dashboard({

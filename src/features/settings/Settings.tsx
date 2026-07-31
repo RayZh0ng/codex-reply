@@ -1,4 +1,3 @@
-import { ArrowCounterClockwise } from "@phosphor-icons/react/ArrowCounterClockwise";
 import { Browser } from "@phosphor-icons/react/Browser";
 import { CheckCircle } from "@phosphor-icons/react/CheckCircle";
 import { Desktop } from "@phosphor-icons/react/Desktop";
@@ -19,33 +18,8 @@ import {
   type CodexEnvironmentInstallReport,
   type CodexEnvironmentReport,
   type DesktopWorkspaceHistoryItem,
-  type DesktopWorkspaceMode,
-  type DesktopWorkspaceSettings,
 } from "../../shared/ipc";
 import type { ThemePreference } from "../../shared/theme";
-
-const modes: Array<{
-  mode: DesktopWorkspaceMode;
-  title: string;
-  detail: string;
-}> = [
-  {
-    mode: "fresh",
-    title: "每次全新启动",
-    detail: "每次切换创建空白工作区并保留，可从下方历史记录恢复。",
-  },
-  {
-    mode: "per_profile",
-    title: "账号独立工作区",
-    detail: "每个 Relay 档案使用固定工作区，保留各自的客户端会话、状态与设置。",
-  },
-  {
-    mode: "shared",
-    title: "共享原客户端状态",
-    detail:
-      "使用原有 ChatGPT/Codex 数据目录，保留已保存的本地客户端状态。切换前会请求关闭客户端。",
-  },
-];
 
 const themes: Array<{
   value: ThemePreference;
@@ -75,7 +49,6 @@ const updateChannels: Array<{
 ];
 
 interface SettingsProps {
-  settings: DesktopWorkspaceSettings;
   workspaces: DesktopWorkspaceHistoryItem[];
   busy: boolean;
   themePreference: ThemePreference;
@@ -87,19 +60,16 @@ interface SettingsProps {
   codexEnvironment: CodexEnvironmentReport | null;
   codexEnvironmentInstall: CodexEnvironmentInstallReport | null;
   codexEnvironmentBusy: boolean;
-  onChangeMode: (mode: DesktopWorkspaceMode) => Promise<void>;
   onThemePreferenceChange: (preference: ThemePreference) => void;
   onChangeUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
   onCheckUpdate: () => Promise<void>;
   onInstallUpdate: () => Promise<void>;
   onRefreshCodexEnvironment: () => Promise<void>;
   onInstallCodexEnvironment: () => Promise<void>;
-  onRestore: (id: string) => Promise<void>;
   onDelete: (id: string, alias: string) => void;
 }
 
 export function Settings({
-  settings,
   workspaces,
   busy,
   themePreference,
@@ -111,14 +81,12 @@ export function Settings({
   codexEnvironment,
   codexEnvironmentInstall,
   codexEnvironmentBusy,
-  onChangeMode,
   onThemePreferenceChange,
   onChangeUpdateSettings,
   onCheckUpdate,
   onInstallUpdate,
   onRefreshCodexEnvironment,
   onInstallCodexEnvironment,
-  onRestore,
   onDelete,
 }: SettingsProps) {
   const installableMissingIds = new Set(
@@ -410,50 +378,15 @@ export function Settings({
           </button>
         </div>
       </section>
-      <div className="section-heading compact-section-heading">
-        <div>
-          <h2>工作区模式</h2>
-          <p>选择切换档案时桌面客户端使用的本机状态。</p>
-        </div>
-      </div>
-      <section
-        className="workspace-mode-grid"
-        data-animate="cards"
-        aria-label="桌面工作区模式"
-      >
-        {modes.map((option) => (
-          <label
-            className={`workspace-mode-card ${settings.mode === option.mode ? "selected" : ""}`}
-            key={option.mode}
-          >
-            <input
-              checked={settings.mode === option.mode}
-              disabled={busy}
-              name="workspace-mode"
-              onChange={() => void onChangeMode(option.mode)}
-              type="radio"
-              value={option.mode}
-            />
-            <strong>{option.title}</strong>
-            <span>{option.detail}</span>
-          </label>
-        ))}
-      </section>
-      {settings.mode === "shared" && (
-        <article className="privacy-banner contextual-notice" data-animate="notice">
-          <Warning size={20} weight="fill" />
-          <div>
-            <strong>共享模式只复用原客户端的本机状态</strong>
-            <p>账号 Cookie、钥匙串、云端聊天与记忆不会在档案之间迁移。</p>
-          </div>
-        </article>
-      )}
       <section className="surface-card workspace-history">
         <div className="card-heading">
           <div>
-            <h2>全新工作区历史</h2>
+            <h2>旧独立工作区清理</h2>
           </div>
         </div>
+        <p className="muted-copy">
+          已取消独立工作区模式。这里仅列出历史遗留的全新工作区，可按需清理其本地客户端数据。
+        </p>
         {workspaces.length ? (
           <ul>
             {workspaces.map((workspace) => (
@@ -467,17 +400,9 @@ export function Settings({
                 </div>
                 <div className="workspace-history-actions">
                   <button
-                    className="quiet-button"
-                    disabled={busy || workspace.profile_alias === "已删除档案"}
-                    onClick={() => void onRestore(workspace.id)}
-                    type="button"
-                  >
-                    <ArrowCounterClockwise size={17} /> 恢复
-                  </button>
-                  <button
                     className="icon-button danger"
                     disabled={busy}
-                    aria-label={`删除 ${workspace.profile_alias} 的工作区`}
+                    aria-label={`删除 ${workspace.profile_alias} 的旧独立工作区`}
                     onClick={() => onDelete(workspace.id, workspace.profile_alias)}
                     type="button"
                   >
@@ -488,9 +413,7 @@ export function Settings({
             ))}
           </ul>
         ) : (
-          <p className="muted-copy">
-            选择“每次全新启动”并切换账号后，保存的工作区会显示在这里。
-          </p>
+          <p className="muted-copy">当前没有可清理的旧独立工作区。</p>
         )}
       </section>
     </div>

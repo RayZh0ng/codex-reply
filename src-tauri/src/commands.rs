@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
@@ -22,31 +22,36 @@ use uuid::Uuid;
 use crate::{
     codex_environment, codex_gateway,
     codex_runtime::{CodexRuntime, DesktopWorkspaceLaunch},
+    codex_session_history,
     collaboration::CollaborationManager,
     database::Repository,
     domain::{
         AppUpdateChannel, AppUpdateInfo, AppUpdateProgressEvent, AppUpdateProgressPhase,
         AppUpdateSettings, CancelCodexSessionInput, CancelManagedTaskInput, CheckAppUpdateInput,
         ClientKeySecretInput, CodexAuthMode, CodexEnvironmentInstallReport, CodexEnvironmentReport,
+        CodexHistoryExportReport, CodexHistoryImportReport, CodexHistoryMutationReport,
+        CodexHistoryReport, CodexHistorySyncReport, CodexHistoryTransitionStatus,
         CodexSessionSummary, CollaborationCallbackStatus, CollaborationContextSummary,
         CollaborationProjectBinding, CollaborationProvider, CommitJsonProfileImportInput,
         CompleteOAuthImportInput, ContinueCodexSessionInput, CreateApiServiceProfileInput,
         CreateClientKeyInput, CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
-        CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCollaborationBotInput,
-        DeleteCollaborationProjectBindingInput, DeleteDesktopWorkspaceInput, DeleteFeishuBotInput,
-        DeleteFeishuProjectBindingInput, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
-        DesktopWorkspaceSettings, DiscardJsonProfileImportInput, FeishuProjectBinding,
-        GatewayCodexConfigStatus, GatewayStatus, InstallAppUpdateInput,
+        CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCodexHistoryInput,
+        DeleteCollaborationBotInput, DeleteCollaborationProjectBindingInput,
+        DeleteDesktopWorkspaceInput, DeleteFeishuBotInput, DeleteFeishuProjectBindingInput,
+        DesktopWorkspaceHistoryItem, DesktopWorkspaceSettings, DiscardJsonProfileImportInput,
+        ExportCodexHistoryInput, FeishuProjectBinding, GatewayCodexConfigStatus, GatewayProvider,
+        GatewayStatus, GatewayWireApi, ImportCodexHistoryInput, InstallAppUpdateInput,
         InstallCodexEnvironmentInput, JsonProfileImportPreview, JsonProfileImportResult,
-        ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey, MaskedCollaborationBot,
-        MaskedFeishuBot, MaskedProfile, OAuthImportStatus, PreviewJsonProfileImportInput,
-        ProfileQuotaRefreshReport, ResetCollaborationContextInput, RestoreDesktopWorkspaceInput,
-        RetryJsonProfileImportInput, SelectCurrentProfileInput, SetCodexGatewayOAuthProfileInput,
-        StartManagedTaskInput, StartOAuthImportInput, TestApiServiceInput,
-        UpdateAppUpdateSettingsInput, UpdateCollaborationContextInput,
-        UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput, UpdateProfileInput,
-        UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput, UpsertFeishuBotInput,
-        UpsertFeishuProjectBindingInput, APP_UPDATE_PROGRESS_EVENT,
+        ListCodexHistoryInput, ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey,
+        MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile, OAuthImportStatus,
+        PreviewJsonProfileImportInput, ProfileQuotaRefreshReport, ResetCollaborationContextInput,
+        RestoreDesktopWorkspaceInput, RetryJsonProfileImportInput, SelectCurrentProfileInput,
+        SetCodexGatewayOAuthProfileInput, StartManagedTaskInput, StartOAuthImportInput,
+        SyncCodexHistoryInput, TestApiServiceInput, UpdateAppUpdateSettingsInput,
+        UpdateCollaborationContextInput, UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput,
+        UpdateProfileInput, UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput,
+        UpsertFeishuBotInput, UpsertFeishuProjectBindingInput, APP_UPDATE_PROGRESS_EVENT,
+        CODEX_HISTORY_SYNC_FINISHED_EVENT,
     },
     error::{AppError, AppResult},
     gateway::{
@@ -66,6 +71,8 @@ pub struct AppState {
     pub runtime: Arc<CodexRuntime>,
     pub collaboration: Arc<CollaborationManager>,
     pub quota_refresh_lock: tokio::sync::Mutex<()>,
+    pub history_sync_lock: Arc<tokio::sync::Mutex<()>>,
+    pub history_transition_status: Arc<Mutex<Option<CodexHistoryTransitionStatus>>>,
     pub(crate) oauth_credentials: Arc<OAuthCredentialStore>,
     pub json_imports: crate::profile_import::JsonProfileImportStore,
 }
@@ -84,6 +91,89 @@ pub fn dashboard_snapshot(state: State<'_, AppState>) -> AppResult<DashboardSnap
         workspace_mode: state.repository.desktop_workspace_mode()?,
         collaboration: state.repository.collaboration_summary()?,
     })
+}
+
+#[tauri::command]
+pub async fn list_codex_history(
+    input: Option<ListCodexHistoryInput>,
+    state: State<'_, AppState>,
+) -> AppResult<CodexHistoryReport> {
+    let repository = Arc::clone(&state.repository);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_session_history::list_codex_history(
+            repository.as_ref(),
+            &data_dir,
+            input.unwrap_or_default(),
+        )
+    })
+    .await
+    .map_err(|_| AppError::Internal)?
+}
+
+#[tauri::command]
+pub async fn sync_codex_history(
+    input: SyncCodexHistoryInput,
+    state: State<'_, AppState>,
+) -> AppResult<CodexHistorySyncReport> {
+    if !input.confirmed {
+        return Err(AppError::ConfirmationRequired);
+    }
+    sync_codex_history_locked(state.inner(), None).await
+}
+
+#[tauri::command]
+pub async fn delete_codex_history(
+    input: DeleteCodexHistoryInput,
+    state: State<'_, AppState>,
+) -> AppResult<CodexHistoryMutationReport> {
+    if !input.confirmed {
+        return Err(AppError::ConfirmationRequired);
+    }
+    let _guard = state.history_sync_lock.lock().await;
+    let repository = Arc::clone(&state.repository);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_session_history::delete_codex_history(repository.as_ref(), &data_dir, input)
+    })
+    .await
+    .map_err(|_| AppError::Internal)?
+}
+
+#[tauri::command]
+pub async fn export_codex_history(
+    input: ExportCodexHistoryInput,
+    state: State<'_, AppState>,
+) -> AppResult<CodexHistoryExportReport> {
+    if !input.confirmed {
+        return Err(AppError::ConfirmationRequired);
+    }
+    let _guard = state.history_sync_lock.lock().await;
+    let repository = Arc::clone(&state.repository);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_session_history::export_codex_history(repository.as_ref(), &data_dir, input)
+    })
+    .await
+    .map_err(|_| AppError::Internal)?
+}
+
+#[tauri::command]
+pub async fn import_codex_history(
+    input: ImportCodexHistoryInput,
+    state: State<'_, AppState>,
+) -> AppResult<CodexHistoryImportReport> {
+    if !input.confirmed {
+        return Err(AppError::ConfirmationRequired);
+    }
+    let _guard = state.history_sync_lock.lock().await;
+    let repository = Arc::clone(&state.repository);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_session_history::import_codex_history(repository.as_ref(), &data_dir, input)
+    })
+    .await
+    .map_err(|_| AppError::Internal)?
 }
 
 #[tauri::command]
@@ -314,28 +404,17 @@ pub async fn delete_profile(
 pub async fn select_current_profile(
     input: SelectCurrentProfileInput,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> AppResult<CurrentProfileActivation> {
-    let mode = state.repository.desktop_workspace_mode()?;
-    if mode == DesktopWorkspaceMode::Shared && !input.confirmed_desktop_restart {
-        return Err(AppError::ConfirmationRequired);
-    }
+    let workspace = desktop_workspace_for_current_profile_selection(&input)?;
     let profile = state.repository.profile(&input.id)?;
+    let profile_id = profile.profile.id.clone();
+    let target_home = state.data_dir.join("runtimes").join(&profile_id);
+    let auth_before = auth_json_fingerprint(&target_home);
     let credential = active_profile_credential(state.inner(), &profile).await?;
-    if mode == DesktopWorkspaceMode::Shared {
-        state.runtime.quit_desktop_for_shared_switch()?;
-    }
-    let workspace = match mode {
-        DesktopWorkspaceMode::Fresh => {
-            let workspace_id = Uuid::new_v4().to_string();
-            state
-                .repository
-                .create_desktop_workspace(&workspace_id, &input.id, now_ms())?;
-            DesktopWorkspaceLaunch::Fresh(workspace_id)
-        }
-        DesktopWorkspaceMode::PerProfile => DesktopWorkspaceLaunch::PerProfile,
-        DesktopWorkspaceMode::Shared => DesktopWorkspaceLaunch::Shared,
-    };
-    let activation = match credential {
+    codex_gateway::restore_official_config(&state.repository, state.secrets.clone()).await?;
+    state.runtime.quit_desktop_for_shared_switch()?;
+    let mut activation = match credential {
         ActiveProfileCredential::OAuth(credential) => state
             .runtime
             .activate_profile(profile, credential, workspace)?,
@@ -343,7 +422,252 @@ pub async fn select_current_profile(
             .runtime
             .activate_profile_auth_json(profile, auth_json, workspace)?,
     };
+    let history_sync_status =
+        queue_codex_history_transition_sync(state.inner(), &app, Some(target_home), auth_before);
+    activation.message = append_history_transition_status(activation.message, &history_sync_status);
+    activation.history_sync_status = Some(history_sync_status);
     Ok(activation)
+}
+
+fn desktop_workspace_for_current_profile_selection(
+    input: &SelectCurrentProfileInput,
+) -> AppResult<DesktopWorkspaceLaunch> {
+    if !input.confirmed_desktop_restart {
+        return Err(AppError::ConfirmationRequired);
+    }
+    Ok(DesktopWorkspaceLaunch::Shared)
+}
+
+async fn sync_codex_history_locked(
+    state: &AppState,
+    priority_home: Option<PathBuf>,
+) -> AppResult<CodexHistorySyncReport> {
+    let _guard = state.history_sync_lock.lock().await;
+    let repository = Arc::clone(&state.repository);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if priority_home.is_some() {
+            codex_session_history::sync_codex_history_prioritized_home(
+                repository.as_ref(),
+                &data_dir,
+                priority_home.as_deref(),
+            )
+        } else {
+            codex_session_history::sync_codex_history(repository.as_ref(), &data_dir)
+        }
+    })
+    .await
+    .map_err(|_| AppError::Internal)?
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthFileFingerprint {
+    modified_at_ms: Option<i64>,
+    len: u64,
+}
+
+fn queue_codex_history_transition_sync(
+    state: &AppState,
+    app: &AppHandle,
+    target_home: Option<PathBuf>,
+    target_auth_before: Option<AuthFileFingerprint>,
+) -> CodexHistoryTransitionStatus {
+    let queued_at_ms = now_ms();
+    let queued = CodexHistoryTransitionStatus {
+        status: "queued".to_owned(),
+        message: "Codex 会话历史已排队后台恢复，切换不会等待完整扫描。".to_owned(),
+        queued_at_ms,
+        completed_at_ms: None,
+        warnings: Vec::new(),
+    };
+    set_history_transition_status(state, queued.clone());
+
+    let repository = Arc::clone(&state.repository);
+    let data_dir = state.data_dir.clone();
+    let history_sync_lock = Arc::clone(&state.history_sync_lock);
+    let transition_status = Arc::clone(&state.history_transition_status);
+    let app = app.clone();
+    let priority_home = target_home.clone();
+
+    tauri::async_runtime::spawn(async move {
+        set_history_transition_status_arc(
+            &transition_status,
+            CodexHistoryTransitionStatus {
+                status: "running".to_owned(),
+                message: "Codex 会话历史正在后台恢复。".to_owned(),
+                queued_at_ms,
+                completed_at_ms: None,
+                warnings: Vec::new(),
+            },
+        );
+
+        let mut wait_warnings = Vec::new();
+        if let Some(home) = target_home.as_deref() {
+            wait_for_target_auth_json(home, target_auth_before, queued_at_ms, &mut wait_warnings)
+                .await;
+        }
+
+        let result = {
+            let _guard = history_sync_lock.lock().await;
+            let repository = Arc::clone(&repository);
+            let data_dir = data_dir.clone();
+            let priority_home = priority_home.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                codex_session_history::sync_codex_history_prioritized_home(
+                    repository.as_ref(),
+                    &data_dir,
+                    priority_home.as_deref(),
+                )
+            })
+            .await
+            .map_err(|_| AppError::Internal)
+            .and_then(|result| result)
+        };
+
+        let finished =
+            history_transition_status_from_sync_result(queued_at_ms, result, wait_warnings);
+        set_history_transition_status_arc(&transition_status, finished.clone());
+        let _ = app.emit(CODEX_HISTORY_SYNC_FINISHED_EVENT, finished);
+    });
+
+    queued
+}
+
+fn append_history_transition_status(
+    message: String,
+    status: &CodexHistoryTransitionStatus,
+) -> String {
+    format!("{message} {}", status.message)
+}
+
+fn set_history_transition_status(state: &AppState, status: CodexHistoryTransitionStatus) {
+    set_history_transition_status_arc(&state.history_transition_status, status);
+}
+
+fn set_history_transition_status_arc(
+    transition_status: &Arc<Mutex<Option<CodexHistoryTransitionStatus>>>,
+    status: CodexHistoryTransitionStatus,
+) {
+    if let Ok(mut current) = transition_status.lock() {
+        let should_update = match current.as_ref() {
+            Some(existing) => status.queued_at_ms >= existing.queued_at_ms,
+            None => true,
+        };
+        if should_update {
+            *current = Some(status);
+        }
+    }
+}
+
+fn latest_history_transition_status(state: &AppState) -> Option<CodexHistoryTransitionStatus> {
+    state
+        .history_transition_status
+        .lock()
+        .ok()
+        .and_then(|current| current.clone())
+}
+
+async fn wait_for_target_auth_json(
+    target_home: &std::path::Path,
+    before: Option<AuthFileFingerprint>,
+    queued_at_ms: i64,
+    warnings: &mut Vec<String>,
+) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        if auth_json_ready_for_transition(target_home, before.as_ref(), queued_at_ms) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    warnings.push(format!(
+        "{} auth.json 未在后台同步前确认更新，已继续同步。",
+        target_home.display()
+    ));
+}
+
+fn auth_json_ready_for_transition(
+    target_home: &std::path::Path,
+    before: Option<&AuthFileFingerprint>,
+    queued_at_ms: i64,
+) -> bool {
+    let Some(current) = auth_json_fingerprint(target_home) else {
+        return false;
+    };
+    let Some(before) = before else {
+        return true;
+    };
+    if current.len != before.len {
+        return true;
+    }
+    match (current.modified_at_ms, before.modified_at_ms) {
+        (Some(current_modified), Some(before_modified)) if current_modified > before_modified => {
+            true
+        }
+        (Some(current_modified), None) => current_modified >= queued_at_ms.saturating_sub(1_000),
+        _ => false,
+    }
+}
+
+fn auth_json_fingerprint(home: &std::path::Path) -> Option<AuthFileFingerprint> {
+    let metadata = std::fs::metadata(home.join("auth.json")).ok()?;
+    Some(AuthFileFingerprint {
+        modified_at_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|modified| system_time_to_ms(modified).ok()),
+        len: metadata.len(),
+    })
+}
+
+fn system_time_to_ms(value: SystemTime) -> AppResult<i64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(i64::MAX))
+        .map_err(|_| AppError::Internal)
+}
+
+fn history_transition_status_from_sync_result(
+    queued_at_ms: i64,
+    result: AppResult<CodexHistorySyncReport>,
+    mut warnings: Vec<String>,
+) -> CodexHistoryTransitionStatus {
+    let completed_at_ms = Some(now_ms());
+    match result {
+        Ok(report) => {
+            warnings.extend(report.warnings);
+            let status = if warnings.is_empty() {
+                "completed"
+            } else {
+                "warning"
+            };
+            let message = if warnings.is_empty() {
+                "Codex 会话历史已在后台恢复。".to_owned()
+            } else {
+                format!(
+                    "Codex 会话历史已在后台恢复，{} 项需要在会话页复查。",
+                    warnings.len()
+                )
+            };
+            CodexHistoryTransitionStatus {
+                status: status.to_owned(),
+                message,
+                queued_at_ms,
+                completed_at_ms,
+                warnings,
+            }
+        }
+        Err(error) => {
+            warnings.push(error.to_string());
+            CodexHistoryTransitionStatus {
+                status: "warning".to_owned(),
+                message: "Codex 会话历史后台恢复未完成，可在会话页手动同步/修复。".to_owned(),
+                queued_at_ms,
+                completed_at_ms,
+                warnings,
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -361,7 +685,9 @@ pub fn update_desktop_workspace_settings(
     state: State<'_, AppState>,
 ) -> AppResult<DesktopWorkspaceSettings> {
     state.repository.set_desktop_workspace_mode(&input.mode)?;
-    Ok(DesktopWorkspaceSettings { mode: input.mode })
+    Ok(DesktopWorkspaceSettings {
+        mode: state.repository.desktop_workspace_mode()?,
+    })
 }
 
 #[tauri::command]
@@ -643,10 +969,15 @@ pub fn current_profile_activation_status(
     input: CurrentProfileActivationStatusInput,
     state: State<'_, AppState>,
 ) -> AppResult<CurrentProfileActivation> {
-    let activation = state
+    let mut activation = state
         .runtime
         .current_profile_activation_status(&input.attempt_id)?;
     persist_current_profile_if_activated(&state.repository, &activation)?;
+    if let Some(history_sync_status) = latest_history_transition_status(state.inner()) {
+        activation.message =
+            append_history_transition_status(activation.message, &history_sync_status);
+        activation.history_sync_status = Some(history_sync_status);
+    }
     Ok(activation)
 }
 
@@ -780,22 +1111,35 @@ pub async fn codex_gateway_config_status(
 #[tauri::command]
 pub async fn enable_codex_gateway(
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> AppResult<GatewayCodexConfigStatus> {
-    codex_gateway::enable(
+    let gateway_status = gateway_ready_for_codex_switch(state.inner()).await?;
+    let mut status = codex_gateway::enable(
         &state.repository,
         state.secrets.clone(),
         state.oauth_credentials.clone(),
-        state.gateway.status()?,
+        gateway_status,
         &state.data_dir,
     )
-    .await
+    .await?;
+    let history_sync_status = queue_codex_history_transition_sync(state.inner(), &app, None, None);
+    status.message = append_history_transition_status(status.message, &history_sync_status);
+    status.history_sync_status = Some(history_sync_status);
+    append_shared_desktop_restart_result(state.inner(), &mut status);
+    Ok(status)
 }
 
 #[tauri::command]
 pub async fn disable_codex_gateway(
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> AppResult<GatewayCodexConfigStatus> {
-    codex_gateway::disable(&state.repository, state.secrets.clone()).await
+    let mut status = codex_gateway::disable(&state.repository, state.secrets.clone()).await?;
+    let history_sync_status = queue_codex_history_transition_sync(state.inner(), &app, None, None);
+    status.message = append_history_transition_status(status.message, &history_sync_status);
+    status.history_sync_status = Some(history_sync_status);
+    append_shared_desktop_restart_result(state.inner(), &mut status);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -815,7 +1159,44 @@ pub fn list_gateway_model_options(state: State<'_, AppState>) -> AppResult<Vec<S
 pub async fn activate_api_service_profile(
     id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> AppResult<GatewayCodexConfigStatus> {
+    prepare_api_profile_for_codex_switch(&state.repository, state.secrets.clone(), &id).await?;
+    let mut status = codex_gateway::enable_api_profile(
+        &state.repository,
+        state.secrets.clone(),
+        state.oauth_credentials.clone(),
+        &id,
+        &state.data_dir,
+    )
+    .await?;
+    let history_sync_status = queue_codex_history_transition_sync(state.inner(), &app, None, None);
+    status.message = append_history_transition_status(status.message, &history_sync_status);
+    status.history_sync_status = Some(history_sync_status);
+    append_shared_desktop_restart_result(state.inner(), &mut status);
+    Ok(status)
+}
+
+async fn prepare_api_profile_for_codex_switch(
+    repository: &Repository,
+    secrets: Arc<dyn SecretStore>,
+    id: &str,
+) -> AppResult<()> {
+    let stored = repository.profile(id)?;
+    if stored.profile.kind != crate::domain::ProfileKind::ApiKey
+        || !matches!(
+            stored.profile.provider,
+            GatewayProvider::OpenAi | GatewayProvider::OpenAiCompatible
+        )
+        || stored.profile.wire_api != GatewayWireApi::Responses
+    {
+        return Err(AppError::ValidationFailed);
+    }
+    discover_profile_models(repository, secrets, id).await?;
+    Ok(())
+}
+
+async fn gateway_ready_for_codex_switch(state: &AppState) -> AppResult<GatewayStatus> {
     let mut gateway_status = state.gateway.status()?;
     if !gateway_status.running || !gateway_status.certificate_ready {
         gateway_status = state.gateway.start().await?;
@@ -824,14 +1205,19 @@ pub async fn activate_api_service_profile(
     {
         state.gateway.trust_ca_in_system_store()?;
     }
-    codex_gateway::enable_api_profile(
-        &state.repository,
-        state.secrets.clone(),
-        &id,
-        &state.data_dir,
-        gateway_status,
-    )
-    .await
+    Ok(gateway_status)
+}
+
+fn append_shared_desktop_restart_result(state: &AppState, status: &mut GatewayCodexConfigStatus) {
+    let suffix = match state.runtime.restart_default_desktop_for_shared_switch() {
+        Ok(()) => {
+            "已复用原客户端数据目录重启 ChatGPT/Codex，聊天记录、记忆、设置与状态会保留。"
+        }
+        Err(_) => {
+            "配置已写入；请手动重启 ChatGPT/Codex，Relay 未传入独立客户端数据目录，聊天记录、记忆、设置与状态会保留。"
+        }
+    };
+    status.message = format!("{} {}", status.message, suffix);
 }
 
 #[tauri::command]
@@ -1496,8 +1882,11 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use std::{
+        io::{Read, Write},
+        net::TcpListener,
         path::PathBuf,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        thread,
     };
 
     #[test]
@@ -1554,13 +1943,172 @@ mod tests {
         assert_eq!(failed.message, "更新失败");
     }
 
+    #[test]
+    fn transition_auth_readiness_waits_for_existing_auth_json_update() {
+        let root = temp_command_root("auth-ready");
+        let home = root.join("runtime-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "old").unwrap();
+        let before = auth_json_fingerprint(&home);
+
+        assert!(!auth_json_ready_for_transition(
+            &home,
+            before.as_ref(),
+            now_ms().saturating_add(5_000),
+        ));
+
+        std::fs::write(home.join("auth.json"), "new-auth-json").unwrap();
+
+        assert!(auth_json_ready_for_transition(
+            &home,
+            before.as_ref(),
+            now_ms(),
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn transition_sync_failure_becomes_warning_status() {
+        let status = history_transition_status_from_sync_result(
+            42,
+            Err(AppError::RuntimeUnavailable),
+            Vec::new(),
+        );
+
+        assert_eq!(status.status, "warning");
+        assert!(status.completed_at_ms.is_some());
+        assert_eq!(status.queued_at_ms, 42);
+        assert_eq!(status.warnings.len(), 1);
+        assert!(status.message.contains("手动同步/修复"));
+    }
+
+    #[test]
+    fn older_transition_status_does_not_replace_newer_status() {
+        let store = Arc::new(Mutex::new(None));
+        set_history_transition_status_arc(
+            &store,
+            CodexHistoryTransitionStatus {
+                status: "running".to_owned(),
+                message: "new".to_owned(),
+                queued_at_ms: 10,
+                completed_at_ms: None,
+                warnings: Vec::new(),
+            },
+        );
+        set_history_transition_status_arc(
+            &store,
+            CodexHistoryTransitionStatus {
+                status: "completed".to_owned(),
+                message: "old".to_owned(),
+                queued_at_ms: 9,
+                completed_at_ms: Some(11),
+                warnings: Vec::new(),
+            },
+        );
+
+        let current = store.lock().unwrap().clone().unwrap();
+        assert_eq!(current.message, "new");
+    }
+
     fn activation(status: &str) -> CurrentProfileActivation {
         CurrentProfileActivation {
             profile_id: "oauth-profile".to_owned(),
             attempt_id: Some("attempt".to_owned()),
             status: status.to_owned(),
             message: "非敏感状态".to_owned(),
+            history_sync: None,
+            history_sync_status: None,
         }
+    }
+
+    fn temp_command_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("codex-command-{name}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn current_profile_selection_requires_confirmation_and_uses_shared_workspace() {
+        assert!(matches!(
+            desktop_workspace_for_current_profile_selection(&SelectCurrentProfileInput {
+                id: "oauth-profile".to_owned(),
+                confirmed_desktop_restart: false,
+            }),
+            Err(AppError::ConfirmationRequired)
+        ));
+        assert!(matches!(
+            desktop_workspace_for_current_profile_selection(&SelectCurrentProfileInput {
+                id: "oauth-profile".to_owned(),
+                confirmed_desktop_restart: true,
+            })
+            .unwrap(),
+            DesktopWorkspaceLaunch::Shared
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepares_api_profile_for_codex_switch_by_refreshing_models() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(crate::secrets::MemorySecretStore::new());
+        let profile = profiles::create_profile(
+            &repository,
+            secrets.clone(),
+            CreateProfileInput {
+                alias: "Third party".to_owned(),
+                kind: crate::domain::ProfileKind::ApiKey,
+                base_url: Some(spawn_openai_models_server(&["third-party-coder"])),
+                provider: crate::domain::GatewayProvider::OpenAiCompatible,
+                wire_api: crate::domain::GatewayWireApi::Responses,
+                api_key: Some("sk-test".to_owned()),
+                models: vec!["stale-model".to_owned()],
+                model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let mut stored = repository.profile(&profile.id).unwrap();
+        stored.profile.health = "unhealthy".to_owned();
+        stored.profile.models.clear();
+        stored.profile.model_mappings.clear();
+        repository.update_profile(&stored).unwrap();
+
+        prepare_api_profile_for_codex_switch(&repository, secrets, &profile.id)
+            .await
+            .unwrap();
+
+        let refreshed = repository.profile(&profile.id).unwrap().profile;
+        assert_eq!(refreshed.health, "healthy");
+        assert_eq!(refreshed.models, vec!["third-party-coder"]);
+        assert!(!refreshed.in_pool);
+    }
+
+    fn spawn_openai_models_server(models: &[&str]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "data": models
+                .iter()
+                .map(|model| serde_json::json!({"id": model}))
+                .collect::<Vec<_>>()
+        })
+        .to_string();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{address}/v1")
     }
 
     fn test_app_state(repository: Arc<Repository>, secrets: Arc<dyn SecretStore>) -> AppState {
@@ -1588,6 +2136,8 @@ mod tests {
             data_dir: PathBuf::from("/tmp/codex-relay-test-data"),
             secrets: secrets.clone(),
             quota_refresh_lock: tokio::sync::Mutex::new(()),
+            history_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            history_transition_status: Arc::new(Mutex::new(None)),
             oauth_credentials,
             json_imports: crate::profile_import::JsonProfileImportStore::default(),
         }

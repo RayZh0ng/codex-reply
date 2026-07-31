@@ -1,6 +1,7 @@
 import { ArrowsClockwise } from "@phosphor-icons/react/ArrowsClockwise";
 import { ChartPieSlice } from "@phosphor-icons/react/ChartPieSlice";
 import { ChatCircleDots } from "@phosphor-icons/react/ChatCircleDots";
+import { ClockCounterClockwise } from "@phosphor-icons/react/ClockCounterClockwise";
 import { GearSix } from "@phosphor-icons/react/GearSix";
 import { Lightning } from "@phosphor-icons/react/Lightning";
 import { List } from "@phosphor-icons/react/List";
@@ -21,6 +22,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Dashboard } from "../features/dashboard/Dashboard";
 import {
   APP_UPDATE_PROGRESS_EVENT,
+  CODEX_HISTORY_SYNC_FINISHED_EVENT,
   api,
   type AppUpdateChannel,
   type AppUpdateInfo,
@@ -29,9 +31,8 @@ import {
   type CurrentProfileActivation,
   type CodexEnvironmentInstallReport,
   type CodexEnvironmentReport,
+  type CodexHistoryTransitionStatus,
   type DesktopWorkspaceHistoryItem,
-  type DesktopWorkspaceMode,
-  type DesktopWorkspaceSettings,
   type CodexSessionSummary,
   type CollaborationContextSummary,
   type CollaborationProjectBinding,
@@ -49,6 +50,7 @@ import logo from "../../src-tauri/icons/icon.png";
 
 const loadProfilesPage = () => import("../features/profiles/Profiles");
 const loadGatewayPage = () => import("../features/gateway/Gateway");
+const loadSessionsPage = () => import("../features/sessions/Sessions");
 const loadCollaborationPage = () => import("../features/collaboration/Collaboration");
 const loadSettingsPage = () => import("../features/settings/Settings");
 
@@ -58,6 +60,9 @@ const Profiles = lazy(() =>
 const Gateway = lazy(() =>
   loadGatewayPage().then((module) => ({ default: module.Gateway })),
 );
+const Sessions = lazy(() =>
+  loadSessionsPage().then((module) => ({ default: module.Sessions })),
+);
 const Collaboration = lazy(() =>
   loadCollaborationPage().then((module) => ({ default: module.Collaboration })),
 );
@@ -65,7 +70,8 @@ const Settings = lazy(() =>
   loadSettingsPage().then((module) => ({ default: module.Settings })),
 );
 
-type Page = "dashboard" | "profiles" | "gateway" | "collaboration" | "settings";
+type Page =
+  "dashboard" | "profiles" | "gateway" | "sessions" | "collaboration" | "settings";
 type Confirmation = {
   title: string;
   detail: string;
@@ -81,7 +87,6 @@ const idleTaskStatus: ManagedTaskStatus = {
   message: "当前没有正在运行的受管 Codex 任务。",
 };
 const PROFILE_ACTIVATION_TIMEOUT_MS = 20_000;
-const defaultWorkspaceSettings: DesktopWorkspaceSettings = { mode: "per_profile" };
 const defaultAppUpdateSettings: AppUpdateSettings = {
   channel: "stable",
   auto_check: true,
@@ -123,9 +128,8 @@ function App() {
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
   const [profileActivation, setProfileActivation] =
     useState<CurrentProfileActivation | null>(null);
-  const [workspaceSettings, setWorkspaceSettings] = useState<DesktopWorkspaceSettings>(
-    defaultWorkspaceSettings,
-  );
+  const [historySyncStatus, setHistorySyncStatus] =
+    useState<CodexHistoryTransitionStatus | null>(null);
   const [appUpdateSettings, setAppUpdateSettings] = useState<AppUpdateSettings>(
     defaultAppUpdateSettings,
   );
@@ -162,7 +166,6 @@ function App() {
       ]);
       setSnapshot(nextSnapshot);
       setTaskStatus(nextTaskStatus);
-      setWorkspaceSettings({ mode: nextSnapshot.workspace_mode });
       setError(null);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -382,6 +385,29 @@ function App() {
     };
   }, []);
   useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let mounted = true;
+    void listen<CodexHistoryTransitionStatus>(
+      CODEX_HISTORY_SYNC_FINISHED_EVENT,
+      (event) => {
+        if (!mounted) return;
+        setHistorySyncStatus(event.payload);
+        setNotice(event.payload.message);
+      },
+    )
+      .then((nextUnlisten) => {
+        unlisten = nextUnlisten;
+        if (!mounted) unlisten();
+      })
+      .catch(() => {
+        // History transition events are available only inside the Tauri runtime.
+      });
+    return () => {
+      mounted = false;
+      unlisten?.();
+    };
+  }, []);
+  useEffect(() => {
     const media = window.matchMedia(COMPACT_SIDEBAR_QUERY);
     const update = (event: MediaQueryListEvent | MediaQueryList) => {
       setCompactSidebar(event.matches);
@@ -480,6 +506,9 @@ function App() {
     setActionBusy(true);
     try {
       const activation = await api.selectProfile(id, confirmedDesktopRestart);
+      if (activation.history_sync_status) {
+        setHistorySyncStatus(activation.history_sync_status);
+      }
       if (activation.status === "switching") {
         setProfileActivation(activation);
         return;
@@ -493,17 +522,13 @@ function App() {
     }
   };
   const selectProfile = async (id: string) => {
-    if (workspaceSettings.mode === "shared") {
-      setConfirmation({
-        title: "关闭并重启原客户端？",
-        detail:
-          "共享模式会先请求正常退出 ChatGPT/Codex，再使用你原有的客户端数据目录启动。已保存的会话、设置与状态会保留，但未发送内容可能丢失。",
-        confirmLabel: "关闭并切换",
-        action: () => selectProfileDirect(id, true),
-      });
-      return;
-    }
-    await selectProfileDirect(id);
+    setConfirmation({
+      title: "关闭并切换 Codex 客户端？",
+      detail:
+        "切换账号会先请求正常退出 ChatGPT/Codex，再复用原客户端数据目录启动。已保存的聊天记录、记忆、设置与状态会保留，但未发送内容可能丢失。",
+      confirmLabel: "关闭并切换",
+      action: () => selectProfileDirect(id, true),
+    });
   };
   const startManagedTask = async (input: StartManagedTaskInput) => {
     setActionBusy(true);
@@ -528,6 +553,7 @@ function App() {
         .then(async (next) => {
           if (timedOut) return;
           setProfileActivation(next);
+          if (next.history_sync_status) setHistorySyncStatus(next.history_sync_status);
           if (next.status !== "switching") {
             await refresh();
             setNotice(next.message);
@@ -653,7 +679,6 @@ function App() {
       requestCancelManagedTask={requestCancelManagedTask}
       requestDelete={requestDelete}
       notify={setNotice}
-      workspaceSettings={workspaceSettings}
       appUpdateSettings={appUpdateSettings}
       availableAppUpdate={availableAppUpdate}
       appUpdateStatus={appUpdateStatus}
@@ -669,13 +694,8 @@ function App() {
       codexSessions={codexSessions}
       collaborationContexts={collaborationContexts}
       gatewayModelOptions={gatewayModelOptions}
-      onChangeWorkspaceMode={async (mode) => {
-        await execute(
-          () => api.updateDesktopWorkspaceSettings(mode),
-          "客户端工作区模式已保存。",
-        );
-        await refreshWorkspaceHistory();
-      }}
+      historySyncStatus={historySyncStatus}
+      onHistorySyncStatus={setHistorySyncStatus}
       onChangeAppUpdateSettings={changeAppUpdateSettings}
       onCheckAppUpdate={async () => {
         await checkForAppUpdate(appUpdateSettings.channel, false, true);
@@ -692,16 +712,6 @@ function App() {
         }
       }}
       onInstallCodexEnvironment={installCodexEnvironment}
-      onRestoreWorkspace={async (id) => {
-        const activation = await api.restoreDesktopWorkspace(id);
-        if (activation.status === "switching") {
-          setProfileActivation(activation);
-          return;
-        }
-        await refresh();
-        await refreshWorkspaceHistory();
-        setNotice(activation.message);
-      }}
       onThemePreferenceChange={setThemePreference}
       onRefresh={refreshCurrentPage}
       onRefreshCollaboration={refreshCollaboration}
@@ -758,6 +768,13 @@ function App() {
             label="网关"
             onClick={() => navigate("gateway")}
             prefetch={loadGatewayPage}
+          />
+          <NavItem
+            active={page === "sessions"}
+            icon={<ClockCounterClockwise size={20} />}
+            label="会话"
+            onClick={() => navigate("sessions")}
+            prefetch={loadSessionsPage}
           />
           <NavItem
             active={page === "collaboration"}
@@ -893,7 +910,6 @@ function PageContent({
   requestCancelManagedTask,
   requestDelete,
   notify,
-  workspaceSettings,
   appUpdateSettings,
   availableAppUpdate,
   appUpdateStatus,
@@ -909,13 +925,13 @@ function PageContent({
   codexSessions,
   collaborationContexts,
   gatewayModelOptions,
-  onChangeWorkspaceMode,
+  historySyncStatus,
+  onHistorySyncStatus,
   onChangeAppUpdateSettings,
   onCheckAppUpdate,
   onInstallAppUpdate,
   onRefreshCodexEnvironment,
   onInstallCodexEnvironment,
-  onRestoreWorkspace,
   onThemePreferenceChange,
   onRefresh,
   onRefreshCollaboration,
@@ -942,7 +958,6 @@ function PageContent({
     refreshAction?: () => Promise<void>,
   ) => void;
   notify: (message: string) => void;
-  workspaceSettings: DesktopWorkspaceSettings;
   appUpdateSettings: AppUpdateSettings;
   availableAppUpdate: AppUpdateInfo | null;
   appUpdateStatus: string | null;
@@ -958,13 +973,13 @@ function PageContent({
   codexSessions: CodexSessionSummary[];
   collaborationContexts: CollaborationContextSummary[];
   gatewayModelOptions: string[];
-  onChangeWorkspaceMode: (mode: DesktopWorkspaceMode) => Promise<void>;
+  historySyncStatus: CodexHistoryTransitionStatus | null;
+  onHistorySyncStatus: (status: CodexHistoryTransitionStatus) => void;
   onChangeAppUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
   onCheckAppUpdate: () => Promise<void>;
   onInstallAppUpdate: () => Promise<void>;
   onRefreshCodexEnvironment: () => Promise<void>;
   onInstallCodexEnvironment: () => Promise<void>;
-  onRestoreWorkspace: (id: string) => Promise<void>;
   onThemePreferenceChange: (preference: ThemePreference) => void;
   onRefresh: () => Promise<void>;
   onRefreshCollaboration: () => Promise<void>;
@@ -1069,10 +1084,13 @@ function PageContent({
           )
         }
         onActivateApiProfile={(profile) =>
-          execute(
-            () => api.activateApiServiceProfile(profile.id),
-            "Codex 已切换到 API 服务档案。请启动新会话后使用。",
-          )
+          execute(async () => {
+            const status = await api.activateApiServiceProfile(profile.id);
+            if (status.history_sync_status) {
+              onHistorySyncStatus(status.history_sync_status);
+            }
+            notify(status.message);
+          })
         }
         onDelete={(id, alias) =>
           requestDelete(
@@ -1082,7 +1100,6 @@ function PageContent({
           )
         }
         onJsonImportComplete={onJsonImportComplete}
-        workspaceMode={workspaceSettings.mode}
       />
     );
   if (page === "gateway")
@@ -1096,9 +1113,14 @@ function PageContent({
         onStart={async () => execute(api.startGateway, "网关已启动并使用 HTTPS 保护。")}
         onStop={async () => execute(api.stopGateway, "网关已停止。")}
         onNotice={notify}
+        onHistorySyncStatus={onHistorySyncStatus}
         onNavigateProfiles={() => navigate("profiles")}
         onRefresh={onRefresh}
       />
+    );
+  if (page === "sessions")
+    return (
+      <Sessions busy={busy} historySyncStatus={historySyncStatus} onNotice={notify} />
     );
   if (page === "collaboration")
     return (
@@ -1160,7 +1182,6 @@ function PageContent({
   if (page === "settings")
     return (
       <Settings
-        settings={workspaceSettings}
         workspaces={workspaceHistory}
         codexEnvironment={codexEnvironment}
         codexEnvironmentInstall={codexEnvironmentInstall}
@@ -1172,17 +1193,15 @@ function PageContent({
         updateStatus={appUpdateStatus}
         updateBusy={appUpdateBusy}
         updateProgress={appUpdateProgress}
-        onChangeMode={onChangeWorkspaceMode}
         onThemePreferenceChange={onThemePreferenceChange}
         onChangeUpdateSettings={onChangeAppUpdateSettings}
         onCheckUpdate={onCheckAppUpdate}
         onInstallUpdate={onInstallAppUpdate}
         onRefreshCodexEnvironment={onRefreshCodexEnvironment}
         onInstallCodexEnvironment={onInstallCodexEnvironment}
-        onRestore={onRestoreWorkspace}
         onDelete={(id, alias) =>
           requestDelete(
-            `删除“${alias}”的全新工作区？`,
+            `删除“${alias}”的旧独立工作区？`,
             "该工作区的本地客户端数据会被永久删除，无法恢复。",
             () => api.deleteDesktopWorkspace(id),
             onRefresh,
@@ -1243,6 +1262,7 @@ function pageLabel(page: Page) {
     dashboard: "总览",
     profiles: "档案",
     gateway: "网关",
+    sessions: "会话",
     collaboration: "协作",
     settings: "设置",
   }[page];

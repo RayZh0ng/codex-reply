@@ -39,7 +39,7 @@ use toml_edit::{value as toml_value, Array, DocumentMut, Item, Table};
 use uuid::Uuid;
 
 use crate::{
-    codex_gateway,
+    codex_gateway, codex_session_history,
     database::{Repository, StoredCodexSession, StoredCollaborationBot},
     domain::{
         CancelCodexSessionInput, CodexAuthMode, CodexSessionEvent, CodexSessionSummary,
@@ -1744,6 +1744,20 @@ impl CollaborationManager {
         }
         if let Some(context) = context.as_ref() {
             write_context_memory_config(&session_home, context.memory_enabled)?;
+        }
+        if resume {
+            if let Some(codex_id) = codex_session_id.as_deref() {
+                codex_session_history::restore_codex_session_to_home(
+                    &self.repository,
+                    &self.data_dir,
+                    codex_id,
+                    &session_home,
+                    &format!(
+                        "协作上下文 {}",
+                        short_id(context_id.as_deref().unwrap_or(&session_id))
+                    ),
+                )?;
+            }
         }
         let image_paths = match self
             .download_incoming_images(&binding.provider, &binding.bot_id, &run_dir, &images)
@@ -6243,6 +6257,7 @@ mod tests {
                     cooldown_until_ms: None,
                     credential_configured: true,
                     auth_mode: CodexAuthMode::OAuth,
+                    codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
                 },
@@ -6272,6 +6287,7 @@ mod tests {
                     cooldown_until_ms: None,
                     credential_configured: true,
                     auth_mode: CodexAuthMode::OAuth,
+                    codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
                 },

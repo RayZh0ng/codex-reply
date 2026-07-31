@@ -109,6 +109,8 @@ pub async fn create_profile(
     input: CreateProfileInput,
 ) -> AppResult<MaskedProfile> {
     validate_profile_input(&input)?;
+    let codex_oauth_profile_id =
+        normalize_codex_oauth_profile_id(repository, input.codex_oauth_profile_id.as_deref())?;
     let id = Uuid::new_v4().to_string();
     let model_mappings = normalized_model_mappings(input.models, input.model_mappings)?;
     let models = model_mappings
@@ -145,6 +147,7 @@ pub async fn create_profile(
         cooldown_until_ms: None,
         credential_configured: secret_ref.is_some(),
         auth_mode: CodexAuthMode::OAuth,
+        codex_oauth_profile_id,
         is_current: false,
         account: None,
     };
@@ -184,6 +187,7 @@ pub async fn create_api_service_profile(
             api_key: Some(input.api_key),
             models,
             model_mappings: input.model_mappings,
+            codex_oauth_profile_id: input.codex_oauth_profile_id,
             in_pool: input.in_pool,
             priority: input.priority,
             weight: input.weight,
@@ -223,7 +227,15 @@ pub async fn update_profile(
             }
             stored.profile.base_url = Some(normalized);
         }
-    } else if input.provider.is_some() || input.wire_api.is_some() || input.base_url.is_some() {
+        if let Some(profile_id) = input.codex_oauth_profile_id {
+            stored.profile.codex_oauth_profile_id =
+                normalize_codex_oauth_profile_id(repository, profile_id.as_deref())?;
+        }
+    } else if input.provider.is_some()
+        || input.wire_api.is_some()
+        || input.base_url.is_some()
+        || input.codex_oauth_profile_id.is_some()
+    {
         return Err(AppError::ValidationFailed);
     }
     let model_mappings = match input.model_mappings {
@@ -521,6 +533,7 @@ pub async fn create_oauth_profile(
         cooldown_until_ms: None,
         credential_configured: true,
         auth_mode: CodexAuthMode::OAuth,
+        codex_oauth_profile_id: None,
         is_current: false,
         account: account_summary(credential),
     };
@@ -567,6 +580,7 @@ pub async fn create_imported_profile(
         cooldown_until_ms: None,
         credential_configured: true,
         auth_mode: credential.auth_mode.clone(),
+        codex_oauth_profile_id: None,
         is_current: false,
         account,
     };
@@ -912,6 +926,30 @@ fn validate_profile_input(input: &CreateProfileInput) -> AppResult<()> {
     Ok(())
 }
 
+pub(crate) fn normalize_codex_oauth_profile_id(
+    repository: &Repository,
+    profile_id: Option<&str>,
+) -> AppResult<Option<String>> {
+    let Some(profile_id) = profile_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let stored = repository.profile(profile_id)?;
+    if is_codex_oauth_unlock_profile(&stored) {
+        Ok(Some(stored.profile.id))
+    } else {
+        Err(AppError::ValidationFailed)
+    }
+}
+
+pub(crate) fn is_codex_oauth_unlock_profile(stored: &StoredProfile) -> bool {
+    let profile = &stored.profile;
+    profile.kind == ProfileKind::CodexOauth
+        && profile.auth_mode == CodexAuthMode::OAuth
+        && stored.credential_fingerprint.is_none()
+        && profile.enabled
+        && profile.credential_configured
+}
+
 pub fn normalized_model_mappings(
     models: Vec<String>,
     mappings: Vec<GatewayModelMapping>,
@@ -988,13 +1026,14 @@ mod tests {
         candidates_for_model, create_imported_profile, create_oauth_profile, create_profile,
         imported_account_summary, migrate_oauth_credentials, save_oauth_credential,
         sync_oauth_account_info, sync_oauth_account_info_with_snapshot, unavailable_quota,
-        CodexOAuthCredential, ImportedAuthFileCredential, KEYCHAIN_SIGNING_MIGRATION_SETTING,
+        update_profile, CodexOAuthCredential, ImportedAuthFileCredential,
+        KEYCHAIN_SIGNING_MIGRATION_SETTING,
     };
     use crate::{
         database::Repository,
         domain::{
             CodexAuthMode, CreateProfileInput, GatewayProvider, GatewayWireApi, ProfileKind,
-            ProfileSubscription,
+            ProfileSubscription, UpdateProfileInput,
         },
         secrets::MemorySecretStore,
     };
@@ -1058,6 +1097,7 @@ mod tests {
                 api_key: Some("secret".into()),
                 models: vec!["gpt-5-codex".into()],
                 model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
                 in_pool: true,
                 priority: 0,
                 weight: 1,
@@ -1083,6 +1123,7 @@ mod tests {
                 api_key: Some("super-secret".into()),
                 models: vec!["gpt-5-codex".into()],
                 model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
                 in_pool: true,
                 priority: 0,
                 weight: 1,
@@ -1126,6 +1167,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_profile_accepts_and_clears_codex_oauth_unlock_binding() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        create_oauth_profile(
+            &repository,
+            secrets.clone(),
+            "oauth-login".into(),
+            "Login OAuth".into(),
+            &CodexOAuthCredential {
+                id_token: "id".into(),
+                access_token: "access".into(),
+                refresh_token: None,
+                account_id: None,
+                last_refresh_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let api_profile = create_profile(
+            &repository,
+            secrets.clone(),
+            CreateProfileInput {
+                alias: "Third Party".into(),
+                kind: ProfileKind::ApiKey,
+                base_url: Some("https://api.example.com/v1".into()),
+                provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
+                api_key: Some("api-secret".into()),
+                models: vec!["codex-visible".into()],
+                model_mappings: Vec::new(),
+                codex_oauth_profile_id: Some("oauth-login".into()),
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            api_profile.codex_oauth_profile_id.as_deref(),
+            Some("oauth-login")
+        );
+
+        let updated = update_profile(
+            &repository,
+            secrets,
+            UpdateProfileInput {
+                id: api_profile.id,
+                alias: "Third Party".into(),
+                provider: Some(GatewayProvider::OpenAiCompatible),
+                wire_api: Some(GatewayWireApi::Responses),
+                base_url: Some("https://api.example.com/v1".into()),
+                enabled: true,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+                models: vec!["codex-visible".into()],
+                model_mappings: None,
+                codex_oauth_profile_id: Some(None),
+                api_key: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(updated.codex_oauth_profile_id.is_none());
+        assert!(repository
+            .profile(&updated.id)
+            .unwrap()
+            .profile
+            .codex_oauth_profile_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn api_profile_rejects_unavailable_codex_oauth_unlock_binding() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        create_oauth_profile(
+            &repository,
+            secrets.clone(),
+            "disabled-oauth".into(),
+            "Disabled OAuth".into(),
+            &CodexOAuthCredential {
+                id_token: "id".into(),
+                access_token: "access".into(),
+                refresh_token: None,
+                account_id: None,
+                last_refresh_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let mut disabled = repository.profile("disabled-oauth").unwrap();
+        disabled.profile.enabled = false;
+        repository.update_profile(&disabled).unwrap();
+
+        let result = create_profile(
+            &repository,
+            secrets,
+            CreateProfileInput {
+                alias: "Third Party".into(),
+                kind: ProfileKind::ApiKey,
+                base_url: Some("https://api.example.com/v1".into()),
+                provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
+                api_key: Some("api-secret".into()),
+                models: vec!["codex-visible".into()],
+                model_mappings: Vec::new(),
+                codex_oauth_profile_id: Some("disabled-oauth".into()),
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::AppError::ValidationFailed)
+        ));
+        assert!(repository
+            .list_profiles()
+            .unwrap()
+            .iter()
+            .all(|stored| stored.profile.kind != ProfileKind::ApiKey));
+    }
+
+    #[tokio::test]
     async fn gateway_candidates_include_only_opted_in_oauth_profiles() {
         let repository = Repository::memory();
         let secrets = Arc::new(MemorySecretStore::new());
@@ -1141,6 +1311,7 @@ mod tests {
                 api_key: Some("api-secret".into()),
                 models: vec!["gpt-5".into()],
                 model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
                 in_pool: true,
                 priority: 0,
                 weight: 1,
@@ -1460,6 +1631,7 @@ mod tests {
                 api_key: None,
                 models: vec!["unknown".into()],
                 model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
                 in_pool: false,
                 priority: 0,
                 weight: 1,

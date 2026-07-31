@@ -93,7 +93,7 @@ Codex Relay 帮助个人开发者和小团队在一台本机上管理多个 Code
 | ACC-02 | 支持多格式 JSON 文件批量导入档案。                         | 原生文件选择器可选择最多 100 个 `.json` 文件；支持 Codex `auth.json`（OAuth、Agent Identity、PAT）、明确 token/session JSON、仅 `accessToken`、`refresh_token`、`at-…` / `personal_access_token` 与 Sub2API `accounts[].credentials` 中的 OpenAI OAuth 项。解析后必须显示脱敏预览、联网预检结果与逐项勾选；无效或未验证项默认不可选，提交可局部成功。 |
 | ACC-03 | 支持 OAuth 授权。                                          | 授权完成后创建或更新档案并保存凭据。                                                                                                                                                                                                                                                                                                                  |
 | ACC-04 | 支持 OpenAI 兼容第三方中转站的 API Key 连接。              | 保存后可用于网关路由。                                                                                                                                                                                                                                                                                                                                |
-| ACC-05 | 用户可切换当前档案。                                       | 已保存的目标凭据直接原子写入当前用户的 `.codex/auth.json`。用户可选择每次全新启动、档案独立工作区或共享原客户端状态：前两者使用受控 Electron 数据目录，后者不传入用户数据目录且在确认后正常关闭并重启原客户端。macOS 同步写入对应的 `Codex Auth` Keychain 条目。无需再次授权。                                                                        |
+| ACC-05 | 用户可切换当前档案。                                       | 已保存的目标凭据直接原子写入当前用户的 `.codex/auth.json`。切换前用户确认正常关闭并重启 Codex/ChatGPT 客户端；启动时不传入受控 Electron 用户数据目录，固定复用原客户端本机状态以保留聊天记录、记忆和设置。不写入 macOS `Codex Auth` Keychain，避免账号切换触发系统钥匙串授权弹窗。无需再次授权。                                                      |
 | ACC-06 | 用户可启用、停用、删除、标记和配置账号池成员。             | 档案状态变化同步到账号池。                                                                                                                                                                                                                                                                                                                            |
 
 > 导入仅接受明确的认证字段和当前 Sub2API `accounts[].credentials` 的 `platform: "openai"`、`type: "oauth"` 项；不支持浏览器 cookie、`session_token` 或未知 JSON 的递归猜测。
@@ -169,7 +169,7 @@ v0.2 beta 提供五个平台通用的协作命令、项目共享上下文和会�
 ### 6.1 功能验收
 
 1. 手动、多格式 JSON、OAuth 和 API Key 导入可创建独立档案；JSON 导入的无效项不会泄露凭据，且不影响同批已成功项。
-2. 已保存 OAuth 档案可直接成为当前档案；切换后按所选桌面工作区模式启动相关 Codex 应用，不出现通用 ChatGPT 登录流程。共享模式保留原客户端已保存的本地状态，但不迁移 ChatGPT 账号数据。
+2. 已保存 OAuth 档案可直接成为当前档案；确认关闭并切换后复用原 Codex/ChatGPT 客户端数据目录启动相关应用，不出现通用 ChatGPT 登录流程，并保留本机聊天记录、记忆、设置与状态。
 3. 网关完成 `/v1/models`、`/v1/responses` 与 `/v1/chat/completions` 调用。
 4. 多成员池按优先级和权重路由；成员失败时其他成员继续服务。
 5. 状态统计反映本产品网关处理的请求。

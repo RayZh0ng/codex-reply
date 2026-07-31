@@ -13,6 +13,7 @@ import {
   type CreatedClientKey,
   type GatewayCodexConfigStatus,
   type GatewayStatus,
+  type CodexHistoryTransitionStatus,
   type MaskedClientKey,
 } from "../../shared/ipc";
 import { Select } from "../../shared/ui/Select";
@@ -26,6 +27,7 @@ interface GatewayProps {
   onStart: () => Promise<void>;
   onStop: () => Promise<void>;
   onNotice: (message: string) => void;
+  onHistorySyncStatus?: (status: CodexHistoryTransitionStatus) => void;
   onNavigateProfiles: () => void;
   onRefresh: () => Promise<void>;
 }
@@ -37,6 +39,7 @@ export function Gateway({
   onStart,
   onStop,
   onNotice,
+  onHistorySyncStatus = () => undefined,
   onNavigateProfiles,
   onRefresh,
 }: GatewayProps) {
@@ -45,6 +48,8 @@ export function Gateway({
   const [keyName, setKeyName] = useState("");
   const [loadingKeys, setLoadingKeys] = useState(true);
   const [codexConfig, setCodexConfig] = useState<GatewayCodexConfigStatus | null>(null);
+  const codexConfigMode = codexConfig?.mode ?? "official";
+  const codexManaged = codexConfigMode !== "official";
   const oauthCandidates = codexConfig?.oauth_profile_options ?? [];
   const hasAvailableOAuthCandidate = oauthCandidates.some(
     (profile) => profile.available,
@@ -58,14 +63,14 @@ export function Gateway({
     {
       value: NO_OAUTH_PROFILE,
       label: "不绑定登录档案",
-      description: "只切换模型请求，不改写 Codex 登录态",
+      description: "保留当前 Codex 登录态，只切换模型请求地址",
     },
     ...oauthCandidates.map((profile) => ({
       value: profile.id,
       label: profile.alias,
       disabled: !profile.available,
       description: profile.available
-        ? "OAuth 授权登录态解锁"
+        ? "只用于解锁 Codex 登录态"
         : (profile.reason ?? "需要重新检查登录状态"),
     })),
     ...(selectedOAuthMissing
@@ -145,6 +150,7 @@ export function Gateway({
         ? await api.disableCodexGateway()
         : await api.enableCodexGateway();
       setCodexConfig(next);
+      if (next.history_sync_status) onHistorySyncStatus(next.history_sync_status);
       await Promise.all([reloadKeys(), onRefresh()]);
       onNotice(next.message);
     } catch (error) {
@@ -158,19 +164,25 @@ export function Gateway({
       setCodexConfig(next);
       onNotice(
         profileId
-          ? "Codex 网关 OAuth 登录档案已绑定。"
+          ? "Codex 网关 OAuth 登录档案已绑定，仅用于解锁登录态。"
           : "Codex 网关 OAuth 登录档案已清空。",
       );
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "OAuth 登录档案未保存。");
     }
   };
-  const codexActionRequiresRunning = !codexConfig?.enabled || codexConfig.needs_repair;
   const codexButtonLabel = codexConfig?.needs_repair
-    ? "修复 Codex Key"
-    : codexConfig?.enabled
-      ? "恢复原 Codex 配置"
+    ? "修复 Codex 配置"
+    : codexManaged
+      ? "恢复官方配置"
       : "设为 Codex 网关";
+  const codexStatusLabel = codexConfig?.needs_repair
+    ? "需要修复 Codex 配置"
+    : codexConfigMode === "third_party"
+      ? "第三方直连"
+      : codexConfigMode === "relay_gateway"
+        ? "已接入 Relay 网关"
+        : "官方模型配置";
   const exportCa = async () => {
     try {
       const destination = await save({
@@ -312,14 +324,10 @@ export function Gateway({
             <div className="codex-config-overview">
               <span
                 className={`codex-config-status ${
-                  codexConfig?.enabled && !codexConfig.needs_repair ? "" : "is-disabled"
+                  codexManaged && !codexConfig?.needs_repair ? "" : "is-disabled"
                 }`}
               >
-                {codexConfig?.needs_repair
-                  ? "需要修复 Codex Key"
-                  : codexConfig?.enabled
-                    ? "已接入 Relay 网关"
-                    : "未接入 Relay 网关"}
+                {codexStatusLabel}
               </span>
               <p className="muted-copy codex-config-copy">
                 {codexConfig?.message ?? "正在读取 Codex 配置状态…"}
@@ -342,15 +350,11 @@ export function Gateway({
               </label>
               <button
                 className={`codex-config-button ${
-                  codexConfig?.enabled && !codexConfig.needs_repair
+                  codexManaged && !codexConfig?.needs_repair
                     ? "quiet-button"
                     : "primary-button"
                 }`}
-                disabled={
-                  busy ||
-                  !codexConfig ||
-                  (codexActionRequiresRunning && !gateway.running)
-                }
+                disabled={busy || !codexConfig}
                 type="button"
                 onClick={() => void toggleCodexGateway()}
               >
@@ -358,14 +362,16 @@ export function Gateway({
               </button>
             </div>
             <p className="codex-config-helper">
-              {codexConfig?.oauth_profile_id
-                ? codexConfig.oauth_profile_available
-                  ? `当前登录档案：${codexConfig.oauth_profile_alias ?? codexConfig.oauth_profile_id}`
-                  : (selectedOAuthOption?.reason ??
-                    "已绑定的 OAuth 登录档案当前不可读，请重新授权或清空绑定。")
-                : hasAvailableOAuthCandidate
-                  ? "未绑定时保留本机登录档案，只把模型请求路由到账号池成员。"
-                  : "还没有可用于登录态解锁的 OAuth 授权档案；JSON 导入账号只用于反代账号池。"}
+              {codexConfigMode === "third_party"
+                ? `当前直连：${codexConfig?.direct_profile_alias ?? codexConfig?.direct_profile_id ?? "第三方供应商"}；OAuth 登录档案只用于解锁 Codex 登录态，模型请求发送到该供应商 Base URL。`
+                : codexConfig?.oauth_profile_id
+                  ? codexConfig.oauth_profile_available
+                    ? `当前登录档案：${codexConfig.oauth_profile_alias ?? codexConfig.oauth_profile_id}；只解锁 Codex 登录态，模型请求继续走 Relay 网关账号池。`
+                    : (selectedOAuthOption?.reason ??
+                      "已绑定的 OAuth 登录档案当前不可读，请重新授权或清空绑定。")
+                  : hasAvailableOAuthCandidate
+                    ? "未绑定时保留本机登录档案；切换后模型请求继续走 Relay 网关账号池。"
+                    : "还没有可用于登录态解锁的 OAuth 授权档案；JSON/PAT/Agent Identity 档案只用于反代账号池。"}
             </p>
           </article>
           <article className="surface-card key-card gateway-card">
