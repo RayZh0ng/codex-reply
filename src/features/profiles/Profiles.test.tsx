@@ -205,13 +205,29 @@ function chooseMenuOption(label: string, currentValue: string, optionLabel: stri
 }
 
 describe("Profiles OAuth import", () => {
-  it("keeps the empty profile state centered across the masonry columns", () => {
+  it("keeps profile cards in a regular grid with bottom-aligned actions", () => {
+    expect(componentsCss).toMatch(
+      /\.profile-grid\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);[^}]*align-items:\s*stretch;/s,
+    );
+    expect(componentsCss).toMatch(
+      /@media\s*\(min-width:\s*1600px\)\s*\{[^}]*\.profile-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\);/s,
+    );
+    expect(componentsCss).toMatch(
+      /@media\s*\(max-width:\s*980px\)\s*\{[^}]*\.profile-grid\s*\{[^}]*grid-template-columns:\s*1fr;/s,
+    );
+    expect(componentsCss).toMatch(
+      /\.profile-card\s*\{[^}]*display:\s*flex;[^}]*height:\s*100%;/s,
+    );
+    expect(componentsCss).toMatch(/\.profile-actions\s*\{[^}]*margin-top:\s*auto;/s);
+  });
+
+  it("keeps the empty profile state spanning the full profile grid", () => {
     const view = renderProfiles();
     const emptyState = view.container.querySelector(".profile-grid > .empty-state");
 
     expect(emptyState).toBeInTheDocument();
     expect(componentsCss).toMatch(
-      /\.profile-grid\s*>\s*\.empty-state\s*\{[^}]*display:\s*grid;[^}]*width:\s*100%;[^}]*column-span:\s*all;/s,
+      /\.profile-grid\s*>\s*\.empty-state\s*\{[^}]*display:\s*grid;[^}]*grid-column:\s*1\s*\/\s*-1;[^}]*width:\s*100%;/s,
     );
   });
 

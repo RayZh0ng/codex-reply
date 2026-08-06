@@ -1,8 +1,11 @@
 use std::{
     fs,
-    io::Write,
+    io::{BufRead, BufReader, ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    process::{Command, Stdio},
+    sync::{mpsc, Arc},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -40,11 +43,68 @@ const CODEX_CLIENT_KEY_NAME: &str = "Codex CLI Gateway";
 const CODEX_RELAY_MODEL_CATALOG_FILENAME: &str = "codex-relay-model-catalog.json";
 const CODEX_RELAY_GATEWAY_PROVIDER: &str = "codex_relay";
 const CODEX_RELAY_DIRECT_PROVIDER: &str = "codex_relay_direct";
+const CODEX_APP_SERVER_ACCOUNT_READ_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Serialize, Deserialize)]
 struct ConfigSnapshot {
     original: String,
     generated_hash: String,
+}
+
+#[derive(Clone, Copy)]
+enum OAuthProjectionRoute {
+    ThirdParty,
+    Relay,
+}
+
+impl OAuthProjectionRoute {
+    fn request_route_message(self) -> &'static str {
+        match self {
+            Self::ThirdParty => "模型请求仍走第三方提供商。",
+            Self::Relay => "模型请求仍走 Relay 网关。",
+        }
+    }
+}
+
+trait ProjectedOAuthIdentityVerifier: Send + Sync {
+    fn verify(&self, home: &Path, expected_account_id: &str) -> AppResult<()>;
+}
+
+struct AppServerProjectedOAuthIdentityVerifier;
+
+impl ProjectedOAuthIdentityVerifier for AppServerProjectedOAuthIdentityVerifier {
+    fn verify(&self, home: &Path, expected_account_id: &str) -> AppResult<()> {
+        let actual = read_codex_account_id_from_app_server(home)?;
+        match actual.as_deref() {
+            Some(account_id) if account_id == expected_account_id => Ok(()),
+            Some(_) | None => Err(AppError::OAuthIdentityMismatch),
+        }
+    }
+}
+
+#[cfg(test)]
+struct AuthJsonProjectedOAuthIdentityVerifier;
+
+#[cfg(test)]
+impl ProjectedOAuthIdentityVerifier for AuthJsonProjectedOAuthIdentityVerifier {
+    fn verify(&self, home: &Path, expected_account_id: &str) -> AppResult<()> {
+        let auth_json =
+            fs::read_to_string(home.join("auth.json")).map_err(|_| AppError::RuntimeUnavailable)?;
+        match auth_json_account_id(&auth_json)?.as_deref() {
+            Some(account_id) if account_id == expected_account_id => Ok(()),
+            Some(_) | None => Err(AppError::OAuthIdentityMismatch),
+        }
+    }
+}
+
+#[cfg(test)]
+struct MismatchedProjectedOAuthIdentityVerifier;
+
+#[cfg(test)]
+impl ProjectedOAuthIdentityVerifier for MismatchedProjectedOAuthIdentityVerifier {
+    fn verify(&self, _home: &Path, _expected_account_id: &str) -> AppResult<()> {
+        Err(AppError::OAuthIdentityMismatch)
+    }
 }
 
 pub async fn status(repository: &Repository) -> AppResult<GatewayCodexConfigStatus> {
@@ -180,6 +240,60 @@ fn status_message(
     }
 }
 
+fn active_relay_provider_name(mode: &str) -> Option<&'static str> {
+    match mode {
+        "third_party" => Some(CODEX_RELAY_DIRECT_PROVIDER),
+        "relay_gateway" => Some(CODEX_RELAY_GATEWAY_PROVIDER),
+        _ => None,
+    }
+}
+
+fn ensure_provider_requires_openai_auth_at_path(
+    path: &Path,
+    provider_name: &str,
+) -> AppResult<bool> {
+    let original = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(AppError::RuntimeUnavailable),
+    };
+    let mut document = original
+        .parse::<DocumentMut>()
+        .map_err(|_| AppError::ValidationFailed)?;
+    if !ensure_provider_requires_openai_auth(&mut document, provider_name)? {
+        return Ok(false);
+    }
+    fs::write(path, document.to_string()).map_err(|_| AppError::RuntimeUnavailable)?;
+    Ok(true)
+}
+
+fn ensure_provider_requires_openai_auth(
+    document: &mut DocumentMut,
+    provider_name: &str,
+) -> AppResult<bool> {
+    let Some(providers) = document
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return Ok(false);
+    };
+    let Some(provider) = providers
+        .get_mut(provider_name)
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return Ok(false);
+    };
+    if provider
+        .get("requires_openai_auth")
+        .and_then(|item| item.as_bool())
+        == Some(true)
+    {
+        return Ok(false);
+    }
+    provider.insert("requires_openai_auth", value(true));
+    Ok(true)
+}
+
 pub async fn enable(
     repository: &Repository,
     secrets: Arc<dyn SecretStore>,
@@ -207,6 +321,28 @@ async fn enable_for_path(
     data_dir: &Path,
     path: &Path,
 ) -> AppResult<GatewayCodexConfigStatus> {
+    let verifier = AppServerProjectedOAuthIdentityVerifier;
+    enable_for_path_with_verifier(
+        repository,
+        secrets,
+        oauth_credentials,
+        gateway,
+        data_dir,
+        path,
+        &verifier,
+    )
+    .await
+}
+
+async fn enable_for_path_with_verifier(
+    repository: &Repository,
+    secrets: Arc<dyn SecretStore>,
+    oauth_credentials: Arc<OAuthCredentialStore>,
+    gateway: GatewayStatus,
+    data_dir: &Path,
+    path: &Path,
+    verifier: &dyn ProjectedOAuthIdentityVerifier,
+) -> AppResult<GatewayCodexConfigStatus> {
     if !gateway.running || !gateway.certificate_ready {
         return Err(AppError::GatewayNotRunning);
     }
@@ -232,8 +368,12 @@ async fn enable_for_path(
     .await?;
     repository.delete_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING)?;
     if let Some(auth_json) = auth_json.as_deref() {
-        project_auth_json_to_default_codex_home(auth_json)?;
-        status.message = format!("{} OAuth 登录档案已同步到默认 Codex 凭据。", status.message);
+        let projection_message = project_auth_json_to_default_codex_home_with_verifier(
+            auth_json,
+            OAuthProjectionRoute::Relay,
+            verifier,
+        )?;
+        status.message = format!("{} {}", status.message, projection_message);
     }
     let oauth = codex_oauth_profile_status(repository)?;
     status.oauth_profile_id = oauth.id;
@@ -268,6 +408,7 @@ async fn enable_at_path(
     provider["name"] = value("Codex Relay LAN Gateway");
     provider["base_url"] = value(format!("{}/v1", gateway.service_url));
     provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(true);
     let mut auth = Table::new();
     auth["command"] = value(
         std::env::current_exe()
@@ -432,6 +573,26 @@ async fn set_codex_oauth_profile_at_path(
     path: &Path,
     project_desktop: bool,
 ) -> AppResult<GatewayCodexConfigStatus> {
+    let verifier = AppServerProjectedOAuthIdentityVerifier;
+    set_codex_oauth_profile_at_path_with_verifier(
+        repository,
+        oauth_credentials,
+        input,
+        path,
+        project_desktop,
+        &verifier,
+    )
+    .await
+}
+
+async fn set_codex_oauth_profile_at_path_with_verifier(
+    repository: &Repository,
+    oauth_credentials: &OAuthCredentialStore,
+    input: SetCodexGatewayOAuthProfileInput,
+    path: &Path,
+    project_desktop: bool,
+    verifier: &dyn ProjectedOAuthIdentityVerifier,
+) -> AppResult<GatewayCodexConfigStatus> {
     if !input.confirmed {
         return Err(AppError::ConfirmationRequired);
     }
@@ -446,6 +607,11 @@ async fn set_codex_oauth_profile_at_path(
         }
     }
     let current = status_for_path(repository, path)?;
+    if current.enabled {
+        if let Some(provider_name) = active_relay_provider_name(&current.mode) {
+            ensure_provider_requires_openai_auth_at_path(path, provider_name)?;
+        }
+    }
     let auth_json = if current.enabled {
         codex_oauth_profile_auth_json_for_id(
             repository,
@@ -473,16 +639,25 @@ async fn set_codex_oauth_profile_at_path(
     } else {
         repository.delete_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)?;
     }
+    let mut projection_message = None;
     if let Some(auth_json) = auth_json.as_deref() {
         let home = path.parent().ok_or(AppError::RuntimeUnavailable)?;
-        write_auth_json_to_home(home, auth_json)?;
-        if project_desktop {
-            project_desktop_auth_json(home, auth_json)?;
-        }
+        let route = if current.mode == "third_party" {
+            OAuthProjectionRoute::ThirdParty
+        } else {
+            OAuthProjectionRoute::Relay
+        };
+        projection_message = Some(project_auth_json_to_home_with_verifier(
+            home,
+            auth_json,
+            project_desktop,
+            route,
+            verifier,
+        )?);
     }
     let mut status = status_for_path(repository, path)?;
-    if current.enabled && profile_id.is_some() {
-        status.message = format!("{} OAuth 登录档案已同步到默认 Codex 凭据。", status.message);
+    if let Some(message) = projection_message {
+        status.message = format!("{} {}", status.message, message);
     }
     Ok(status)
 }
@@ -587,6 +762,24 @@ async fn sync_active_direct_oauth_profile_at_path(
     profile_id: &str,
     path: &Path,
 ) -> AppResult<GatewayCodexConfigStatus> {
+    let verifier = AppServerProjectedOAuthIdentityVerifier;
+    sync_active_direct_oauth_profile_at_path_with_verifier(
+        repository,
+        oauth_credentials,
+        profile_id,
+        path,
+        &verifier,
+    )
+    .await
+}
+
+async fn sync_active_direct_oauth_profile_at_path_with_verifier(
+    repository: &Repository,
+    oauth_credentials: &OAuthCredentialStore,
+    profile_id: &str,
+    path: &Path,
+    verifier: &dyn ProjectedOAuthIdentityVerifier,
+) -> AppResult<GatewayCodexConfigStatus> {
     let current = status_for_path(repository, path)?;
     if !current.enabled
         || current.mode != "third_party"
@@ -606,14 +799,22 @@ async fn sync_active_direct_oauth_profile_at_path(
         CredentialAccess::UserInitiated,
     )
     .await?;
+    ensure_provider_requires_openai_auth_at_path(path, CODEX_RELAY_DIRECT_PROVIDER)?;
+    let mut projection_message = None;
     if let Some(auth_json) = auth_json.as_deref() {
         let home = path.parent().ok_or(AppError::RuntimeUnavailable)?;
-        write_auth_json_to_home(home, auth_json)?;
+        projection_message = Some(project_auth_json_to_home_with_verifier(
+            home,
+            auth_json,
+            false,
+            OAuthProjectionRoute::ThirdParty,
+            verifier,
+        )?);
     }
 
     let mut status = status_for_path(repository, path)?;
-    status.message = if stored.profile.codex_oauth_profile_id.is_some() {
-        format!("{} OAuth 登录档案已同步到默认 Codex 凭据。", status.message)
+    status.message = if let Some(message) = projection_message {
+        format!("{} {}", status.message, message)
     } else {
         format!(
             "{} OAuth 登录档案已清空，未改写默认 Codex 凭据。",
@@ -652,13 +853,48 @@ fn is_gateway_model_profile(profile: &crate::domain::MaskedProfile, now: i64) ->
         && profile.cooldown_until_ms.is_none_or(|until| until <= now)
 }
 
-fn project_auth_json_to_default_codex_home(auth_json: &str) -> AppResult<()> {
+fn project_auth_json_to_default_codex_home_with_verifier(
+    auth_json: &str,
+    route: OAuthProjectionRoute,
+    verifier: &dyn ProjectedOAuthIdentityVerifier,
+) -> AppResult<String> {
     let home = config_path()?
         .parent()
         .ok_or(AppError::RuntimeUnavailable)?
         .to_path_buf();
-    write_auth_json_to_home(&home, auth_json)?;
-    project_desktop_auth_json(&home, auth_json)
+    project_auth_json_to_home_with_verifier(&home, auth_json, true, route, verifier)
+}
+
+fn project_auth_json_to_home_with_verifier(
+    home: &Path,
+    auth_json: &str,
+    project_desktop: bool,
+    route: OAuthProjectionRoute,
+    verifier: &dyn ProjectedOAuthIdentityVerifier,
+) -> AppResult<String> {
+    write_auth_json_to_home(home, auth_json)?;
+    if project_desktop {
+        project_desktop_auth_json(home, auth_json)?;
+    }
+    let expected_account_id =
+        auth_json_account_id(auth_json)?.ok_or(AppError::ProfileRuntimeUnavailable)?;
+    verifier.verify(home, &expected_account_id)?;
+    Ok(format!(
+        "OAuth 登录档案已写入并验证为所选账号；{}",
+        route.request_route_message()
+    ))
+}
+
+fn auth_json_account_id(auth_json: &str) -> AppResult<Option<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(auth_json).map_err(|_| AppError::ValidationFailed)?;
+    Ok(value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned))
 }
 
 fn write_auth_json_to_home(home: &Path, auth_json: &str) -> AppResult<()> {
@@ -684,6 +920,108 @@ fn write_auth_json_to_home(home: &Path, auth_json: &str) -> AppResult<()> {
 fn project_desktop_auth_json(codex_home: &Path, auth_json: &str) -> AppResult<()> {
     let _ = (codex_home, auth_json);
     Ok(())
+}
+
+fn read_codex_account_id_from_app_server(home: &Path) -> AppResult<Option<String>> {
+    let mut command = Command::new("codex");
+    command
+        .args(["app-server", "--stdio"])
+        .env("CODEX_HOME", home)
+        .env_remove("CODEX_API_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().map_err(codex_spawn_error)?;
+    let result = (|| -> AppResult<Option<String>> {
+        let mut stdin = child.stdin.take().ok_or(AppError::RuntimeUnavailable)?;
+        for request in [
+            json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "codex-relay",
+                        "title": "Codex Relay",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": {}
+                }
+            }),
+            json!({"method": "initialized", "params": {}}),
+            json!({"method": "account/read", "id": 2, "params": {"refreshToken": true}}),
+        ] {
+            serde_json::to_writer(&mut stdin, &request)
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            stdin
+                .write_all(b"\n")
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+        }
+        stdin.flush().map_err(|_| AppError::RuntimeUnavailable)?;
+
+        let stdout = child.stdout.take().ok_or(AppError::RuntimeUnavailable)?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + CODEX_APP_SERVER_ACCOUNT_READ_TIMEOUT;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let line = receiver
+                .recv_timeout(remaining)
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            let response: serde_json::Value =
+                serde_json::from_str(&line).map_err(|_| AppError::RuntimeUnavailable)?;
+            if response.get("id") != Some(&json!(2)) {
+                continue;
+            }
+            if response.get("error").is_some() {
+                return Err(app_server_account_error(&response));
+            }
+            return Ok(response
+                .get("result")
+                .and_then(|result| result.get("account"))
+                .filter(|account| !account.is_null())
+                .and_then(|account| account.get("accountId").or_else(|| account.get("id")))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned));
+        }
+        Err(AppError::RuntimeUnavailable)
+    })();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn codex_spawn_error(error: std::io::Error) -> AppError {
+    if error.kind() == ErrorKind::NotFound {
+        AppError::CodexCliMissing
+    } else {
+        AppError::RuntimeUnavailable
+    }
+}
+
+fn app_server_account_error(response: &serde_json::Value) -> AppError {
+    let detail = response
+        .get("error")
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if detail.contains("401")
+        || detail.contains("403")
+        || detail.contains("unauthorized")
+        || detail.contains("forbidden")
+        || detail.contains("auth")
+        || detail.contains("login")
+    {
+        AppError::ProfileRuntimeUnavailable
+    } else {
+        AppError::RuntimeUnavailable
+    }
 }
 
 pub(crate) async fn ensure_codex_client_key(
@@ -781,6 +1119,28 @@ async fn enable_api_profile_at_path(
     data_dir: &Path,
     path: &Path,
 ) -> AppResult<GatewayCodexConfigStatus> {
+    let verifier = AppServerProjectedOAuthIdentityVerifier;
+    enable_api_profile_at_path_with_verifier(
+        repository,
+        secrets,
+        oauth_credentials,
+        id,
+        data_dir,
+        path,
+        &verifier,
+    )
+    .await
+}
+
+async fn enable_api_profile_at_path_with_verifier(
+    repository: &Repository,
+    secrets: Arc<dyn SecretStore>,
+    oauth_credentials: Arc<OAuthCredentialStore>,
+    id: &str,
+    data_dir: &Path,
+    path: &Path,
+    verifier: &dyn ProjectedOAuthIdentityVerifier,
+) -> AppResult<GatewayCodexConfigStatus> {
     let stored = repository.profile(id)?;
     if stored.profile.kind != crate::domain::ProfileKind::ApiKey
         || stored.profile.health != "healthy"
@@ -837,6 +1197,7 @@ async fn enable_api_profile_at_path(
     provider["name"] = value(format!("Codex Relay · {}", stored.profile.alias));
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(true);
     let mut auth = Table::new();
     auth["command"] = value(
         std::env::current_exe()
@@ -858,8 +1219,12 @@ async fn enable_api_profile_at_path(
     fs::write(path, generated).map_err(|_| AppError::RuntimeUnavailable)?;
     repository.set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, &stored.profile.id)?;
     if let Some(auth_json) = auth_json.as_deref() {
-        project_auth_json_to_default_codex_home(auth_json)?;
-        message = format!("{message} OAuth 登录档案已同步到默认 Codex 凭据。");
+        let projection_message = project_auth_json_to_default_codex_home_with_verifier(
+            auth_json,
+            OAuthProjectionRoute::ThirdParty,
+            verifier,
+        )?;
+        message = format!("{message} {projection_message}");
     }
     let oauth_profile = codex_oauth_profile_status_for_id(
         repository,
@@ -1120,8 +1485,10 @@ mod tests {
     use super::{
         codex_oauth_profile_options, content_hash, enable_api_profile_at_path, enable_for_path,
         gateway_model_options, relay_auth_config, remove_relay_config,
-        set_codex_oauth_profile_at_path, status_for_path, sync_active_direct_oauth_profile_at_path,
-        timestamp_ms,
+        set_codex_oauth_profile_at_path, set_codex_oauth_profile_at_path_with_verifier,
+        status_for_path, sync_active_direct_oauth_profile_at_path,
+        sync_active_direct_oauth_profile_at_path_with_verifier, timestamp_ms,
+        AuthJsonProjectedOAuthIdentityVerifier, MismatchedProjectedOAuthIdentityVerifier,
     };
     use crate::{
         database::{Repository, StoredProfile},
@@ -1220,6 +1587,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_oauth_selection_repairs_requires_openai_auth_and_projects_identity() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let oauth_credentials = OAuthCredentialStore::new(secrets.clone());
+        insert_oauth_profile(&repository, "oauth-b", "账号 B");
+        let credential = CodexOAuthCredential {
+            id_token: "id-oauth-b".to_owned(),
+            access_token: "access-b".to_owned(),
+            refresh_token: Some("refresh-b".to_owned()),
+            account_id: Some("account-b".to_owned()),
+            last_refresh_ms: 1,
+        };
+        secrets
+            .set(
+                "profile:oauth-b:oauth",
+                &serde_json::to_string(&credential).unwrap(),
+            )
+            .await
+            .unwrap();
+        let root = temp_root("codex-relay-oauth-selection");
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model_provider = "codex_relay"
+model = "provider-real"
+
+[model_providers.codex_relay]
+name = "Codex Relay LAN Gateway"
+base_url = "http://127.0.0.1:53111/v1"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+        let verifier = AuthJsonProjectedOAuthIdentityVerifier;
+
+        let status = set_codex_oauth_profile_at_path_with_verifier(
+            &repository,
+            &oauth_credentials,
+            SetCodexGatewayOAuthProfileInput {
+                profile_id: Some("oauth-b".to_owned()),
+                confirmed: true,
+            },
+            &config_path,
+            false,
+            &verifier,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status.mode, "relay_gateway");
+        assert_eq!(status.oauth_profile_id.as_deref(), Some("oauth-b"));
+        assert!(status.message.contains("模型请求仍走 Relay 网关"));
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["tokens"]["account_id"], "account-b");
+        assert_eq!(auth["tokens"]["access_token"], "access-b");
+        assert_eq!(auth["tokens"]["refresh_token"], "refresh-b");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(config["model_provider"].as_str(), Some("codex_relay"));
+        assert_eq!(
+            config["model_providers"]["codex_relay"]["base_url"].as_str(),
+            Some("http://127.0.0.1:53111/v1")
+        );
+        assert_eq!(
+            config["model_providers"]["codex_relay"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn direct_oauth_selection_projects_selected_identity_without_changing_provider() {
         let repository = Repository::memory();
         let secrets = Arc::new(MemorySecretStore::new());
@@ -1279,7 +1722,8 @@ wire_api = "responses"
         )
         .unwrap();
 
-        let status = set_codex_oauth_profile_at_path(
+        let verifier = AuthJsonProjectedOAuthIdentityVerifier;
+        let status = set_codex_oauth_profile_at_path_with_verifier(
             &repository,
             &oauth_credentials,
             SetCodexGatewayOAuthProfileInput {
@@ -1288,6 +1732,7 @@ wire_api = "responses"
             },
             &config_path,
             false,
+            &verifier,
         )
         .await
         .unwrap();
@@ -1328,6 +1773,84 @@ wire_api = "responses"
         assert_eq!(
             config["model_providers"]["codex_relay_direct"]["base_url"].as_str(),
             Some("https://api.example.com/v1")
+        );
+        assert_eq!(
+            config["model_providers"]["codex_relay_direct"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn direct_oauth_selection_rejects_account_read_mismatch() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let oauth_credentials = OAuthCredentialStore::new(secrets.clone());
+        insert_oauth_profile(&repository, "oauth-b", "账号 B");
+        insert_api_profile(
+            &repository,
+            "api-direct",
+            "Third Party",
+            "healthy",
+            None,
+            vec!["provider-real"],
+            Vec::new(),
+        );
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "api-direct")
+            .unwrap();
+        let credential = CodexOAuthCredential {
+            id_token: "id-oauth-b".to_owned(),
+            access_token: "access-b".to_owned(),
+            refresh_token: Some("refresh-b".to_owned()),
+            account_id: Some("account-b".to_owned()),
+            last_refresh_ms: 1,
+        };
+        secrets
+            .set(
+                "profile:oauth-b:oauth",
+                &serde_json::to_string(&credential).unwrap(),
+            )
+            .await
+            .unwrap();
+        let root = temp_root("codex-direct-oauth-mismatch");
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model_provider = "codex_relay_direct"
+model = "provider-real"
+
+[model_providers.codex_relay_direct]
+name = "Third Party"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+        let verifier = MismatchedProjectedOAuthIdentityVerifier;
+
+        let result = set_codex_oauth_profile_at_path_with_verifier(
+            &repository,
+            &oauth_credentials,
+            SetCodexGatewayOAuthProfileInput {
+                profile_id: Some("oauth-b".to_owned()),
+                confirmed: true,
+            },
+            &config_path,
+            false,
+            &verifier,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::OAuthIdentityMismatch)));
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            config["model_providers"]["codex_relay_direct"]["requires_openai_auth"].as_bool(),
+            Some(true)
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1392,18 +1915,22 @@ wire_api = "responses"
         )
         .unwrap();
 
-        let status = sync_active_direct_oauth_profile_at_path(
+        let verifier = AuthJsonProjectedOAuthIdentityVerifier;
+        let status = sync_active_direct_oauth_profile_at_path_with_verifier(
             &repository,
             &oauth_credentials,
             "api-direct",
             &config_path,
+            &verifier,
         )
         .await
         .unwrap();
 
         assert_eq!(status.mode, "third_party");
         assert_eq!(status.oauth_profile_id.as_deref(), Some("oauth-b"));
-        assert!(status.message.contains("OAuth 登录档案已同步"));
+        assert!(status
+            .message
+            .contains("OAuth 登录档案已写入并验证为所选账号"));
         let auth: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(root.join("auth.json")).unwrap())
                 .unwrap();
@@ -1422,6 +1949,10 @@ wire_api = "responses"
         assert_eq!(
             config["model_providers"]["codex_relay_direct"]["base_url"].as_str(),
             Some("https://api.example.com/v1")
+        );
+        assert_eq!(
+            config["model_providers"]["codex_relay_direct"]["requires_openai_auth"].as_bool(),
+            Some(true)
         );
         assert_eq!(
             repository
@@ -1674,6 +2205,10 @@ base_url = "https://api.example.com/v1"
             document["model_providers"]["codex_relay_direct"]["base_url"].as_str(),
             Some("https://api.example.com/v1")
         );
+        assert_eq!(
+            document["model_providers"]["codex_relay_direct"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
         let auth = relay_auth_config(&document, "codex_relay_direct").unwrap();
         assert_eq!(auth.secret_ref, "profile:api:credential");
         assert_eq!(auth.data_dir, data_dir);
@@ -1801,6 +2336,10 @@ base_url = "https://api.example.com/v1"
         assert_eq!(result.auth_status, "ok");
         assert!(!result.needs_repair);
         assert_eq!(document["model_provider"].as_str(), Some("codex_relay"));
+        assert_eq!(
+            document["model_providers"]["codex_relay"]["requires_openai_auth"].as_bool(),
+            Some(true)
+        );
         assert_ne!(auth.secret_ref, "client-key:stale");
         assert_eq!(
             repository

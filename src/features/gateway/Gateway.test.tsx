@@ -252,6 +252,8 @@ describe("Gateway", () => {
       ...directStatus,
       oauth_profile_id: "oauth-b",
       oauth_profile_alias: "账号 B",
+      message:
+        "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
     });
     const { onNotice } = renderGateway({ available_profiles: 1 });
 
@@ -264,7 +266,7 @@ describe("Gateway", () => {
       expect(api.setCodexGatewayOAuthProfile).toHaveBeenCalledWith("oauth-b"),
     );
     expect(onNotice).toHaveBeenCalledWith(
-      "第三方直连 OAuth 登录档案已绑定，仅用于解锁登录态。",
+      "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
     );
     expect(trigger).toHaveTextContent("账号 B");
   });

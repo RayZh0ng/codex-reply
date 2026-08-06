@@ -943,7 +943,8 @@ describe("App", () => {
               ...activeStatus,
               oauth_profile_id: "oauth-b",
               oauth_profile_alias: "Work B",
-              message: "已同步 OAuth 登录档案，已重启 Codex。",
+              message:
+                "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
             },
           });
         }
@@ -984,7 +985,7 @@ describe("App", () => {
       }),
     );
     expect(screen.getByRole("status")).toHaveTextContent(
-      "已同步 OAuth 登录档案，已重启 Codex。",
+      "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
     );
     expect(
       native.invoke.mock.calls.some(

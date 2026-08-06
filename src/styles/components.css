@@ -963,12 +963,13 @@
 }
 .profile-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-  gap: 20px;
-  align-items: start;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(18px, 2vw, 28px);
+  align-items: stretch;
 }
 .profile-card {
   display: flex;
+  height: 100%;
   flex-direction: column;
   padding: 24px;
   border: 1px solid rgb(60 60 67 / 12%);
@@ -1319,7 +1320,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-top: 18px;
+  margin-top: auto;
   padding-top: 18px;
   border-top: 1px solid rgb(60 60 67 / 11%);
 }
@@ -5755,26 +5756,24 @@ input[type="number"]::-webkit-outer-spin-button {
   }
 }
 
-/* 档案页瀑布式排列：避免长短卡片在栅格中产生大块留白。 */
+/* 档案页规则栅格：保持卡片列宽、行高和操作区对齐。 */
 .profile-grid {
-  display: block;
-  column-count: 2;
-  column-gap: clamp(18px, 2vw, 28px);
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(18px, 2vw, 28px);
+  align-items: stretch;
 }
 
 .profile-grid > .profile-card {
-  display: inline-flex;
   width: 100%;
-  margin: 0 0 clamp(18px, 2vw, 28px);
-  break-inside: avoid;
-  page-break-inside: avoid;
+  height: 100%;
+  min-width: 0;
 }
 
 .profile-grid > .empty-state {
   display: grid;
+  grid-column: 1 / -1;
   width: 100%;
-  break-inside: avoid;
-  column-span: all;
 }
 
 .profile-oauth-binding {
@@ -5785,12 +5784,12 @@ input[type="number"]::-webkit-outer-spin-button {
 
 @media (min-width: 1600px) {
   .profile-grid {
-    column-count: 3;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 980px) {
   .profile-grid {
-    column-count: 1;
+    grid-template-columns: 1fr;
   }
 }
