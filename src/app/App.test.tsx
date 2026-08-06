@@ -5,10 +5,15 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DashboardSnapshot } from "../shared/ipc";
+import type {
+  DashboardSnapshot,
+  GatewayCodexConfigStatus,
+  MaskedProfile,
+} from "../shared/ipc";
 import App from "./App";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -28,6 +33,7 @@ vi.stubGlobal("ResizeObserver", ResizeObserver);
 let eventHandlers: Record<string, (event: { payload: unknown }) => void> = {};
 
 beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn();
   eventHandlers = {};
   events.listen.mockImplementation(
     (event: string, handler: (event: { payload: unknown }) => void) => {
@@ -879,6 +885,210 @@ describe("App", () => {
     );
   });
 
+  it("updates active direct API profile OAuth binding through the sync command", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const oauthA = {
+      ...snapshot.profiles[0],
+      id: "oauth-a",
+      alias: "Work A",
+      is_current: true,
+    };
+    const oauthB = {
+      ...snapshot.profiles[1],
+      id: "oauth-b",
+      alias: "Work B",
+      is_current: false,
+    };
+    const apiProfile = apiProfileForAppTest("api-active", "oauth-a");
+    let currentSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      profiles: [oauthA, oauthB, apiProfile],
+    };
+    const activeStatus = gatewayConfigForAppTest({
+      enabled: true,
+      directProfileId: "api-active",
+      oauthProfileId: "oauth-a",
+      message: "Codex 正在直连第三方模型提供商：Third Party。",
+    });
+    native.invoke.mockImplementation(
+      (command: string, args?: Record<string, unknown>) => {
+        if (command === "dashboard_snapshot") return Promise.resolve(currentSnapshot);
+        if (command === "managed_task_status")
+          return Promise.resolve(idleTaskStatusForTest());
+        if (command === "refresh_profile_quotas")
+          return Promise.resolve({ profiles: [], failed_profile_ids: [] });
+        if (command === "codex_gateway_config_status")
+          return Promise.resolve(activeStatus);
+        if (command === "update_api_service_profile") {
+          expect(args).toEqual({
+            input: expect.objectContaining({
+              id: "api-active",
+              codex_oauth_profile_id: "oauth-b",
+              provider: "openai_compatible",
+              wire_api: "responses",
+              base_url: "https://api.example.test/v1",
+            }),
+          });
+          const updatedProfile = { ...apiProfile, codex_oauth_profile_id: "oauth-b" };
+          currentSnapshot = {
+            ...currentSnapshot,
+            profiles: [oauthA, oauthB, updatedProfile],
+          };
+          return Promise.resolve({
+            profile: updatedProfile,
+            codex_config: {
+              ...activeStatus,
+              oauth_profile_id: "oauth-b",
+              oauth_profile_alias: "Work B",
+              message: "已同步 OAuth 登录档案，已重启 Codex。",
+            },
+          });
+        }
+        if (command === "list_collaboration_bots") return Promise.resolve([]);
+        if (command === "list_collaboration_project_bindings")
+          return Promise.resolve([]);
+        if (command === "list_codex_sessions") return Promise.resolve([]);
+        if (command === "list_collaboration_contexts") return Promise.resolve([]);
+        if (command === "list_gateway_model_options")
+          return Promise.resolve(["codex-visible"]);
+        return Promise.reject(new Error(`unexpected command: ${command}`));
+      },
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "档案" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "编辑 API 服务：Third Party" }),
+    );
+    const sheet = await screen
+      .findByRole("heading", { name: "编辑第三方模型提供商" })
+      .then((heading) => heading.closest("section") as HTMLElement);
+    const form = within(sheet);
+    const oauthSelector = form.getByRole("combobox", {
+      name: "OAuth 登录档案（可选）",
+    });
+    await waitFor(() => expect(oauthSelector).toHaveTextContent("Work A"));
+    fireEvent.click(oauthSelector);
+    fireEvent.click(await screen.findByRole("option", { name: /Work B/ }));
+    fireEvent.click(form.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("update_api_service_profile", {
+        input: expect.objectContaining({
+          id: "api-active",
+          codex_oauth_profile_id: "oauth-b",
+        }),
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "已同步 OAuth 登录档案，已重启 Codex。",
+    );
+    expect(
+      native.invoke.mock.calls.some(
+        ([command, args]) =>
+          command === "update_profile" &&
+          (args as { input?: { id?: string } } | undefined)?.input?.id === "api-active",
+      ),
+    ).toBe(false);
+  });
+
+  it("shows the ordinary provider update notice when an API profile is inactive", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const oauthA = {
+      ...snapshot.profiles[0],
+      id: "oauth-a",
+      alias: "Work A",
+      is_current: true,
+    };
+    const oauthB = {
+      ...snapshot.profiles[1],
+      id: "oauth-b",
+      alias: "Work B",
+      is_current: false,
+    };
+    const apiProfile = apiProfileForAppTest("api-inactive", "oauth-a");
+    let currentSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      profiles: [oauthA, oauthB, apiProfile],
+    };
+    const inactiveStatus = gatewayConfigForAppTest({
+      enabled: false,
+      directProfileId: null,
+      oauthProfileId: null,
+      message: "Codex 正在使用官方模型配置。",
+    });
+    native.invoke.mockImplementation(
+      (command: string, args?: Record<string, unknown>) => {
+        if (command === "dashboard_snapshot") return Promise.resolve(currentSnapshot);
+        if (command === "managed_task_status")
+          return Promise.resolve(idleTaskStatusForTest());
+        if (command === "refresh_profile_quotas")
+          return Promise.resolve({ profiles: [], failed_profile_ids: [] });
+        if (command === "codex_gateway_config_status")
+          return Promise.resolve(inactiveStatus);
+        if (command === "update_api_service_profile") {
+          expect(args).toEqual({
+            input: expect.objectContaining({
+              id: "api-inactive",
+              codex_oauth_profile_id: "oauth-b",
+            }),
+          });
+          const updatedProfile = { ...apiProfile, codex_oauth_profile_id: "oauth-b" };
+          currentSnapshot = {
+            ...currentSnapshot,
+            profiles: [oauthA, oauthB, updatedProfile],
+          };
+          return Promise.resolve({
+            profile: updatedProfile,
+            codex_config: null,
+          });
+        }
+        if (command === "list_collaboration_bots") return Promise.resolve([]);
+        if (command === "list_collaboration_project_bindings")
+          return Promise.resolve([]);
+        if (command === "list_codex_sessions") return Promise.resolve([]);
+        if (command === "list_collaboration_contexts") return Promise.resolve([]);
+        if (command === "list_gateway_model_options")
+          return Promise.resolve(["codex-visible"]);
+        return Promise.reject(new Error(`unexpected command: ${command}`));
+      },
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "档案" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "编辑 API 服务：Third Party" }),
+    );
+    const sheet = await screen
+      .findByRole("heading", { name: "编辑第三方模型提供商" })
+      .then((heading) => heading.closest("section") as HTMLElement);
+    const form = within(sheet);
+    const oauthSelector = form.getByRole("combobox", {
+      name: "OAuth 登录档案（可选）",
+    });
+    await waitFor(() => expect(oauthSelector).toHaveTextContent("Work A"));
+    fireEvent.click(oauthSelector);
+    fireEvent.click(await screen.findByRole("option", { name: /Work B/ }));
+    fireEvent.click(form.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("update_api_service_profile", {
+        input: expect.objectContaining({
+          id: "api-inactive",
+          codex_oauth_profile_id: "oauth-b",
+        }),
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("第三方模型提供商已更新。");
+    expect(screen.getByRole("status")).not.toHaveTextContent("重启");
+  });
+
   it("keeps a background Keychain authorization requirement out of the global error state", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
@@ -995,6 +1205,86 @@ describe("App", () => {
     ).toBeInTheDocument();
   });
 });
+
+function apiProfileForAppTest(id: string, codexOAuthProfileId: string): MaskedProfile {
+  return {
+    id,
+    alias: "Third Party",
+    kind: "api_key",
+    base_url: "https://api.example.test/v1",
+    provider: "openai_compatible",
+    wire_api: "responses",
+    enabled: true,
+    in_pool: false,
+    priority: 0,
+    weight: 1,
+    models: ["codex-visible"],
+    model_mappings: [
+      {
+        model: "codex-visible",
+        upstream_model: "provider-real",
+        display_name: "Provider Real",
+        context_window: null,
+      },
+    ],
+    codex_oauth_profile_id: codexOAuthProfileId,
+    health: "healthy",
+    cooldown_until_ms: null,
+    credential_configured: true,
+    is_current: false,
+    validation_status: "unknown",
+    validated_at_ms: null,
+    validation_message: null,
+  };
+}
+
+function gatewayConfigForAppTest({
+  enabled,
+  directProfileId,
+  oauthProfileId,
+  message,
+}: {
+  enabled: boolean;
+  directProfileId: string | null;
+  oauthProfileId: string | null;
+  message: string;
+}): GatewayCodexConfigStatus {
+  return {
+    enabled,
+    mode: enabled && directProfileId ? "third_party" : "official",
+    config_path: "/Users/test/.codex/config.toml",
+    service_url: enabled ? "https://api.example.test/v1" : null,
+    message,
+    auth_status: enabled ? "ok" : "missing",
+    needs_repair: false,
+    direct_profile_id: directProfileId,
+    direct_profile_alias: directProfileId ? "Third Party" : null,
+    oauth_profile_id: oauthProfileId,
+    oauth_profile_alias:
+      oauthProfileId === "oauth-a"
+        ? "Work A"
+        : oauthProfileId === "oauth-b"
+          ? "Work B"
+          : null,
+    oauth_profile_available: Boolean(oauthProfileId),
+    oauth_profile_options: [
+      {
+        id: "oauth-a",
+        alias: "Work A",
+        available: true,
+        reason: null,
+      },
+      {
+        id: "oauth-b",
+        alias: "Work B",
+        available: true,
+        reason: null,
+      },
+    ],
+    history_sync: null,
+    history_sync_status: null,
+  };
+}
 
 function commandCalls(command: string) {
   return native.invoke.mock.calls.filter(([name]) => name === command);

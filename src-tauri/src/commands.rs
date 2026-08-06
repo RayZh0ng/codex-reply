@@ -26,31 +26,32 @@ use crate::{
     collaboration::CollaborationManager,
     database::Repository,
     domain::{
-        AppUpdateChannel, AppUpdateInfo, AppUpdateProgressEvent, AppUpdateProgressPhase,
-        AppUpdateSettings, CancelCodexSessionInput, CancelManagedTaskInput, CheckAppUpdateInput,
-        ClientKeySecretInput, CodexAuthMode, CodexEnvironmentInstallReport, CodexEnvironmentReport,
-        CodexHistoryExportReport, CodexHistoryImportReport, CodexHistoryMutationReport,
-        CodexHistoryReport, CodexHistorySyncReport, CodexHistoryTransitionStatus,
-        CodexSessionSummary, CollaborationCallbackStatus, CollaborationContextSummary,
-        CollaborationProjectBinding, CollaborationProvider, CommitJsonProfileImportInput,
-        CompleteOAuthImportInput, ContinueCodexSessionInput, CreateApiServiceProfileInput,
-        CreateClientKeyInput, CreateProfileInput, CreatedClientKey, CurrentProfileActivation,
-        CurrentProfileActivationStatusInput, DashboardSnapshot, DeleteCodexHistoryInput,
-        DeleteCollaborationBotInput, DeleteCollaborationProjectBindingInput,
-        DeleteDesktopWorkspaceInput, DeleteFeishuBotInput, DeleteFeishuProjectBindingInput,
-        DesktopWorkspaceHistoryItem, DesktopWorkspaceSettings, DiscardJsonProfileImportInput,
-        ExportCodexHistoryInput, FeishuProjectBinding, GatewayCodexConfigStatus, GatewayProvider,
-        GatewayStatus, GatewayWireApi, ImportCodexHistoryInput, InstallAppUpdateInput,
-        InstallCodexEnvironmentInput, JsonProfileImportPreview, JsonProfileImportResult,
-        ListCodexHistoryInput, ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey,
-        MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile, OAuthImportStatus,
-        PreviewJsonProfileImportInput, ProfileQuotaRefreshReport, ResetCollaborationContextInput,
-        RestoreDesktopWorkspaceInput, RetryJsonProfileImportInput, SelectCurrentProfileInput,
-        SetCodexGatewayOAuthProfileInput, StartManagedTaskInput, StartOAuthImportInput,
-        SyncCodexHistoryInput, TestApiServiceInput, UpdateAppUpdateSettingsInput,
-        UpdateCollaborationContextInput, UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput,
-        UpdateProfileInput, UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput,
-        UpsertFeishuBotInput, UpsertFeishuProjectBindingInput, APP_UPDATE_PROGRESS_EVENT,
+        ApiServiceProfileUpdateResult, AppUpdateChannel, AppUpdateInfo, AppUpdateProgressEvent,
+        AppUpdateProgressPhase, AppUpdateSettings, CancelCodexSessionInput, CancelManagedTaskInput,
+        CheckAppUpdateInput, ClientKeySecretInput, CodexAuthMode, CodexEnvironmentInstallReport,
+        CodexEnvironmentReport, CodexHistoryExportReport, CodexHistoryImportReport,
+        CodexHistoryMutationReport, CodexHistoryReport, CodexHistorySyncReport,
+        CodexHistoryTransitionStatus, CodexSessionSummary, CollaborationCallbackStatus,
+        CollaborationContextSummary, CollaborationProjectBinding, CollaborationProvider,
+        CommitJsonProfileImportInput, CompleteOAuthImportInput, ContinueCodexSessionInput,
+        CreateApiServiceProfileInput, CreateClientKeyInput, CreateProfileInput, CreatedClientKey,
+        CurrentProfileActivation, CurrentProfileActivationStatusInput, DashboardSnapshot,
+        DeleteCodexHistoryInput, DeleteCollaborationBotInput,
+        DeleteCollaborationProjectBindingInput, DeleteDesktopWorkspaceInput, DeleteFeishuBotInput,
+        DeleteFeishuProjectBindingInput, DesktopWorkspaceHistoryItem, DesktopWorkspaceSettings,
+        DiscardJsonProfileImportInput, ExportCodexHistoryInput, FeishuProjectBinding,
+        GatewayCodexConfigStatus, GatewayProvider, GatewayStatus, GatewayWireApi,
+        ImportCodexHistoryInput, InstallAppUpdateInput, InstallCodexEnvironmentInput,
+        JsonProfileImportPreview, JsonProfileImportResult, ListCodexHistoryInput,
+        ListCodexSessionsInput, ManagedTaskStatus, MaskedClientKey, MaskedCollaborationBot,
+        MaskedFeishuBot, MaskedProfile, OAuthImportStatus, PreviewJsonProfileImportInput,
+        ProfileQuotaRefreshReport, ResetCollaborationContextInput, RestoreDesktopWorkspaceInput,
+        RetryJsonProfileImportInput, SelectCurrentProfileInput, SetCodexGatewayOAuthProfileInput,
+        StartManagedTaskInput, StartOAuthImportInput, SyncCodexHistoryInput, TestApiServiceInput,
+        UpdateAppUpdateSettingsInput, UpdateCollaborationContextInput,
+        UpdateDesktopWorkspaceSettingsInput, UpdateGatewayInput, UpdateProfileInput,
+        UpsertCollaborationBotInput, UpsertCollaborationProjectBindingInput, UpsertFeishuBotInput,
+        UpsertFeishuProjectBindingInput, APP_UPDATE_PROGRESS_EVENT,
         CODEX_HISTORY_SYNC_FINISHED_EVENT,
     },
     error::{AppError, AppResult},
@@ -218,6 +219,56 @@ pub async fn update_profile(
     state: State<'_, AppState>,
 ) -> AppResult<MaskedProfile> {
     profiles::update_profile(&state.repository, state.secrets.clone(), input).await
+}
+
+#[tauri::command]
+pub async fn update_api_service_profile(
+    input: UpdateProfileInput,
+    state: State<'_, AppState>,
+) -> AppResult<ApiServiceProfileUpdateResult> {
+    let profile_id = input.id.clone();
+    let current_codex_config = codex_gateway::status(&state.repository).await?;
+    let is_active_direct_profile = current_codex_config.enabled
+        && current_codex_config.mode == "third_party"
+        && current_codex_config.direct_profile_id.as_deref() == Some(profile_id.as_str());
+    let oauth_profile_id = if is_active_direct_profile {
+        match input.codex_oauth_profile_id.as_ref() {
+            Some(Some(profile_id)) => Some(profile_id.clone()),
+            Some(None) => None,
+            None => {
+                state
+                    .repository
+                    .profile(&profile_id)?
+                    .profile
+                    .codex_oauth_profile_id
+            }
+        }
+    } else {
+        None
+    };
+    if is_active_direct_profile {
+        validate_oauth_profile_for_switch(state.inner(), oauth_profile_id.as_deref()).await?;
+    }
+
+    let profile = profiles::update_profile(&state.repository, state.secrets.clone(), input).await?;
+    let codex_config = if is_active_direct_profile {
+        let mut status = codex_gateway::sync_active_direct_oauth_profile(
+            &state.repository,
+            &state.oauth_credentials,
+            &profile_id,
+        )
+        .await?;
+        if profile.codex_oauth_profile_id.is_some() {
+            append_shared_desktop_restart_result(state.inner(), &mut status);
+        }
+        Some(status)
+    } else {
+        None
+    };
+    Ok(ApiServiceProfileUpdateResult {
+        profile,
+        codex_config,
+    })
 }
 
 #[tauri::command]

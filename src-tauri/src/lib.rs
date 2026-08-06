@@ -40,6 +40,7 @@ pub fn run() {
             commands::create_profile,
             commands::create_api_service_profile,
             commands::update_profile,
+            commands::update_api_service_profile,
             commands::sync_profile_account_info,
             commands::refresh_profile_quotas,
             commands::delete_profile,

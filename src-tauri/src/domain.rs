@@ -462,6 +462,12 @@ pub struct UpdateProfileInput {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ApiServiceProfileUpdateResult {
+    pub profile: MaskedProfile,
+    pub codex_config: Option<GatewayCodexConfigStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DashboardSnapshot {
     pub gateway: GatewayStatus,
     pub profiles: Vec<MaskedProfile>,

@@ -588,6 +588,118 @@ describe("Profiles OAuth import", () => {
     );
   });
 
+  it("saves the selected OAuth account when editing a third-party provider", async () => {
+    const onUpdateApiProfile = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(api, "codexGatewayConfigStatus").mockResolvedValue({
+      enabled: true,
+      mode: "third_party",
+      config_path: "/Users/test/.codex/config.toml",
+      service_url: "https://api.example.test/v1",
+      message: "Codex 正在直连第三方模型提供商：Third Party。",
+      auth_status: "ok",
+      needs_repair: false,
+      direct_profile_id: "api-active",
+      direct_profile_alias: "Third Party",
+      oauth_profile_id: "oauth-a",
+      oauth_profile_alias: "Work A",
+      oauth_profile_available: true,
+      oauth_profile_options: [
+        {
+          id: "oauth-a",
+          alias: "Work A",
+          available: true,
+          reason: null,
+        },
+        {
+          id: "oauth-b",
+          alias: "Work B",
+          available: true,
+          reason: null,
+        },
+      ],
+      history_sync: null,
+    });
+    render(
+      <Profiles
+        profiles={[
+          profileFixture({ id: "oauth-a", alias: "Work A" }),
+          profileFixture({ id: "oauth-b", alias: "Work B" }),
+          {
+            id: "api-active",
+            alias: "Third Party",
+            kind: "api_key",
+            base_url: "https://api.example.test/v1",
+            provider: "openai_compatible",
+            wire_api: "responses",
+            enabled: true,
+            in_pool: false,
+            priority: 0,
+            weight: 1,
+            models: ["codex-visible"],
+            model_mappings: [
+              {
+                model: "codex-visible",
+                upstream_model: "provider-real",
+                display_name: "Provider Real",
+                context_window: null,
+              },
+            ],
+            codex_oauth_profile_id: "oauth-a",
+            health: "healthy",
+            cooldown_until_ms: null,
+            credential_configured: true,
+            is_current: false,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
+          },
+        ]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onUpdateApiProfile={onUpdateApiProfile}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑 API 服务：Third Party" }));
+    const sheet = screen
+      .getByRole("heading", { name: "编辑第三方模型提供商" })
+      .closest("section") as HTMLElement;
+    const form = within(sheet);
+    const oauthSelector = form.getByRole("combobox", {
+      name: "OAuth 登录档案（可选）",
+    });
+    await waitFor(() => expect(oauthSelector).toHaveTextContent("Work A"));
+    fireEvent.click(oauthSelector);
+    fireEvent.click(await screen.findByRole("option", { name: /Work B/ }));
+    fireEvent.click(form.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() =>
+      expect(onUpdateApiProfile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "api-active",
+          codex_oauth_profile_id: "oauth-b",
+          provider: "openai_compatible",
+          wire_api: "responses",
+          base_url: "https://api.example.test/v1",
+          model_mappings: [
+            {
+              model: "codex-visible",
+              upstream_model: "provider-real",
+              display_name: "Provider Real",
+              context_window: null,
+            },
+          ],
+        }),
+      ),
+    );
+  });
+
   it("resets model mappings from discovered upstream models", async () => {
     vi.spyOn(api, "testApiServiceProfile").mockResolvedValue({
       status: "verified",

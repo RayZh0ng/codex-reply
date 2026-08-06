@@ -572,6 +572,57 @@ pub(crate) fn gateway_model_is_available(repository: &Repository, model: &str) -
         .any(|candidate| candidate == model))
 }
 
+pub(crate) async fn sync_active_direct_oauth_profile(
+    repository: &Repository,
+    oauth_credentials: &OAuthCredentialStore,
+    profile_id: &str,
+) -> AppResult<GatewayCodexConfigStatus> {
+    let path = config_path()?;
+    sync_active_direct_oauth_profile_at_path(repository, oauth_credentials, profile_id, &path).await
+}
+
+async fn sync_active_direct_oauth_profile_at_path(
+    repository: &Repository,
+    oauth_credentials: &OAuthCredentialStore,
+    profile_id: &str,
+    path: &Path,
+) -> AppResult<GatewayCodexConfigStatus> {
+    let current = status_for_path(repository, path)?;
+    if !current.enabled
+        || current.mode != "third_party"
+        || current.direct_profile_id.as_deref() != Some(profile_id)
+    {
+        return Ok(current);
+    }
+
+    let stored = repository.profile(profile_id)?;
+    if stored.profile.kind != ProfileKind::ApiKey {
+        return Err(AppError::ValidationFailed);
+    }
+    let auth_json = codex_oauth_profile_auth_json_for_id(
+        repository,
+        oauth_credentials,
+        stored.profile.codex_oauth_profile_id.as_deref(),
+        CredentialAccess::UserInitiated,
+    )
+    .await?;
+    if let Some(auth_json) = auth_json.as_deref() {
+        let home = path.parent().ok_or(AppError::RuntimeUnavailable)?;
+        write_auth_json_to_home(home, auth_json)?;
+    }
+
+    let mut status = status_for_path(repository, path)?;
+    status.message = if stored.profile.codex_oauth_profile_id.is_some() {
+        format!("{} OAuth 登录档案已同步到默认 Codex 凭据。", status.message)
+    } else {
+        format!(
+            "{} OAuth 登录档案已清空，未改写默认 Codex 凭据。",
+            status.message
+        )
+    };
+    Ok(status)
+}
+
 fn is_codex_oauth_unlock_profile(stored: &StoredProfile) -> bool {
     let profile = &stored.profile;
     profile.kind == ProfileKind::CodexOauth
@@ -1069,7 +1120,8 @@ mod tests {
     use super::{
         codex_oauth_profile_options, content_hash, enable_api_profile_at_path, enable_for_path,
         gateway_model_options, relay_auth_config, remove_relay_config,
-        set_codex_oauth_profile_at_path, status_for_path, timestamp_ms,
+        set_codex_oauth_profile_at_path, status_for_path, sync_active_direct_oauth_profile_at_path,
+        timestamp_ms,
     };
     use crate::{
         database::{Repository, StoredProfile},
@@ -1277,6 +1329,159 @@ wire_api = "responses"
             config["model_providers"]["codex_relay_direct"]["base_url"].as_str(),
             Some("https://api.example.com/v1")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn active_direct_profile_update_projects_selected_oauth_identity_only() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let oauth_credentials = OAuthCredentialStore::new(secrets.clone());
+        insert_oauth_profile(&repository, "oauth-a", "账号 A");
+        insert_oauth_profile(&repository, "oauth-b", "账号 B");
+        insert_api_profile(
+            &repository,
+            "api-direct",
+            "Third Party",
+            "healthy",
+            None,
+            vec!["provider-real"],
+            Vec::new(),
+        );
+        let mut direct = repository.profile("api-direct").unwrap();
+        direct.profile.codex_oauth_profile_id = Some("oauth-b".to_owned());
+        repository.update_profile(&direct).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "api-direct")
+            .unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING, "oauth-a")
+            .unwrap();
+        for (id, account, access, refresh) in [
+            ("oauth-a", "account-a", "access-a", "refresh-a"),
+            ("oauth-b", "account-b", "access-b", "refresh-b"),
+        ] {
+            let credential = CodexOAuthCredential {
+                id_token: format!("id-{id}"),
+                access_token: access.to_owned(),
+                refresh_token: Some(refresh.to_owned()),
+                account_id: Some(account.to_owned()),
+                last_refresh_ms: 1,
+            };
+            secrets
+                .set(
+                    &format!("profile:{id}:oauth"),
+                    &serde_json::to_string(&credential).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let root = temp_root("codex-direct-profile-update-oauth");
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model_provider = "codex_relay_direct"
+model = "provider-real"
+
+[model_providers.codex_relay_direct]
+name = "Third Party"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+
+        let status = sync_active_direct_oauth_profile_at_path(
+            &repository,
+            &oauth_credentials,
+            "api-direct",
+            &config_path,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status.mode, "third_party");
+        assert_eq!(status.oauth_profile_id.as_deref(), Some("oauth-b"));
+        assert!(status.message.contains("OAuth 登录档案已同步"));
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["tokens"]["account_id"], "account-b");
+        assert_eq!(auth["tokens"]["access_token"], "access-b");
+        assert_eq!(auth["tokens"]["refresh_token"], "refresh-b");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            config["model_provider"].as_str(),
+            Some("codex_relay_direct")
+        );
+        assert_eq!(config["model"].as_str(), Some("provider-real"));
+        assert_eq!(
+            config["model_providers"]["codex_relay_direct"]["base_url"].as_str(),
+            Some("https://api.example.com/v1")
+        );
+        assert_eq!(
+            repository
+                .setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)
+                .unwrap()
+                .as_deref(),
+            Some("oauth-a")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn active_direct_profile_update_rejects_invalid_oauth_identity() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let oauth_credentials = OAuthCredentialStore::new(secrets);
+        insert_oauth_profile(&repository, "oauth-invalid", "失效账号");
+        let mut invalid = repository.profile("oauth-invalid").unwrap();
+        invalid.profile.validation_status = "invalid".to_owned();
+        invalid.profile.validation_message = Some("OAuth 已失效".to_owned());
+        repository.update_profile(&invalid).unwrap();
+        insert_api_profile(
+            &repository,
+            "api-direct",
+            "Third Party",
+            "healthy",
+            None,
+            vec!["provider-real"],
+            Vec::new(),
+        );
+        let mut direct = repository.profile("api-direct").unwrap();
+        direct.profile.codex_oauth_profile_id = Some("oauth-invalid".to_owned());
+        repository.update_profile(&direct).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "api-direct")
+            .unwrap();
+        let root = temp_root("codex-direct-profile-update-invalid-oauth");
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model_provider = "codex_relay_direct"
+model = "provider-real"
+
+[model_providers.codex_relay_direct]
+base_url = "https://api.example.com/v1"
+"#,
+        )
+        .unwrap();
+
+        let result = sync_active_direct_oauth_profile_at_path(
+            &repository,
+            &oauth_credentials,
+            "api-direct",
+            &config_path,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::ProfileRuntimeUnavailable)));
+        assert!(!root.join("auth.json").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

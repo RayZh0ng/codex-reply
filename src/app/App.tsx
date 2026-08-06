@@ -1070,10 +1070,13 @@ function PageContent({
           })
         }
         onUpdateApiProfile={(input) =>
-          api.updateProfile(input).then(async () => {
+          api.updateApiServiceProfile(input).then(async (result) => {
             await onRefresh();
             await onRefreshCollaboration();
-            notify("第三方模型提供商已更新。");
+            if (result.codex_config?.history_sync_status) {
+              onHistorySyncStatus(result.codex_config.history_sync_status);
+            }
+            notify(result.codex_config?.message ?? "第三方模型提供商已更新。");
           })
         }
         onTogglePool={(profile) =>

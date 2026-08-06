@@ -183,6 +183,11 @@ export interface GatewayCodexConfigStatus {
   history_sync_status?: CodexHistoryTransitionStatus | null;
 }
 
+export interface ApiServiceProfileUpdateResult {
+  profile: MaskedProfile;
+  codex_config: GatewayCodexConfigStatus | null;
+}
+
 export interface ApiServiceTestReport {
   status: "verified" | "failed";
   category: string;
@@ -717,6 +722,8 @@ export const api = {
     relayInvoke<MaskedProfile>("create_api_service_profile", { input }),
   updateProfile: (input: Record<string, unknown>) =>
     relayInvoke<MaskedProfile>("update_profile", { input }),
+  updateApiServiceProfile: (input: Record<string, unknown>) =>
+    relayInvoke<ApiServiceProfileUpdateResult>("update_api_service_profile", { input }),
   syncProfileAccountInfo: (id: string) =>
     relayInvoke<MaskedProfile>("sync_profile_account_info", { id }),
   refreshProfileQuotas: () =>
