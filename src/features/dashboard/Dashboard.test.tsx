@@ -62,6 +62,9 @@ const snapshot = {
       cooldown_until_ms: null,
       credential_configured: true,
       is_current: true,
+      validation_status: "unknown" as const,
+      validated_at_ms: null,
+      validation_message: null,
     },
   ],
 };

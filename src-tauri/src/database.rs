@@ -114,7 +114,10 @@ impl Repository {
                       account_id TEXT,
                       account_updated_at_ms INTEGER,
                       account_quota_json TEXT,
-                      account_subscription_json TEXT
+                      account_subscription_json TEXT,
+                      validation_status TEXT NOT NULL DEFAULT 'unknown',
+                      validated_at_ms INTEGER,
+                      validation_message TEXT
                     );
                     CREATE TABLE IF NOT EXISTS app_settings (
                       key TEXT PRIMARY KEY,
@@ -326,6 +329,9 @@ impl Repository {
                 ("wire_api", "TEXT NOT NULL DEFAULT 'responses'"),
                 ("model_mappings_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("codex_oauth_profile_id", "TEXT"),
+                ("validation_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("validated_at_ms", "INTEGER"),
+                ("validation_message", "TEXT"),
             ] {
                 if !profile_columns.iter().any(|column| column == name) {
                     connection
@@ -404,8 +410,8 @@ impl Repository {
         self.with_connection(|connection| {
             connection
                 .execute(
-                    "INSERT INTO profiles(id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                    "INSERT INTO profiles(id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json, validation_status, validated_at_ms, validation_message)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
@@ -432,6 +438,9 @@ impl Repository {
                         stored.profile.account.as_ref().map(|account| account.updated_at_ms),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.quota).ok()),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.subscription).ok()),
+                        stored.profile.validation_status,
+                        stored.profile.validated_at_ms,
+                        stored.profile.validation_message,
                     ],
                 )
                 .map_err(|error| match error {
@@ -453,7 +462,7 @@ impl Repository {
                 .optional()
                 .map_err(|_| AppError::Internal)?;
             let mut statement = connection
-                .prepare("SELECT id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json FROM profiles ORDER BY priority, alias")
+                .prepare("SELECT id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json, validation_status, validated_at_ms, validation_message FROM profiles ORDER BY priority, alias")
                 .map_err(|_| AppError::Internal)?;
             let rows = statement
                 .query_map([], |row| {
@@ -496,6 +505,9 @@ impl Repository {
                                 row.get(23)?,
                                 row.get(24)?,
                             ),
+                            validation_status: row.get(25)?,
+                            validated_at_ms: row.get(26)?,
+                            validation_message: row.get(27)?,
                         },
                     })
                 })
@@ -515,7 +527,7 @@ impl Repository {
         self.with_connection(|connection| {
             let updated = connection
                 .execute(
-                    "UPDATE profiles SET alias = ?2, provider = ?3, wire_api = ?4, enabled = ?5, in_pool = ?6, priority = ?7, weight = ?8, models_json = ?9, model_mappings_json = ?10, codex_oauth_profile_id = ?11, secret_ref = ?12, credential_configured = ?13, auth_mode = ?14, credential_fingerprint = ?15, account_display_name = ?16, account_email = ?17, account_id = ?18, account_updated_at_ms = ?19, account_quota_json = ?20, account_subscription_json = ?21, health = ?22, cooldown_until_ms = ?23 WHERE id = ?1",
+                    "UPDATE profiles SET alias = ?2, provider = ?3, wire_api = ?4, enabled = ?5, in_pool = ?6, priority = ?7, weight = ?8, models_json = ?9, model_mappings_json = ?10, codex_oauth_profile_id = ?11, secret_ref = ?12, credential_configured = ?13, auth_mode = ?14, credential_fingerprint = ?15, account_display_name = ?16, account_email = ?17, account_id = ?18, account_updated_at_ms = ?19, account_quota_json = ?20, account_subscription_json = ?21, health = ?22, cooldown_until_ms = ?23, validation_status = ?24, validated_at_ms = ?25, validation_message = ?26 WHERE id = ?1",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
@@ -540,6 +552,9 @@ impl Repository {
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.subscription).ok()),
                         stored.profile.health,
                         stored.profile.cooldown_until_ms,
+                        stored.profile.validation_status,
+                        stored.profile.validated_at_ms,
+                        stored.profile.validation_message,
                     ],
                 )
                 .map_err(|_| AppError::Internal)?;
@@ -843,6 +858,7 @@ impl Repository {
                             profile.health.as_str(),
                             "unhealthy" | "reauthorization_required"
                         )
+                        && profile.validation_status != "invalid"
                         && profile
                             .cooldown_until_ms
                             .is_none_or(|until| until <= now_ms)
@@ -2628,6 +2644,9 @@ mod tests {
                 codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
             },
             secret_ref: Some(format!("profile:{id}:credential")),
             credential_fingerprint: None,
@@ -2838,14 +2857,46 @@ mod tests {
         assert!(columns.contains(&"wire_api".to_owned()));
         assert!(columns.contains(&"model_mappings_json".to_owned()));
         assert!(columns.contains(&"codex_oauth_profile_id".to_owned()));
+        assert!(columns.contains(&"validation_status".to_owned()));
+        assert!(columns.contains(&"validated_at_ms".to_owned()));
+        assert!(columns.contains(&"validation_message".to_owned()));
         let api_profile = repository.profile("legacy-api").unwrap().profile;
         assert_eq!(api_profile.wire_api, GatewayWireApi::Responses);
         assert_eq!(api_profile.model_mappings.len(), 1);
         assert_eq!(api_profile.model_mappings[0].model, "model-a");
         assert_eq!(api_profile.model_mappings[0].upstream_model, "model-a");
+        assert_eq!(api_profile.validation_status, "unknown");
+        assert!(api_profile.validated_at_ms.is_none());
+        assert!(api_profile.validation_message.is_none());
         let profile = repository.profile("legacy").unwrap().profile;
         assert!(profile.account.is_none());
         assert!(profile.credential_configured);
+        assert_eq!(profile.validation_status, "unknown");
+    }
+
+    #[test]
+    fn profile_validation_fields_round_trip_for_all_states() {
+        let repository = Repository::memory();
+        let mut stored = stored_profile("validation", ProfileKind::CodexOauth, "healthy");
+        repository.insert_profile(&stored).unwrap();
+
+        for (index, status) in ["valid", "invalid", "unknown"].into_iter().enumerate() {
+            stored.profile.validation_status = status.to_owned();
+            stored.profile.validated_at_ms = Some(1_700_000_000_000 + index as i64);
+            stored.profile.validation_message = Some(format!("{status} message"));
+            repository.update_profile(&stored).unwrap();
+
+            let persisted = repository.profile("validation").unwrap().profile;
+            assert_eq!(persisted.validation_status, status);
+            assert_eq!(
+                persisted.validated_at_ms,
+                Some(1_700_000_000_000 + index as i64)
+            );
+            assert_eq!(
+                persisted.validation_message,
+                Some(format!("{status} message"))
+            );
+        }
     }
 
     #[test]
@@ -3138,6 +3189,9 @@ mod tests {
                 codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
             },
             secret_ref: Some(format!("profile:{id}:credential")),
             credential_fingerprint: None,

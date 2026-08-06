@@ -36,7 +36,10 @@ use crate::{
     },
     error::{AppError, AppResult},
     oauth_credentials::{CredentialAccess, OAuthCredentialStore},
-    profiles::{candidates_for_model, cool_down_profile, timestamp_ms},
+    profiles::{
+        candidates_for_model, cool_down_profile, mark_profile_validation_invalid,
+        mark_profile_validation_unknown, timestamp_ms,
+    },
     secrets::SecretStore,
 };
 
@@ -113,6 +116,11 @@ pub async fn discover_profile_models(
     let key = secrets.get(&secret_ref).await?;
     let report = test_api_service(&stored.profile.provider, &base_url, &key).await?;
     if report.status != "verified" {
+        if report.category == "authentication" {
+            mark_profile_validation_invalid(repository, id, report.message)?;
+        } else {
+            mark_profile_validation_unknown(repository, id, report.message)?;
+        }
         return Err(AppError::UpstreamUnavailable);
     }
     let mappings = if stored.profile.model_mappings.is_empty() {
@@ -135,6 +143,9 @@ pub async fn discover_profile_models(
         .collect();
     stored.profile.model_mappings = mappings;
     stored.profile.health = "healthy".to_owned();
+    stored.profile.validation_status = "valid".to_owned();
+    stored.profile.validated_at_ms = Some(timestamp_ms());
+    stored.profile.validation_message = Some(report.message);
     repository.update_profile(&stored)?;
     Ok(stored.profile)
 }
@@ -424,6 +435,7 @@ impl GatewayManager {
                     && profile.profile.in_pool
                     && profile.profile.kind == ProfileKind::CodexOauth
                     && profile.profile.auth_mode == crate::domain::CodexAuthMode::OAuth
+                    && profile.profile.validation_status != "invalid"
             })
         {
             match self
@@ -4692,6 +4704,9 @@ mod tests {
                 codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
             },
             secret_ref: Some(format!("profile:{id}:oauth")),
             credential_fingerprint: None,
@@ -5046,6 +5061,9 @@ mod tests {
                 codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
             },
             secret_ref: None,
             credential_fingerprint: None,

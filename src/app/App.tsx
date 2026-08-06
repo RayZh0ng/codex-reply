@@ -107,6 +107,8 @@ function App() {
   const sidebarToggle = useRef<HTMLButtonElement>(null);
   const quotaRefreshInFlight = useRef(false);
   const hasRefreshableCodexProfiles = useRef(false);
+  const profileValidationStatuses = useRef(new Map<string, string>());
+  const notifiedInvalidProfileIds = useRef(new Set<string>());
   const previousTaskPhase = useRef<ManagedTaskStatus["phase"]>(idleTaskStatus.phase);
   const [page, setPage] = useState<Page>("dashboard");
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
@@ -317,6 +319,22 @@ function App() {
     snapshot?.profiles.some(
       (profile) => profile.kind === "codex_oauth" && profile.credential_configured,
     ) ?? false;
+  useEffect(() => {
+    const currentProfileIds = new Set<string>();
+    for (const profile of snapshot?.profiles ?? []) {
+      currentProfileIds.add(profile.id);
+      profileValidationStatuses.current.set(profile.id, profile.validation_status);
+      if (profile.validation_status === "valid") {
+        notifiedInvalidProfileIds.current.delete(profile.id);
+      }
+    }
+    for (const profileId of profileValidationStatuses.current.keys()) {
+      if (!currentProfileIds.has(profileId)) {
+        profileValidationStatuses.current.delete(profileId);
+        notifiedInvalidProfileIds.current.delete(profileId);
+      }
+    }
+  }, [snapshot]);
   const refreshQuotaSummaries = useCallback(
     async (force = false) => {
       if (
@@ -328,7 +346,27 @@ function App() {
         return;
       quotaRefreshInFlight.current = true;
       try {
-        await api.refreshProfileQuotas();
+        const previousStatuses = new Map(profileValidationStatuses.current);
+        const report = await api.refreshProfileQuotas();
+        const newlyInvalid = report.profiles.filter(
+          (profile) =>
+            previousStatuses.get(profile.id) === "valid" &&
+            profile.validation_status === "invalid" &&
+            !notifiedInvalidProfileIds.current.has(profile.id),
+        );
+        for (const profile of report.profiles) {
+          profileValidationStatuses.current.set(profile.id, profile.validation_status);
+          if (profile.validation_status === "valid") {
+            notifiedInvalidProfileIds.current.delete(profile.id);
+          }
+        }
+        if (newlyInvalid.length) {
+          for (const profile of newlyInvalid) {
+            notifiedInvalidProfileIds.current.add(profile.id);
+          }
+          const aliases = newlyInvalid.map((profile) => profile.alias).join("、");
+          setNotice(`档案 ${aliases} 已失效，请重新授权后再使用。`);
+        }
         await refresh();
       } catch {
         // Per-profile cached states carry refresh failures; do not replace the whole app with an error.

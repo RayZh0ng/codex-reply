@@ -150,6 +150,9 @@ pub async fn create_profile(
         codex_oauth_profile_id,
         is_current: false,
         account: None,
+        validation_status: "unknown".to_owned(),
+        validated_at_ms: None,
+        validation_message: None,
     };
     let stored = StoredProfile {
         profile: profile.clone(),
@@ -384,6 +387,12 @@ pub fn sync_oauth_account_info_with_snapshot(
             account
         })
         .or(previous_account);
+    set_validation_fields(
+        &mut stored.profile,
+        "valid",
+        Some("官方 Codex 接口验证通过。".to_owned()),
+    );
+    stored.profile.health = "healthy".to_owned();
     repository.update_profile(&stored)?;
     Ok(stored.profile)
 }
@@ -435,8 +444,47 @@ pub fn sync_codex_account_info_with_snapshot(
         account.subscription = subscription;
     }
     stored.profile.account = Some(account);
+    set_validation_fields(
+        &mut stored.profile,
+        "valid",
+        Some("官方 Codex 接口验证通过。".to_owned()),
+    );
+    stored.profile.health = "healthy".to_owned();
     repository.update_profile(&stored)?;
     Ok(stored.profile)
+}
+
+pub fn mark_profile_validation_invalid(
+    repository: &Repository,
+    id: &str,
+    message: impl Into<String>,
+) -> AppResult<MaskedProfile> {
+    let mut stored = repository.profile(id)?;
+    set_validation_fields(&mut stored.profile, "invalid", Some(message.into()));
+    stored.profile.health = if stored.profile.kind == ProfileKind::CodexOauth {
+        "reauthorization_required".to_owned()
+    } else {
+        "unhealthy".to_owned()
+    };
+    repository.update_profile(&stored)?;
+    Ok(stored.profile)
+}
+
+pub fn mark_profile_validation_unknown(
+    repository: &Repository,
+    id: &str,
+    message: impl Into<String>,
+) -> AppResult<MaskedProfile> {
+    let mut stored = repository.profile(id)?;
+    set_validation_fields(&mut stored.profile, "unknown", Some(message.into()));
+    repository.update_profile(&stored)?;
+    Ok(stored.profile)
+}
+
+fn set_validation_fields(profile: &mut MaskedProfile, status: &str, message: Option<String>) {
+    profile.validation_status = status.to_owned();
+    profile.validated_at_ms = Some(timestamp_ms());
+    profile.validation_message = message;
 }
 
 pub fn mark_quota_stale(repository: &Repository, id: &str) -> AppResult<MaskedProfile> {
@@ -536,6 +584,9 @@ pub async fn create_oauth_profile(
         codex_oauth_profile_id: None,
         is_current: false,
         account: account_summary(credential),
+        validation_status: "unknown".to_owned(),
+        validated_at_ms: None,
+        validation_message: None,
     };
     if let Err(error) = repository.insert_profile(&StoredProfile {
         profile: profile.clone(),
@@ -583,6 +634,9 @@ pub async fn create_imported_profile(
         codex_oauth_profile_id: None,
         is_current: false,
         account,
+        validation_status: "unknown".to_owned(),
+        validated_at_ms: None,
+        validation_message: None,
     };
     if let Err(error) = repository.insert_profile(&StoredProfile {
         profile: profile.clone(),
@@ -870,6 +924,7 @@ pub fn candidates_for_model(
                     profile.health.as_str(),
                     "unhealthy" | "reauthorization_required"
                 )
+                && profile.validation_status != "invalid"
                 && profile.cooldown_until_ms.is_none_or(|until| until <= now)
                 && model
                     .is_none_or(|model| profile.models.iter().any(|candidate| candidate == model))
@@ -1024,10 +1079,10 @@ fn normalized_models(models: Vec<String>) -> Vec<String> {
 mod tests {
     use super::{
         candidates_for_model, create_imported_profile, create_oauth_profile, create_profile,
-        imported_account_summary, migrate_oauth_credentials, save_oauth_credential,
-        sync_oauth_account_info, sync_oauth_account_info_with_snapshot, unavailable_quota,
-        update_profile, CodexOAuthCredential, ImportedAuthFileCredential,
-        KEYCHAIN_SIGNING_MIGRATION_SETTING,
+        imported_account_summary, mark_profile_validation_invalid, mark_profile_validation_unknown,
+        migrate_oauth_credentials, save_oauth_credential, sync_oauth_account_info,
+        sync_oauth_account_info_with_snapshot, unavailable_quota, update_profile,
+        CodexOAuthCredential, ImportedAuthFileCredential, KEYCHAIN_SIGNING_MIGRATION_SETTING,
     };
     use crate::{
         database::Repository,
@@ -1354,6 +1409,82 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.profile.id == oauth_profile.id));
+
+        let mut invalid_api = repository.profile(&api_profile.id).unwrap();
+        invalid_api.profile.validation_status = "invalid".into();
+        repository.update_profile(&invalid_api).unwrap();
+        let candidates = candidates_for_model(&repository, Some("gpt-5")).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].profile.id, oauth_profile.id);
+
+        let mut invalid_oauth = repository.profile(&oauth_profile.id).unwrap();
+        invalid_oauth.profile.validation_status = "invalid".into();
+        repository.update_profile(&invalid_oauth).unwrap();
+        assert!(candidates_for_model(&repository, Some("gpt-5"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn validation_updates_health_by_auth_kind_and_preserves_it_for_unknown_results() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        create_oauth_profile(
+            &repository,
+            secrets.clone(),
+            "oauth-validation".into(),
+            "OAuth validation".into(),
+            &CodexOAuthCredential {
+                id_token: "id".into(),
+                access_token: "access".into(),
+                refresh_token: Some("refresh".into()),
+                account_id: Some("account".into()),
+                last_refresh_ms: 1,
+            },
+        )
+        .await
+        .unwrap();
+        let api = create_profile(
+            &repository,
+            secrets,
+            CreateProfileInput {
+                alias: "API validation".into(),
+                kind: ProfileKind::ApiKey,
+                base_url: Some("https://api.example.com/v1".into()),
+                provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
+                api_key: Some("api-secret".into()),
+                models: vec!["gpt-5".into()],
+                model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
+                in_pool: true,
+                priority: 0,
+                weight: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let oauth =
+            mark_profile_validation_invalid(&repository, "oauth-validation", "401 Unauthorized")
+                .unwrap();
+        assert_eq!(oauth.validation_status, "invalid");
+        assert_eq!(oauth.health, "reauthorization_required");
+        assert!(oauth.validated_at_ms.is_some());
+
+        let api = mark_profile_validation_invalid(&repository, &api.id, "403 Forbidden").unwrap();
+        assert_eq!(api.validation_status, "invalid");
+        assert_eq!(api.health, "unhealthy");
+
+        let unknown =
+            mark_profile_validation_unknown(&repository, "oauth-validation", "network timeout")
+                .unwrap();
+        assert_eq!(unknown.validation_status, "unknown");
+        assert_eq!(unknown.health, "reauthorization_required");
+        assert_eq!(
+            unknown.validation_message.as_deref(),
+            Some("network timeout")
+        );
     }
 
     #[tokio::test]

@@ -1355,6 +1355,43 @@
   font-size: 12px;
   line-height: 1.45;
 }
+.profile-validation-state {
+  display: grid;
+  gap: 7px;
+  margin: 0 0 15px;
+  padding: 11px 12px;
+  border: 1px solid rgb(99 115 129 / 16%);
+  border-radius: 12px;
+  background: rgb(99 115 129 / 7%);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+.profile-validation-state > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.profile-validation-state strong {
+  color: var(--color-text-primary);
+}
+.profile-validation-state p {
+  margin: 0;
+  line-height: 1.45;
+}
+.profile-validation-state.is-valid {
+  border-color: rgb(52 199 89 / 18%);
+  background: rgb(52 199 89 / 8%);
+}
+.profile-validation-state.is-invalid {
+  border-color: rgb(255 69 58 / 20%);
+  background: rgb(255 69 58 / 8%);
+  color: #a53b34;
+}
+.profile-validation-state .text-button {
+  justify-self: start;
+  padding: 0;
+}
 .empty-state {
   display: grid;
   min-height: 280px;
@@ -5734,7 +5771,7 @@ input[type="number"]::-webkit-outer-spin-button {
 }
 
 .profile-grid > .empty-state {
-  display: block;
+  display: grid;
   width: 100%;
   break-inside: avoid;
   column-span: all;

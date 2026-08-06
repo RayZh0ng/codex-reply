@@ -342,7 +342,7 @@ async fn sync_profile_quota(
                         result.account_id,
                     )
                 }
-                Err(_) => profiles::mark_quota_stale(&state.repository, id),
+                Err(error) => Err(error),
             }
         }
         CodexAuthMode::AgentIdentity | CodexAuthMode::PersonalAccessToken => {
@@ -360,7 +360,7 @@ async fn sync_profile_quota(
                     result.email,
                     result.account_id,
                 ),
-                Err(_) => profiles::mark_quota_stale(&state.repository, id),
+                Err(error) => Err(error),
             }
         }
     }
@@ -376,9 +376,29 @@ async fn sync_profile_quota_or_mark_stale(
         Err(AppError::KeychainInteractionRequired)
             if access == OAuthCredentialAccess::Background =>
         {
-            profiles::mark_quota_stale_for_keychain_interaction(&state.repository, id)
+            profiles::mark_quota_stale_for_keychain_interaction(&state.repository, id)?;
+            profiles::mark_profile_validation_unknown(
+                &state.repository,
+                id,
+                "后台未读取系统钥匙串；档案有效性暂未确认。",
+            )
         }
-        Err(error) => profiles::mark_quota_stale(&state.repository, id).or(Err(error)),
+        Err(AppError::ProfileRuntimeUnavailable) => {
+            profiles::mark_quota_stale(&state.repository, id)?;
+            profiles::mark_profile_validation_invalid(
+                &state.repository,
+                id,
+                "官方 Codex 接口拒绝了当前登录凭据，请重新授权。",
+            )
+        }
+        Err(error) => {
+            profiles::mark_quota_stale(&state.repository, id)?;
+            profiles::mark_profile_validation_unknown(
+                &state.repository,
+                id,
+                format!("档案有效性暂未确认：{error}"),
+            )
+        }
     }
 }
 
@@ -1113,6 +1133,10 @@ pub async fn enable_codex_gateway(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> AppResult<GatewayCodexConfigStatus> {
+    let oauth_profile_id = state
+        .repository
+        .setting(crate::domain::GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)?;
+    validate_oauth_profile_for_switch(state.inner(), oauth_profile_id.as_deref()).await?;
     let gateway_status = gateway_ready_for_codex_switch(state.inner()).await?;
     let mut status = codex_gateway::enable(
         &state.repository,
@@ -1147,7 +1171,14 @@ pub async fn set_codex_gateway_oauth_profile(
     input: SetCodexGatewayOAuthProfileInput,
     state: State<'_, AppState>,
 ) -> AppResult<GatewayCodexConfigStatus> {
-    codex_gateway::set_codex_oauth_profile(&state.repository, input)
+    validate_oauth_profile_for_switch(state.inner(), input.profile_id.as_deref()).await?;
+    let mut status =
+        codex_gateway::set_codex_oauth_profile(&state.repository, &state.oauth_credentials, input)
+            .await?;
+    if status.enabled {
+        append_shared_desktop_restart_result(state.inner(), &mut status);
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1162,6 +1193,12 @@ pub async fn activate_api_service_profile(
     app: AppHandle,
 ) -> AppResult<GatewayCodexConfigStatus> {
     prepare_api_profile_for_codex_switch(&state.repository, state.secrets.clone(), &id).await?;
+    let direct_profile = state.repository.profile(&id)?;
+    validate_oauth_profile_for_switch(
+        state.inner(),
+        direct_profile.profile.codex_oauth_profile_id.as_deref(),
+    )
+    .await?;
     let mut status = codex_gateway::enable_api_profile(
         &state.repository,
         state.secrets.clone(),
@@ -1175,6 +1212,22 @@ pub async fn activate_api_service_profile(
     status.history_sync_status = Some(history_sync_status);
     append_shared_desktop_restart_result(state.inner(), &mut status);
     Ok(status)
+}
+
+async fn validate_oauth_profile_for_switch(
+    state: &AppState,
+    profile_id: Option<&str>,
+) -> AppResult<()> {
+    let Some(profile_id) = profile_id else {
+        return Ok(());
+    };
+    let profile =
+        sync_profile_quota_or_mark_stale(state, profile_id, OAuthCredentialAccess::UserInitiated)
+            .await?;
+    if profile.validation_status == "invalid" {
+        return Err(AppError::ProfileRuntimeUnavailable);
+    }
+    Ok(())
 }
 
 async fn prepare_api_profile_for_codex_switch(

@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import type { GatewayStatus } from "../../shared/ipc";
+import type { GatewayCodexConfigStatus, GatewayStatus } from "../../shared/ipc";
 import { api } from "../../shared/ipc";
 import { Gateway } from "./Gateway";
 
@@ -66,6 +66,7 @@ const gateway: GatewayStatus = {
 function renderGateway(overrides: Partial<GatewayStatus> = {}) {
   const onNavigateProfiles = vi.fn();
   const onRefresh = vi.fn().mockResolvedValue(undefined);
+  const onNotice = vi.fn();
   render(
     <Gateway
       gateway={{ ...gateway, ...overrides }}
@@ -73,12 +74,12 @@ function renderGateway(overrides: Partial<GatewayStatus> = {}) {
       onSave={vi.fn().mockResolvedValue(undefined)}
       onStart={vi.fn().mockResolvedValue(undefined)}
       onStop={vi.fn().mockResolvedValue(undefined)}
-      onNotice={vi.fn()}
+      onNotice={onNotice}
       onNavigateProfiles={onNavigateProfiles}
       onRefresh={onRefresh}
     />,
   );
-  return { onNavigateProfiles, onRefresh };
+  return { onNavigateProfiles, onRefresh, onNotice };
 }
 
 describe("Gateway", () => {
@@ -224,6 +225,48 @@ describe("Gateway", () => {
     expect(screen.getByRole("option", { name: /JSON 导入账号/ })).toHaveAttribute(
       "data-disabled",
     );
+  });
+
+  it("reads and saves the direct profile OAuth binding with mode-specific feedback", async () => {
+    const directStatus = {
+      enabled: true,
+      mode: "third_party",
+      message: "Codex 已切换到第三方模型提供商直连。",
+      auth_status: "ok",
+      needs_repair: false,
+      config_path: "/Users/test/.codex/config.toml",
+      service_url: "https://api.example.com/v1",
+      direct_profile_id: "api-direct",
+      direct_profile_alias: "第三方供应商",
+      oauth_profile_id: "oauth-a",
+      oauth_profile_alias: "账号 A",
+      oauth_profile_available: true,
+      oauth_profile_options: [
+        { id: "oauth-a", alias: "账号 A", available: true, reason: null },
+        { id: "oauth-b", alias: "账号 B", available: true, reason: null },
+      ],
+      history_sync: null,
+    } satisfies GatewayCodexConfigStatus;
+    vi.mocked(api.codexGatewayConfigStatus).mockResolvedValueOnce(directStatus);
+    vi.mocked(api.setCodexGatewayOAuthProfile).mockResolvedValue({
+      ...directStatus,
+      oauth_profile_id: "oauth-b",
+      oauth_profile_alias: "账号 B",
+    });
+    const { onNotice } = renderGateway({ available_profiles: 1 });
+
+    const trigger = await screen.findByRole("combobox", { name: "OAuth 登录档案" });
+    expect(trigger).toHaveTextContent("账号 A");
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("option", { name: "账号 B" }));
+
+    await waitFor(() =>
+      expect(api.setCodexGatewayOAuthProfile).toHaveBeenCalledWith("oauth-b"),
+    );
+    expect(onNotice).toHaveBeenCalledWith(
+      "第三方直连 OAuth 登录档案已绑定，仅用于解锁登录态。",
+    );
+    expect(trigger).toHaveTextContent("账号 B");
   });
 
   it("reveals and rotates user-managed client keys", async () => {

@@ -87,9 +87,18 @@ fn status_for_path(repository: &Repository, path: &Path) -> AppResult<GatewayCod
     } else {
         "missing"
     };
-    let oauth_profile = codex_oauth_profile_status(repository)?;
-    let oauth_profile_options = codex_oauth_profile_options(repository)?;
     let direct_profile = direct_profile_status(repository)?;
+    let oauth_profile = if mode == "third_party" {
+        let profile_id = direct_profile
+            .id
+            .as_deref()
+            .and_then(|id| repository.profile(id).ok())
+            .and_then(|stored| stored.profile.codex_oauth_profile_id);
+        codex_oauth_profile_status_for_id(repository, profile_id)?
+    } else {
+        codex_oauth_profile_status(repository)?
+    };
+    let oauth_profile_options = codex_oauth_profile_options(repository)?;
     Ok(GatewayCodexConfigStatus {
         enabled,
         mode: mode.to_owned(),
@@ -394,14 +403,34 @@ fn oauth_profile_unavailable_reason(stored: &StoredProfile) -> Option<String> {
         Some("档案已停用".to_owned())
     } else if !stored.profile.credential_configured {
         Some("凭据未保存，请重新授权".to_owned())
+    } else if stored.profile.validation_status == "invalid" {
+        Some(
+            stored
+                .profile
+                .validation_message
+                .clone()
+                .unwrap_or_else(|| "档案验证已失效，请重新授权".to_owned()),
+        )
     } else {
         None
     }
 }
 
-pub(crate) fn set_codex_oauth_profile(
+pub(crate) async fn set_codex_oauth_profile(
     repository: &Repository,
+    oauth_credentials: &OAuthCredentialStore,
     input: SetCodexGatewayOAuthProfileInput,
+) -> AppResult<GatewayCodexConfigStatus> {
+    let path = config_path()?;
+    set_codex_oauth_profile_at_path(repository, oauth_credentials, input, &path, true).await
+}
+
+async fn set_codex_oauth_profile_at_path(
+    repository: &Repository,
+    oauth_credentials: &OAuthCredentialStore,
+    input: SetCodexGatewayOAuthProfileInput,
+    path: &Path,
+    project_desktop: bool,
 ) -> AppResult<GatewayCodexConfigStatus> {
     if !input.confirmed {
         return Err(AppError::ConfirmationRequired);
@@ -410,17 +439,52 @@ pub(crate) fn set_codex_oauth_profile(
         .profile_id
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    if let Some(profile_id) = profile_id {
-        let stored = repository.profile(&profile_id)?;
+    if let Some(profile_id) = profile_id.as_deref() {
+        let stored = repository.profile(profile_id)?;
         if !is_codex_oauth_unlock_profile(&stored) {
             return Err(AppError::ProfileRuntimeUnavailable);
         }
-        repository.set_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING, &profile_id)?;
+    }
+    let current = status_for_path(repository, path)?;
+    let auth_json = if current.enabled {
+        codex_oauth_profile_auth_json_for_id(
+            repository,
+            oauth_credentials,
+            profile_id.as_deref(),
+            CredentialAccess::UserInitiated,
+        )
+        .await?
+    } else {
+        None
+    };
+    if current.mode == "third_party" {
+        let direct_profile_id = current
+            .direct_profile_id
+            .as_deref()
+            .ok_or(AppError::NotFound)?;
+        let mut stored = repository.profile(direct_profile_id)?;
+        if stored.profile.kind != ProfileKind::ApiKey {
+            return Err(AppError::ValidationFailed);
+        }
+        stored.profile.codex_oauth_profile_id = profile_id.clone();
+        repository.update_profile(&stored)?;
+    } else if let Some(profile_id) = profile_id.as_deref() {
+        repository.set_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING, profile_id)?;
     } else {
         repository.delete_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)?;
     }
-    let path = config_path()?;
-    status_for_path(repository, &path)
+    if let Some(auth_json) = auth_json.as_deref() {
+        let home = path.parent().ok_or(AppError::RuntimeUnavailable)?;
+        write_auth_json_to_home(home, auth_json)?;
+        if project_desktop {
+            project_desktop_auth_json(home, auth_json)?;
+        }
+    }
+    let mut status = status_for_path(repository, path)?;
+    if current.enabled && profile_id.is_some() {
+        status.message = format!("{} OAuth 登录档案已同步到默认 Codex 凭据。", status.message);
+    }
+    Ok(status)
 }
 
 pub(crate) async fn codex_oauth_profile_auth_json(
@@ -515,6 +579,7 @@ fn is_codex_oauth_unlock_profile(stored: &StoredProfile) -> bool {
         && !is_imported_oauth_profile(stored)
         && profile.enabled
         && profile.credential_configured
+        && profile.validation_status != "invalid"
 }
 
 fn is_imported_oauth_profile(stored: &StoredProfile) -> bool {
@@ -532,6 +597,7 @@ fn is_gateway_model_profile(profile: &crate::domain::MaskedProfile, now: i64) ->
             profile.health.as_str(),
             "unhealthy" | "reauthorization_required"
         )
+        && profile.validation_status != "invalid"
         && profile.cooldown_until_ms.is_none_or(|until| until <= now)
 }
 
@@ -836,8 +902,11 @@ fn codex_catalog_entry_with_slug(index: usize, mapping: &GatewayModelMapping, sl
         "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
         "default_reasoning_level": "high",
         "supported_reasoning_levels": [
-            {"effort": "none", "description": "Disable Thinking"},
-            {"effort": "high", "description": "Enabled Thinking"}
+            {"effort": "minimal", "description": "Minimal reasoning"},
+            {"effort": "low", "description": "Low reasoning"},
+            {"effort": "medium", "description": "Medium reasoning"},
+            {"effort": "high", "description": "High reasoning"},
+            {"effort": "xhigh", "description": "Extra high reasoning"}
         ],
         "shell_type": "shell_command",
         "visibility": "list",
@@ -999,8 +1068,8 @@ mod tests {
 
     use super::{
         codex_oauth_profile_options, content_hash, enable_api_profile_at_path, enable_for_path,
-        gateway_model_options, relay_auth_config, remove_relay_config, set_codex_oauth_profile,
-        status_for_path, timestamp_ms,
+        gateway_model_options, relay_auth_config, remove_relay_config,
+        set_codex_oauth_profile_at_path, status_for_path, timestamp_ms,
     };
     use crate::{
         database::{Repository, StoredProfile},
@@ -1008,10 +1077,11 @@ mod tests {
             CodexAuthMode, GatewayModelMapping, GatewayNetworkAddress, GatewayProvider,
             GatewayStatus, GatewayWireApi, MaskedClientKey, MaskedProfile, ProfileKind,
             SetCodexGatewayOAuthProfileInput, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
-            GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
+            GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
         },
         error::AppError,
         oauth_credentials::OAuthCredentialStore,
+        profiles::CodexOAuthCredential,
         secrets::{LocalEncryptedSecretStore, MemorySecretStore, SecretStore},
     };
 
@@ -1042,18 +1112,25 @@ mod tests {
         assert_eq!(current["custom"]["value"].as_str(), Some("keep"));
     }
 
-    #[test]
-    fn codex_oauth_profile_setting_round_trips_into_status() {
+    #[tokio::test]
+    async fn codex_oauth_profile_setting_round_trips_into_status() {
         let repository = Repository::memory();
         insert_oauth_profile(&repository, "oauth", "插件账号");
+        let oauth_credentials = OAuthCredentialStore::new(Arc::new(MemorySecretStore::new()));
+        let root = temp_root("codex-oauth-setting");
+        let config_path = root.join("config.toml");
 
-        let status = set_codex_oauth_profile(
+        let status = set_codex_oauth_profile_at_path(
             &repository,
+            &oauth_credentials,
             SetCodexGatewayOAuthProfileInput {
                 profile_id: Some("oauth".to_owned()),
                 confirmed: true,
             },
+            &config_path,
+            false,
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1070,24 +1147,145 @@ mod tests {
         assert_eq!(status.oauth_profile_options[0].id, "oauth");
         assert!(status.oauth_profile_options[0].available);
 
-        let status = set_codex_oauth_profile(
+        let status = set_codex_oauth_profile_at_path(
             &repository,
+            &oauth_credentials,
             SetCodexGatewayOAuthProfileInput {
                 profile_id: None,
                 confirmed: true,
             },
+            &config_path,
+            false,
         )
+        .await
         .unwrap();
         assert!(repository
             .setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)
             .unwrap()
             .is_none());
         assert!(status.oauth_profile_id.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn codex_oauth_profile_options_mark_unavailable_reasons() {
+    #[tokio::test]
+    async fn direct_oauth_selection_projects_selected_identity_without_changing_provider() {
         let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let oauth_credentials = OAuthCredentialStore::new(secrets.clone());
+        insert_oauth_profile(&repository, "oauth-a", "账号 A");
+        insert_oauth_profile(&repository, "oauth-b", "账号 B");
+        insert_api_profile(
+            &repository,
+            "api-direct",
+            "Third Party",
+            "healthy",
+            None,
+            vec!["provider-real"],
+            Vec::new(),
+        );
+        let mut direct = repository.profile("api-direct").unwrap();
+        direct.profile.codex_oauth_profile_id = Some("oauth-a".to_owned());
+        repository.update_profile(&direct).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "api-direct")
+            .unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING, "oauth-a")
+            .unwrap();
+        for (id, account, access, refresh) in [
+            ("oauth-a", "account-a", "access-a", "refresh-a"),
+            ("oauth-b", "account-b", "access-b", "refresh-b"),
+        ] {
+            let credential = CodexOAuthCredential {
+                id_token: format!("id-{id}"),
+                access_token: access.to_owned(),
+                refresh_token: Some(refresh.to_owned()),
+                account_id: Some(account.to_owned()),
+                last_refresh_ms: 1,
+            };
+            secrets
+                .set(
+                    &format!("profile:{id}:oauth"),
+                    &serde_json::to_string(&credential).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let root = temp_root("codex-direct-oauth-selection");
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model_provider = "codex_relay_direct"
+model = "provider-real"
+
+[model_providers.codex_relay_direct]
+name = "Third Party"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+
+        let status = set_codex_oauth_profile_at_path(
+            &repository,
+            &oauth_credentials,
+            SetCodexGatewayOAuthProfileInput {
+                profile_id: Some("oauth-b".to_owned()),
+                confirmed: true,
+            },
+            &config_path,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status.mode, "third_party");
+        assert_eq!(status.oauth_profile_id.as_deref(), Some("oauth-b"));
+        assert_eq!(
+            repository
+                .profile("api-direct")
+                .unwrap()
+                .profile
+                .codex_oauth_profile_id
+                .as_deref(),
+            Some("oauth-b")
+        );
+        assert_eq!(
+            repository
+                .setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)
+                .unwrap()
+                .as_deref(),
+            Some("oauth-a")
+        );
+        let auth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["tokens"]["account_id"], "account-b");
+        assert_eq!(auth["tokens"]["access_token"], "access-b");
+        assert_eq!(auth["tokens"]["refresh_token"], "refresh-b");
+        let config = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            config["model_provider"].as_str(),
+            Some("codex_relay_direct")
+        );
+        assert_eq!(config["model"].as_str(), Some("provider-real"));
+        assert_eq!(
+            config["model_providers"]["codex_relay_direct"]["base_url"].as_str(),
+            Some("https://api.example.com/v1")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn codex_oauth_profile_options_mark_unavailable_reasons() {
+        let repository = Repository::memory();
+        let oauth_credentials = OAuthCredentialStore::new(Arc::new(MemorySecretStore::new()));
+        let root = temp_root("codex-oauth-options");
+        let config_path = root.join("config.toml");
         insert_oauth_profile(&repository, "available", "可用登录");
         insert_oauth_profile_with(&repository, "disabled", "停用登录", false, true);
         insert_oauth_profile_with(&repository, "missing", "未授权登录", true, false);
@@ -1123,14 +1321,19 @@ mod tests {
             imported.reason.as_deref(),
             Some("JSON 导入账号用于反代账号池，不能用于登录态解锁")
         );
-        assert!(set_codex_oauth_profile(
+        assert!(set_codex_oauth_profile_at_path(
             &repository,
+            &oauth_credentials,
             SetCodexGatewayOAuthProfileInput {
                 profile_id: Some("json-import".to_owned()),
                 confirmed: true,
             },
+            &config_path,
+            false,
         )
+        .await
         .is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1213,6 +1416,9 @@ mod tests {
                 codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
             },
             secret_ref: Some("profile:api:credential".to_owned()),
             credential_fingerprint: None,
@@ -1280,6 +1486,15 @@ mod tests {
         assert_eq!(catalog["models"][0]["slug"], "provider-real");
         assert_eq!(catalog["models"][0]["display_name"], "Provider Real");
         assert_eq!(catalog["models"][0]["context_window"], 64_000);
+        assert_eq!(
+            catalog["models"][0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["minimal", "low", "medium", "high", "xhigh"]
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1308,6 +1523,9 @@ mod tests {
                 codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
             },
             secret_ref: Some("profile:api:credential".to_owned()),
             credential_fingerprint: None,
@@ -1487,6 +1705,9 @@ args = ["--relay-gateway-token", "client-key:missing", "--relay-data-dir", "{}"]
                     codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
+                    validation_status: "unknown".to_owned(),
+                    validated_at_ms: None,
+                    validation_message: None,
                 },
                 secret_ref: credential_configured.then(|| format!("profile:{id}:oauth")),
                 credential_fingerprint: None,
@@ -1517,6 +1738,9 @@ args = ["--relay-gateway-token", "client-key:missing", "--relay-data-dir", "{}"]
                     codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
+                    validation_status: "unknown".to_owned(),
+                    validated_at_ms: None,
+                    validation_message: None,
                 },
                 secret_ref: Some(format!("profile:{id}:oauth")),
                 credential_fingerprint: Some(format!("json:{id}")),
@@ -1555,6 +1779,9 @@ args = ["--relay-gateway-token", "client-key:missing", "--relay-data-dir", "{}"]
                     codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
+                    validation_status: "unknown".to_owned(),
+                    validated_at_ms: None,
+                    validation_message: None,
                 },
                 secret_ref: Some(format!("profile:{id}:credential")),
                 credential_fingerprint: None,

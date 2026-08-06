@@ -4396,8 +4396,11 @@ fn write_gateway_model_catalog(home: &Path, model: &str) -> AppResult<()> {
             "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
             "default_reasoning_level": "high",
             "supported_reasoning_levels": [
-                {"effort": "none", "description": "Disable Thinking"},
-                {"effort": "high", "description": "Enabled Thinking"}
+                {"effort": "minimal", "description": "Minimal reasoning"},
+                {"effort": "low", "description": "Low reasoning"},
+                {"effort": "medium", "description": "Medium reasoning"},
+                {"effort": "high", "description": "High reasoning"},
+                {"effort": "xhigh", "description": "Extra high reasoning"}
             ],
             "shell_type": "shell_command",
             "visibility": "list",
@@ -5151,6 +5154,16 @@ mod tests {
         assert!(config.contains("--relay-gateway-token"));
         let catalog = fs::read_to_string(root.join(COLLABORATION_MODEL_CATALOG_FILENAME)).unwrap();
         assert!(catalog.contains("third-party-coder"));
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        assert_eq!(
+            catalog["models"][0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["minimal", "low", "medium", "high", "xhigh"]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6260,6 +6273,9 @@ mod tests {
                     codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
+                    validation_status: "unknown".to_owned(),
+                    validated_at_ms: None,
+                    validation_message: None,
                 },
                 secret_ref: Some("profile:profile-1:oauth".into()),
                 credential_fingerprint: None,
@@ -6290,6 +6306,9 @@ mod tests {
                     codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
+                    validation_status: "unknown".to_owned(),
+                    validated_at_ms: None,
+                    validation_message: None,
                 },
                 secret_ref: Some(format!("profile:{id}:api-key")),
                 credential_fingerprint: None,

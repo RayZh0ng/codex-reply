@@ -24,6 +24,7 @@ import type {
   ProfileQuotaWindow,
 } from "../../shared/ipc";
 import { api } from "../../shared/ipc";
+import componentsCss from "../../styles/components.css?raw";
 import { Profiles } from "./Profiles";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -52,19 +53,23 @@ afterEach(() => {
 });
 
 function renderProfiles(profiles: MaskedProfile[] = []) {
-  return render(
-    <Profiles
-      profiles={profiles}
-      busy={false}
-      onSelect={vi.fn().mockResolvedValue(undefined)}
-      onStartOAuth={vi.fn().mockResolvedValue(status)}
-      onOAuthStatus={vi.fn().mockResolvedValue(status)}
-      onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
-      onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
-      onSyncAccount={vi.fn().mockResolvedValue(undefined)}
-      onDelete={vi.fn()}
-    />,
-  );
+  const onStartOAuth = vi.fn().mockResolvedValue(status);
+  return {
+    ...render(
+      <Profiles
+        profiles={profiles}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={onStartOAuth}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn()}
+      />,
+    ),
+    onStartOAuth,
+  };
 }
 
 function quotaWindow(
@@ -148,12 +153,18 @@ function profileFixture({
   account = null,
   kind = "codex_oauth",
   authMode,
+  validationStatus = "unknown",
+  validatedAtMs = null,
+  validationMessage = null,
 }: {
   id: string;
   alias: string;
   account?: ProfileAccountSummary | null;
   kind?: MaskedProfile["kind"];
   authMode?: MaskedProfile["auth_mode"];
+  validationStatus?: MaskedProfile["validation_status"];
+  validatedAtMs?: number | null;
+  validationMessage?: string | null;
 }): MaskedProfile {
   return {
     id,
@@ -170,6 +181,9 @@ function profileFixture({
     cooldown_until_ms: null,
     credential_configured: true,
     is_current: false,
+    validation_status: validationStatus,
+    validated_at_ms: validatedAtMs,
+    validation_message: validationMessage,
     auth_mode: authMode,
     account,
   };
@@ -191,6 +205,36 @@ function chooseMenuOption(label: string, currentValue: string, optionLabel: stri
 }
 
 describe("Profiles OAuth import", () => {
+  it("keeps the empty profile state centered across the masonry columns", () => {
+    const view = renderProfiles();
+    const emptyState = view.container.querySelector(".profile-grid > .empty-state");
+
+    expect(emptyState).toBeInTheDocument();
+    expect(componentsCss).toMatch(
+      /\.profile-grid\s*>\s*\.empty-state\s*\{[^}]*display:\s*grid;[^}]*width:\s*100%;[^}]*column-span:\s*all;/s,
+    );
+  });
+
+  it("shows invalid profile details and starts reauthorization from the status card", async () => {
+    const view = renderProfiles([
+      profileFixture({
+        id: "invalid",
+        alias: "失效账号",
+        validationStatus: "invalid",
+        validatedAtMs: 1_700_000_000_000,
+        validationMessage: "官方 Codex 接口拒绝了当前登录凭据，请重新授权。",
+      }),
+    ]);
+
+    const validation = screen.getByLabelText("档案有效性：失效账号");
+    expect(validation).toHaveTextContent("档案已失效");
+    expect(validation).toHaveTextContent("官方 Codex 接口拒绝了当前登录凭据");
+    expect(validation).toHaveTextContent("上次验证");
+
+    fireEvent.click(within(validation).getByRole("button", { name: "重新授权" }));
+    await waitFor(() => expect(view.onStartOAuth).toHaveBeenCalledWith("invalid"));
+  });
+
   it("states that profile switching uses saved credentials without reauthorization", () => {
     renderProfiles();
 
@@ -745,6 +789,9 @@ describe("Profiles OAuth import", () => {
             cooldown_until_ms: null,
             credential_configured: true,
             is_current: false,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
           },
         ]}
         busy={false}
@@ -792,6 +839,9 @@ describe("Profiles OAuth import", () => {
             cooldown_until_ms: null,
             credential_configured: true,
             is_current: false,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
           },
         ]}
         busy={false}
@@ -839,6 +889,9 @@ describe("Profiles OAuth import", () => {
             cooldown_until_ms: null,
             credential_configured: true,
             is_current: false,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
           },
         ]}
         busy={false}
@@ -988,6 +1041,9 @@ describe("Profiles OAuth import", () => {
             cooldown_until_ms: null,
             credential_configured: true,
             is_current: true,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
           },
         ]}
         busy={false}
@@ -1029,6 +1085,9 @@ describe("Profiles OAuth import", () => {
             cooldown_until_ms: null,
             credential_configured: true,
             is_current: false,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
             account: {
               display_name: "Ada Lovelace",
               email: "ada@example.com",
@@ -1181,6 +1240,9 @@ describe("Profiles OAuth import", () => {
             cooldown_until_ms: null,
             credential_configured: true,
             is_current: false,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
             account: {
               display_name: null,
               email: "stale@example.com",
@@ -1257,6 +1319,9 @@ describe("Profiles OAuth import", () => {
             cooldown_until_ms: null,
             credential_configured: true,
             is_current: false,
+            validation_status: "unknown",
+            validated_at_ms: null,
+            validation_message: null,
             account: {
               display_name: null,
               email: "locked@example.com",

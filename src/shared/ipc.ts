@@ -5,6 +5,7 @@ export type GatewayProvider =
   "openai" | "openai_compatible" | "anthropic" | "gemini" | "ollama";
 export type GatewayWireApi = "responses" | "chat_completions";
 export type CodexAuthMode = "oauth" | "agent_identity" | "personal_access_token";
+export type ProfileValidationStatus = "valid" | "invalid" | "unknown";
 export type DesktopWorkspaceMode = "fresh" | "per_profile" | "shared";
 export type AppUpdateChannel = "stable" | "beta";
 
@@ -35,6 +36,9 @@ export interface MaskedProfile {
   auth_mode?: CodexAuthMode;
   is_current: boolean;
   account?: ProfileAccountSummary | null;
+  validation_status: ProfileValidationStatus;
+  validated_at_ms: number | null;
+  validation_message: string | null;
 }
 
 export interface JsonProfileImportPreviewItem {

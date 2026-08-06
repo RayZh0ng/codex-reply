@@ -2133,6 +2133,32 @@ function ProfileCard({
           onRefresh={onSyncAccount}
         />
       )}
+      <section
+        className={`profile-validation-state is-${profile.validation_status}`}
+        aria-label={`档案有效性：${profile.alias}`}
+      >
+        <div>
+          <strong>
+            {profile.validation_status === "valid"
+              ? "档案有效"
+              : profile.validation_status === "invalid"
+                ? "档案已失效"
+                : "有效性待确认"}
+          </strong>
+          <span>上次验证 {formatProfileUpdatedAt(profile.validated_at_ms)}</span>
+        </div>
+        {profile.validation_message && <p>{profile.validation_message}</p>}
+        {profile.validation_status === "invalid" && profile.kind === "codex_oauth" && (
+          <button
+            className="text-button"
+            type="button"
+            disabled={busy}
+            onClick={onReauthorize}
+          >
+            重新授权
+          </button>
+        )}
+      </section>
       {gatewayCapable && (
         <dl className="profile-facts">
           <div>
@@ -2207,7 +2233,8 @@ function ProfileCard({
               busy ||
               !profile.enabled ||
               !profile.credential_configured ||
-              !directCompatible
+              !directCompatible ||
+              profile.validation_status === "invalid"
             }
             title={
               directUnsupportedReason ??

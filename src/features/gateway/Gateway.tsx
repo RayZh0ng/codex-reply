@@ -162,10 +162,11 @@ export function Gateway({
       const profileId = value === NO_OAUTH_PROFILE ? null : value;
       const next = await api.setCodexGatewayOAuthProfile(profileId);
       setCodexConfig(next);
+      const target = next.mode === "third_party" ? "第三方直连" : "Relay 网关";
       onNotice(
         profileId
-          ? "Codex 网关 OAuth 登录档案已绑定，仅用于解锁登录态。"
-          : "Codex 网关 OAuth 登录档案已清空。",
+          ? `${target} OAuth 登录档案已绑定，仅用于解锁登录态。`
+          : `${target} OAuth 登录档案已清空。`,
       );
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "OAuth 登录档案未保存。");

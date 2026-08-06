@@ -2498,6 +2498,9 @@ mod tests {
             codex_oauth_profile_id: None,
             is_current: false,
             account: None,
+            validation_status: "unknown".to_owned(),
+            validated_at_ms: None,
+            validation_message: None,
         };
         repository
             .insert_profile(&StoredProfile {

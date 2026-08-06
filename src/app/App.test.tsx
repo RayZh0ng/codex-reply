@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { DashboardSnapshot } from "../shared/ipc";
 import App from "./App";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -36,7 +37,7 @@ beforeEach(() => {
   );
 });
 
-const snapshot = {
+const snapshot: DashboardSnapshot = {
   workspace_mode: "shared" as const,
   collaboration: {
     enabled_bots: 0,
@@ -77,10 +78,14 @@ const snapshot = {
       priority: 0,
       weight: 1,
       models: [],
+      codex_oauth_profile_id: null,
       health: "unknown",
       cooldown_until_ms: null,
       credential_configured: true,
       is_current: true,
+      validation_status: "unknown",
+      validated_at_ms: null,
+      validation_message: null,
     },
     {
       id: "next",
@@ -92,10 +97,14 @@ const snapshot = {
       priority: 0,
       weight: 1,
       models: [],
+      codex_oauth_profile_id: null,
       health: "unknown",
       cooldown_until_ms: null,
       credential_configured: true,
       is_current: false,
+      validation_status: "unknown",
+      validated_at_ms: null,
+      validation_message: null,
     },
   ],
 };
@@ -896,6 +905,94 @@ describe("App", () => {
     );
 
     expect(screen.queryByText("keychain interaction required")).not.toBeInTheDocument();
+  });
+
+  it("notifies once per valid-to-invalid transition and rearms after recovery", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    let currentSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      profiles: [
+        {
+          ...snapshot.profiles[0],
+          validation_status: "valid" as const,
+          validation_message: "官方 Codex 接口验证通过。",
+        },
+      ],
+    };
+    const validationSequence = ["invalid", "invalid", "valid", "invalid"] as const;
+    let validationIndex = 0;
+    native.invoke.mockImplementation((command: string) => {
+      if (command === "dashboard_snapshot") return Promise.resolve(currentSnapshot);
+      if (command === "managed_task_status")
+        return Promise.resolve(idleTaskStatusForTest());
+      if (command === "desktop_workspace_settings")
+        return Promise.resolve({ mode: "per_profile" });
+      if (command === "list_desktop_workspaces") return Promise.resolve([]);
+      if (command === "refresh_profile_quotas") {
+        const validationStatus =
+          validationSequence[Math.min(validationIndex, validationSequence.length - 1)];
+        validationIndex += 1;
+        const profile = {
+          ...currentSnapshot.profiles[0],
+          validation_status: validationStatus,
+          validation_message:
+            validationStatus === "invalid"
+              ? "官方 Codex 接口拒绝了当前登录凭据，请重新授权。"
+              : "官方 Codex 接口验证通过。",
+        };
+        currentSnapshot = { ...currentSnapshot, profiles: [profile] };
+        return Promise.resolve({ profiles: [profile], failed_profile_ids: [] });
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    const profilesButton = await screen.findByRole("button", { name: "档案" });
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(profilesButton);
+      await Promise.all(Array.from({ length: 8 }, () => Promise.resolve()));
+    });
+    expect(
+      screen.getByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(4_000);
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).not.toBeInTheDocument();
+    vi.useRealTimers();
+
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(commandCalls("refresh_profile_quotas")).toHaveLength(2);
+      expect(commandCalls("dashboard_snapshot")).toHaveLength(3);
+    });
+    expect(
+      screen.queryByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).not.toBeInTheDocument();
+
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(commandCalls("refresh_profile_quotas")).toHaveLength(3);
+      expect(commandCalls("dashboard_snapshot")).toHaveLength(4);
+      expect(screen.getByLabelText("档案有效性：当前账号")).toHaveTextContent(
+        "档案有效",
+      );
+    });
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(commandCalls("refresh_profile_quotas")).toHaveLength(4);
+      expect(commandCalls("dashboard_snapshot")).toHaveLength(5);
+    });
+    expect(
+      await screen.findByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).toBeInTheDocument();
   });
 });
 

@@ -178,6 +178,9 @@ pub struct MaskedProfile {
     pub codex_oauth_profile_id: Option<String>,
     pub is_current: bool,
     pub account: Option<ProfileAccountSummary>,
+    pub validation_status: String,
+    pub validated_at_ms: Option<i64>,
+    pub validation_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -44,6 +44,9 @@ const profile: MaskedProfile = {
   credential_configured: true,
   auth_mode: "oauth",
   is_current: true,
+  validation_status: "unknown",
+  validated_at_ms: null,
+  validation_message: null,
 };
 
 const longBinding: CollaborationProjectBinding = {
