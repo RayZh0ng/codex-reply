@@ -30,12 +30,31 @@ pub enum AppError {
     ConfirmationRequired,
     #[error("本机运行时不可用")]
     RuntimeUnavailable,
+    #[error("OAuth 本地回调端口已被占用")]
+    OAuthCallbackPortUnavailable,
+    #[error("无法在默认浏览器中打开 OAuth 登录页")]
+    OAuthBrowserLaunchFailed,
+    #[allow(dead_code)]
+    #[error("环境部署需要系统授权")]
+    EnvironmentPrivilegeRequired,
+    #[allow(dead_code)]
+    #[error("未检测到可用的系统包管理器")]
+    EnvironmentPackageManagerMissing,
+    #[allow(dead_code)]
+    #[error("默认浏览器启动失败")]
+    BrowserLaunchFailed,
+    #[allow(dead_code)]
+    #[error("Relay CA 信任安装失败")]
+    CaTrustFailed,
+    #[allow(dead_code)]
+    #[error("Codex CLI 未安装或不在 PATH 中")]
+    CodexCliMissing,
     #[error("该档案暂不能用于受管 Codex 会话；请完成 OAuth 授权后重试")]
     ProfileRuntimeUnavailable,
-    #[error("Codex 凭据已切换，但 ChatGPT/Codex 桌面端未能重启；请手动打开它")]
+    #[error("Codex 当前登录账号与所选 OAuth 档案不一致，请重新授权后重试")]
+    OAuthIdentityMismatch,
+    #[error("Codex 凭据已切换，但 ChatGPT.app 未能重启；请手动打开它")]
     DesktopUnavailable,
-    #[error("无法更新 macOS 的 Codex Auth 钥匙串")]
-    CodexKeychainUnavailable,
     #[error("请先选择一个已授权的 OAuth 档案，再启动受管 Codex 任务")]
     CurrentProfileRequired,
     #[error("本机会话状态暂不可读")]
@@ -62,9 +81,16 @@ impl AppError {
             Self::AppUpdateUnavailable => "app_update_unavailable",
             Self::ConfirmationRequired => "confirmation_required",
             Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::OAuthCallbackPortUnavailable => "oauth_callback_port_unavailable",
+            Self::OAuthBrowserLaunchFailed => "oauth_browser_launch_failed",
+            Self::EnvironmentPrivilegeRequired => "environment_privilege_required",
+            Self::EnvironmentPackageManagerMissing => "environment_package_manager_missing",
+            Self::BrowserLaunchFailed => "browser_launch_failed",
+            Self::CaTrustFailed => "ca_trust_failed",
+            Self::CodexCliMissing => "codex_cli_missing",
             Self::ProfileRuntimeUnavailable => "profile_runtime_unavailable",
+            Self::OAuthIdentityMismatch => "oauth_identity_mismatch",
             Self::DesktopUnavailable => "desktop_unavailable",
-            Self::CodexKeychainUnavailable => "codex_keychain_unavailable",
             Self::CurrentProfileRequired => "current_profile_required",
             Self::LocalStateUnavailable => "local_state_unavailable",
             Self::Internal => "internal",

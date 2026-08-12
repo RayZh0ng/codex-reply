@@ -1,7 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
+import { ArrowSquareOut } from "@phosphor-icons/react/ArrowSquareOut";
 import { ChatCircleDots } from "@phosphor-icons/react/ChatCircleDots";
 import { CheckCircle } from "@phosphor-icons/react/CheckCircle";
-import { Copy } from "@phosphor-icons/react/Copy";
 import { DiscordLogo } from "@phosphor-icons/react/DiscordLogo";
 import { FolderOpen } from "@phosphor-icons/react/FolderOpen";
 import { LinkSimple } from "@phosphor-icons/react/LinkSimple";
@@ -12,7 +12,14 @@ import { TelegramLogo } from "@phosphor-icons/react/TelegramLogo";
 import { Trash } from "@phosphor-icons/react/Trash";
 import { WechatLogo } from "@phosphor-icons/react/WechatLogo";
 import { XCircle } from "@phosphor-icons/react/XCircle";
-import { FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
+import {
+  type FormEvent,
+  type MouseEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import type {
   CodexSessionSummary,
@@ -24,7 +31,17 @@ import type {
   MaskedCollaborationBot,
   MaskedProfile,
 } from "../../shared/ipc";
-import { Button, Dialog, Select } from "../../shared/ui";
+import {
+  Button,
+  Dialog,
+  EmptyState,
+  InlineNotice,
+  PageHeader,
+  Select,
+  StatusPill,
+  type StatusTone,
+} from "../../shared/ui";
+import "./collaboration.css";
 
 interface ProviderCard {
   id: CollaborationProvider;
@@ -195,20 +212,30 @@ export function Collaboration({
 
   return (
     <div className="page collaboration-page">
-      <header className="page-heading" data-animate="heading">
-        <div>
-          <h1>连接群聊</h1>
-          <p className="page-subtitle">从常用通讯软件向本机 Codex 项目下发任务。</p>
-        </div>
-        <Button
-          leadingIcon={<Question size={17} />}
-          onClick={() => setHelpOpen(true)}
-          size="sm"
-          variant="quiet"
-        >
-          使用指南
-        </Button>
-      </header>
+      <PageHeader
+        actions={
+          <Button
+            leadingIcon={<Question size={17} />}
+            onClick={() => setHelpOpen(true)}
+            size="sm"
+            variant="secondary"
+          >
+            使用指南
+          </Button>
+        }
+        description="连接常用通讯平台，把群聊请求安全地转交给本机 Codex 项目。"
+        meta={
+          <>
+            <span>{bots.length} 个机器人</span>
+            <span>{bindings.length} 个项目绑定</span>
+            <span>
+              {sessions.filter((session) => session.relay_status === "running").length}{" "}
+              个运行中会话
+            </span>
+          </>
+        }
+        title="连接群聊"
+      />
 
       <ProviderGrid
         providers={providers}
@@ -218,8 +245,6 @@ export function Collaboration({
       />
 
       <div className="provider-detail-stage" key={selectedProvider}>
-        {!providerConfigured && <OnboardingSummary provider={selectedProviderMeta} />}
-
         <div className="settings-grid collaboration-settings" data-animate="cards">
           <BotForm busy={busy} provider={selectedProvider} onSubmit={onSaveBot} />
           {providerConfigured ? (
@@ -274,13 +299,14 @@ export function Collaboration({
       </div>
 
       <Dialog
-        description={`${selectedProviderMeta.shortName}的接入步骤与 /codex 命令。`}
+        busy={busy}
+        description={`${selectedProviderMeta.shortName}的接入步骤与官方文档入口。`}
         onClose={() => setHelpOpen(false)}
         open={helpOpen}
         size="lg"
         title={`${selectedProviderMeta.shortName}使用指南`}
         footer={
-          <Button onClick={() => setHelpOpen(false)} variant="primary">
+          <Button disabled={busy} onClick={() => setHelpOpen(false)} variant="primary">
             完成
           </Button>
         }
@@ -292,11 +318,6 @@ export function Collaboration({
             bindings={selectedBindings}
             sessions={selectedSessions}
             callbackStatus={callbackStatus}
-          />
-          <CommandQuickStart
-            provider={selectedProviderMeta}
-            bindings={selectedBindings}
-            sessions={selectedSessions}
           />
         </div>
       </Dialog>
@@ -348,29 +369,6 @@ function ProviderGrid({
   );
 }
 
-function OnboardingSummary({ provider }: { provider: ProviderCard }) {
-  return (
-    <section className="onboarding-summary" data-animate="notice">
-      <div className="provider-icon">{provider.icon}</div>
-      <div>
-        <strong>配置{provider.shortName}</strong>
-        <p>保存机器人凭据后，绑定本机项目，再从群聊发送 /codex 命令。</p>
-      </div>
-      <ol aria-label={`${provider.shortName}配置步骤`}>
-        <li>
-          <span>1</span>保存机器人
-        </li>
-        <li>
-          <span>2</span>绑定项目
-        </li>
-        <li>
-          <span>3</span>群内运行
-        </li>
-      </ol>
-    </section>
-  );
-}
-
 function NextStepCard({ provider }: { provider: ProviderCard }) {
   return (
     <section className="form-sheet next-step-card">
@@ -388,6 +386,11 @@ function NextStepCard({ provider }: { provider: ProviderCard }) {
       </div>
     </section>
   );
+}
+
+function openExternalGuideLink(event: MouseEvent<HTMLAnchorElement>, href: string) {
+  event.preventDefault();
+  window.open(href, "_blank", "noopener,noreferrer");
 }
 
 function SetupGuide({
@@ -421,7 +424,7 @@ function SetupGuide({
     <section className="setup-guide panel-card" data-animate="cards">
       <div className="card-heading">
         <div>
-          <p className="section-kicker">{provider.shortName} setup</p>
+          <p className="section-kicker">{provider.shortName} 配置</p>
           <h2>从 0 创建并使用{provider.shortName}连接器</h2>
         </div>
       </div>
@@ -433,109 +436,48 @@ function SetupGuide({
       )}
       <ol className="setup-steps">
         {steps.map((step, index) => (
-          <li className={step.done ? "done" : ""} key={step.title}>
-            <span className="step-index">
+          <li className={`setup-step-card ${step.done ? "done" : ""}`} key={step.title}>
+            <span className="step-index" aria-hidden="true">
               {step.done ? <CheckCircle size={18} weight="fill" /> : index + 1}
             </span>
-            <div>
-              {step.href ? (
-                <a href={step.href} target="_blank" rel="noreferrer">
-                  {step.title}
-                </a>
-              ) : (
+            <div className="setup-step-body">
+              <div className="setup-step-heading">
                 <strong>{step.title}</strong>
-              )}
+                {step.href && (
+                  <a
+                    className="doc-link-button"
+                    href={step.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(event) => openExternalGuideLink(event, step.href!)}
+                  >
+                    打开文档
+                    <ArrowSquareOut size={14} weight="bold" />
+                  </a>
+                )}
+              </div>
               <p>{step.detail}</p>
             </div>
           </li>
         ))}
       </ol>
-      <div className="doc-links">
+      <div className="doc-links" aria-label={`${provider.shortName}官方文档`}>
+        <span className="doc-links-label">官方文档</span>
         {provider.docs.map((doc) => (
-          <a key={doc.href} href={doc.href} target="_blank" rel="noreferrer">
+          <a
+            className="external-link-button"
+            key={doc.href}
+            href={doc.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(event) => openExternalGuideLink(event, doc.href)}
+          >
             {doc.label}
+            <ArrowSquareOut size={14} weight="bold" />
           </a>
         ))}
       </div>
     </section>
-  );
-}
-
-function CommandQuickStart({
-  provider,
-  bindings,
-  sessions,
-}: {
-  provider: ProviderCard;
-  bindings: CollaborationProjectBinding[];
-  sessions: CodexSessionSummary[];
-}) {
-  const firstBinding = bindings[0];
-  const firstUnbound = bindings.find((binding) => !binding.chat_id);
-  const project = firstBinding?.project_slug ?? "<project>";
-  const bindCode = firstUnbound?.bind_code ?? firstBinding?.bind_code ?? "<code>";
-  const sessionId = sessions[0]?.id ?? "<session_id>";
-  const textCommands = [
-    { label: "查看帮助", value: "/codex help" },
-    { label: "绑定群聊", value: `/codex bind ${bindCode}` },
-    { label: "列出项目", value: "/codex projects" },
-    { label: "自然续接", value: "@Codex 继续根据最新反馈修改" },
-    { label: "新会话", value: `/codex new ${project} 修复当前失败的测试` },
-    { label: "计划模式", value: `/codex plan ${project} 拆解发布前检查` },
-    { label: "长期目标", value: "/codex goal 完成本项目 beta 发布" },
-    { label: "记忆开关", value: "/codex memories status" },
-    { label: "切换模型", value: "/codex model gpt-5.1-codex" },
-    { label: "权限策略", value: "/codex permissions workspace-write" },
-    { label: "上下文状态", value: "/codex status" },
-    { label: "恢复会话", value: `/codex resume ${sessionId}` },
-    { label: "压缩上下文", value: "/codex compact" },
-    { label: "审查当前改动", value: "/codex review" },
-    { label: "取消会话", value: `/codex cancel ${sessionId}` },
-    { label: "继续会话", value: `/codex continue ${sessionId} 根据最新反馈继续修改` },
-  ];
-  const commands =
-    provider.commandMode === "slash"
-      ? textCommands.map((command) => ({
-          ...command,
-          value: `/codex command:${JSON.stringify(command.value.replace("/codex ", ""))}`,
-        }))
-      : textCommands;
-  return (
-    <section className="command-guide panel-card" data-animate="cards">
-      <div className="card-heading">
-        <div>
-          <p className="section-kicker">Commands</p>
-          <h2>{provider.shortName} 命令速查</h2>
-        </div>
-      </div>
-      <div className="command-grid">
-        {commands.map((command) => (
-          <CopyableCommand
-            key={command.label}
-            label={command.label}
-            value={command.value}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function CopyableCommand({ label, value }: { label: string; value: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    await navigator.clipboard?.writeText(value);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
-  };
-  return (
-    <div className="command-card">
-      <span>{label}</span>
-      <code>{value}</code>
-      <button className="text-button" type="button" onClick={() => void copy()}>
-        <Copy size={15} /> {copied ? "已复制" : "复制"}
-      </button>
-    </div>
   );
 }
 
@@ -617,9 +559,14 @@ function BotForm({
         </label>
         <p className="form-note">{providerNote(provider)}</p>
         <div className="form-actions">
-          <button className="primary-button" disabled={busy} type="submit">
+          <Button
+            loading={busy}
+            loadingLabel="正在保存"
+            type="submit"
+            variant="primary"
+          >
             保存机器人
-          </button>
+          </Button>
         </div>
       </form>
     </section>
@@ -729,6 +676,11 @@ function BindingForm({
               placeholder={profiles.length ? "选择档案" : "暂无可用档案"}
               value={profileId}
             />
+            {!profiles.length && (
+              <InlineNotice compact tone="warning">
+                请先在“档案”中启用一个凭据有效的 Codex OAuth 档案。
+              </InlineNotice>
+            )}
           </label>
         )}
         <label>
@@ -770,9 +722,9 @@ function BindingForm({
               value={modelId}
             />
             {!gatewayModelSelectOptions.length && (
-              <p className="form-note error-note">
+              <InlineNotice compact tone="warning">
                 先刷新可用模型，并确认至少一个账号已启用、加入网关账号池且状态可用。
-              </p>
+              </InlineNotice>
             )}
           </label>
         )}
@@ -810,20 +762,20 @@ function BindingForm({
           />
         </label>
         <div className="managed-task-directory">
-          <button
-            className="quiet-button"
+          <Button
+            leadingIcon={<FolderOpen size={17} />}
+            size="sm"
+            variant="secondary"
             type="button"
             onClick={() => void selectDirectory()}
           >
-            <FolderOpen size={17} /> 选择目录
-          </button>
+            选择目录
+          </Button>
           {directory ? <span>已选择工作目录</span> : <span>尚未选择工作目录</span>}
         </div>
         <div className="form-actions">
-          <button
-            className="primary-button"
+          <Button
             disabled={
-              busy ||
               !botId ||
               (executionTarget === "profile" && !profileId) ||
               !name ||
@@ -831,10 +783,13 @@ function BindingForm({
               !directory ||
               (executionTarget === "gateway" && !modelId)
             }
+            loading={busy}
+            loadingLabel="正在创建"
             type="submit"
+            variant="primary"
           >
             创建绑定
-          </button>
+          </Button>
         </div>
       </form>
     </section>
@@ -891,11 +846,16 @@ function BotList({
               <div className="channel-main">
                 <div>
                   <h2>{bot.name}</h2>
-                  <span
-                    className={`status-pill compact ${bot.enabled ? statusClass(bot.connection_status) : "neutral"}`}
+                  <StatusPill
+                    compact
+                    tone={
+                      bot.enabled
+                        ? collaborationStatusTone(bot.connection_status)
+                        : "disabled"
+                    }
                   >
-                    <i /> {bot.enabled ? statusLabel(bot.connection_status) : "已停用"}
-                  </span>
+                    {bot.enabled ? statusLabel(bot.connection_status) : "已停用"}
+                  </StatusPill>
                 </div>
                 <p>
                   {providerLabel(bot.provider)} · {bot.credential_mask} ·{" "}
@@ -988,9 +948,12 @@ function BotList({
             </article>
           ))
         ) : (
-          <p className="muted-copy">
-            还没有协作机器人，请先选择平台并按从 0 引导保存配置。
-          </p>
+          <EmptyState
+            compact
+            icon={<Robot size={20} weight="duotone" />}
+            title="还没有协作机器人"
+            description="选择平台并按引导保存第一份机器人配置。"
+          />
         )}
       </div>
     </section>
@@ -1023,11 +986,9 @@ function BindingList({
               <div className="channel-main">
                 <div>
                   <h2>{binding.project_name}</h2>
-                  <span
-                    className={`status-pill compact ${binding.chat_id ? "success" : "neutral"}`}
-                  >
-                    <i /> {binding.chat_id ? "已绑定群" : "待群内绑定"}
-                  </span>
+                  <StatusPill compact tone={binding.chat_id ? "success" : "neutral"}>
+                    {binding.chat_id ? "已绑定群" : "待群内绑定"}
+                  </StatusPill>
                 </div>
                 <p>
                   {providerLabel(binding.provider)} · /codex run {binding.project_slug}{" "}
@@ -1073,9 +1034,17 @@ function BindingList({
             </article>
           ))
         ) : (
-          <p className="muted-copy">
-            创建绑定后，在目标群或频道发送 /codex bind &lt;code&gt; 完成群绑定。
-          </p>
+          <EmptyState
+            compact
+            icon={<LinkSimple size={20} />}
+            title="还没有项目绑定"
+            description={
+              <>
+                创建绑定后，在目标群或频道发送 <code>/codex bind &lt;code&gt;</code>{" "}
+                完成群绑定。
+              </>
+            }
+          />
         )}
       </div>
     </section>
@@ -1097,7 +1066,7 @@ function ContextPanel({
     <section className="flat-panel contexts-panel" data-animate="cards">
       <div className="card-heading">
         <div>
-          <p className="section-kicker">Shared contexts</p>
+          <p className="section-kicker">共享上下文</p>
           <h2>项目协作上下文</h2>
           <p>
             同一目录、执行方式、档案/模型会复用稳定 CODEX_HOME、active Codex
@@ -1114,9 +1083,12 @@ function ContextPanel({
             <div className="channel-main">
               <div>
                 <h2>{context.project_name}</h2>
-                <span className="status-pill compact running">
-                  <i /> {context.memory_enabled ? "记忆开启" : "记忆关闭"}
-                </span>
+                <StatusPill
+                  compact
+                  tone={context.memory_enabled ? "running" : "neutral"}
+                >
+                  {context.memory_enabled ? "记忆开启" : "记忆关闭"}
+                </StatusPill>
               </div>
               <p>
                 {context.bot_name} · {context.project_slug} ·{" "}
@@ -1193,11 +1165,12 @@ function SessionList({
               <div className="channel-main">
                 <div>
                   <h2>{session.project_name}</h2>
-                  <span
-                    className={`status-pill compact ${sessionStatusClass(session.relay_status)}`}
+                  <StatusPill
+                    compact
+                    tone={collaborationSessionTone(session.relay_status)}
                   >
-                    <i /> {sessionStatusLabel(session.relay_status)}
-                  </span>
+                    {sessionStatusLabel(session.relay_status)}
+                  </StatusPill>
                 </div>
                 <p>
                   {providerLabel(session.provider)} · {shortId(session.id)} ·{" "}
@@ -1262,7 +1235,12 @@ function SessionList({
             </article>
           ))
         ) : (
-          <p className="muted-copy">还没有从协作平台启动的 Codex 会话。</p>
+          <EmptyState
+            compact
+            icon={<ChatCircleDots size={20} weight="duotone" />}
+            title="还没有协作会话"
+            description="完成项目绑定后，可从目标群聊直接启动 Codex 任务。"
+          />
         )}
       </div>
     </section>
@@ -1576,16 +1554,20 @@ function statusLabel(status: string) {
             : "已配置";
 }
 
-function statusClass(status: string) {
-  return status === "connected" || status === "connecting" || status === "configured"
-    ? "success"
-    : status === "failed"
-      ? "danger"
-      : "neutral";
+function collaborationStatusTone(status: string): StatusTone {
+  if (status === "connected" || status === "configured") return "success";
+  if (status === "connecting") return "running";
+  if (status === "failed") return "danger";
+  if (status === "disabled") return "disabled";
+  return "neutral";
 }
 
-function sessionStatusClass(status: string) {
-  return status === "running" ? "success" : status === "failed" ? "danger" : "neutral";
+function collaborationSessionTone(status: string): StatusTone {
+  if (status === "running") return "running";
+  if (status === "completed") return "success";
+  if (status === "failed") return "danger";
+  if (status === "cancelled") return "disabled";
+  return "neutral";
 }
 
 function sessionStatusLabel(status: string) {

@@ -38,11 +38,15 @@ const profile: MaskedProfile = {
   priority: 0,
   weight: 1,
   models: [],
+  codex_oauth_profile_id: null,
   health: "unknown",
   cooldown_until_ms: null,
   credential_configured: true,
   auth_mode: "oauth",
   is_current: true,
+  validation_status: "unknown",
+  validated_at_ms: null,
+  validation_message: null,
 };
 
 const longBinding: CollaborationProjectBinding = {

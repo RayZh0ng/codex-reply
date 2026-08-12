@@ -1,19 +1,23 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicI64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use std::process::Command;
 
 use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
 use axum::{
     body::{Body, Bytes},
-    extract::{ConnectInfo, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, Extension, State},
+    http::{header, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -22,20 +26,29 @@ use futures_util::{future::join_all, StreamExt, TryStreamExt};
 use ipnet::IpNet;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use reqwest::{redirect::Policy, Client, NoProxy, Proxy};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use tokio::sync::{mpsc, Notify};
 use url::Url;
 
 use crate::{
+    codex_environment::default_codex_home,
     database::Repository,
     database::StoredProfile,
     domain::{
-        ApiServiceTestReport, GatewayHealthProviderSummary, GatewayHealthSummary,
-        GatewayModelMapping, GatewayNetworkAddress, GatewayProvider, GatewayStatus, GatewayWireApi,
-        MaskedProfile, ProfileKind,
+        ApiServiceTestReport, CodexAuthMode, GatewayHealthProviderSummary, GatewayHealthSummary,
+        GatewayModelMapping, GatewayNetworkAddress, GatewayProvider, GatewayRequestMetricSummary,
+        GatewayStatus, GatewayWireApi, MaskedProfile, ProfileKind,
+        GATEWAY_CODEX_CLIENT_KEY_REF_SETTING, GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
     },
     error::{AppError, AppResult},
     oauth_credentials::{CredentialAccess, OAuthCredentialStore},
-    profiles::{candidates_for_model, cool_down_profile, timestamp_ms},
+    profiles::{
+        candidates_for_model, cool_down_profile, mark_profile_validation_invalid,
+        mark_profile_validation_unknown, timestamp_ms,
+    },
     secrets::SecretStore,
 };
 
@@ -46,8 +59,12 @@ struct GatewayApiState {
     oauth_credentials: Arc<OAuthCredentialStore>,
     cidrs: Vec<IpNet>,
     oauth_responses_url: Url,
-    upstream_proxy: GatewayUpstreamProxy,
+    http_client: Client,
+    auth_cache: Arc<GatewayAuthCache>,
+    concurrency: Arc<ProfileConcurrencyManager>,
+    telemetry: Arc<GatewayTelemetry>,
     certificate_ready: bool,
+    codex_home: PathBuf,
     scheduler: Arc<Mutex<WeightedScheduler>>,
     affinities: Arc<Mutex<HashMap<String, ResponseAffinity>>>,
 }
@@ -64,6 +81,15 @@ const GATEWAY_ERROR_FIRST_RESPONSE: &str = "upstream_first_response_failed";
 const GATEWAY_ERROR_STREAM_INTERRUPTED: &str = "upstream_stream_interrupted";
 const AFFINITY_TTL_MS: i64 = 60 * 60 * 1000;
 const MAX_AFFINITIES: usize = 2_048;
+/// Axum's JSON extractor defaults to 2 MiB, which is too small for Codex
+/// requests containing a long conversation, tool output, or base64 images.
+/// Keep the override bounded because JSON bodies are buffered before routing.
+const GATEWAY_JSON_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(test)]
+static ARGON2_VERIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static AUTH_COUNTER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum GatewayUpstreamProxy {
@@ -76,6 +102,397 @@ enum GatewayUpstreamProxy {
 struct ResponseAffinity {
     profile_id: String,
     expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizedClient {
+    codex_managed: bool,
+    auth_mode: &'static str,
+    auth_latency_ms: i64,
+    request_started: Instant,
+}
+
+type TokenDigest = [u8; 32];
+
+#[derive(Clone)]
+struct DirectOAuthAuthSnapshot {
+    access_token_digest: TokenDigest,
+}
+
+#[derive(Clone)]
+struct CachedClientAuth {
+    client: AuthorizedClient,
+    expires_at: Instant,
+}
+
+struct GatewayAuthCacheState {
+    oauth: Option<DirectOAuthAuthSnapshot>,
+    client_keys: HashMap<TokenDigest, CachedClientAuth>,
+    rejected: VecDeque<(TokenDigest, Instant)>,
+    last_oauth_refresh: Instant,
+}
+
+struct GatewayAuthCache {
+    state: Mutex<GatewayAuthCacheState>,
+}
+
+impl GatewayAuthCache {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GatewayAuthCacheState {
+                oauth: None,
+                client_keys: HashMap::new(),
+                rejected: VecDeque::new(),
+                last_oauth_refresh: Instant::now() - Duration::from_secs(60),
+            }),
+        }
+    }
+
+    fn refresh_oauth(&self, repository: &Repository, codex_home: &std::path::Path) {
+        let snapshot = direct_oauth_auth_snapshot(repository, codex_home);
+        if let Ok(mut state) = self.state.lock() {
+            state.oauth = snapshot;
+            state.last_oauth_refresh = Instant::now();
+        }
+    }
+
+    fn refresh_oauth_if_due(&self, repository: &Repository, codex_home: &std::path::Path) {
+        let due = self
+            .state
+            .lock()
+            .map(|state| state.last_oauth_refresh.elapsed() >= Duration::from_secs(5))
+            .unwrap_or(false);
+        if due {
+            self.refresh_oauth(repository, codex_home);
+        }
+    }
+
+    fn oauth_matches(&self, digest: &TokenDigest) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.oauth.clone())
+            .is_some_and(|snapshot| bool::from(snapshot.access_token_digest.ct_eq(digest)))
+    }
+
+    fn oauth_ready(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.oauth.is_some())
+            .unwrap_or(false)
+    }
+
+    fn cached_client(&self, digest: &TokenDigest) -> Option<AuthorizedClient> {
+        let mut state = self.state.lock().ok()?;
+        let now = Instant::now();
+        state
+            .client_keys
+            .retain(|_, cached| cached.expires_at > now);
+        state
+            .client_keys
+            .get(digest)
+            .filter(|cached| cached.expires_at > now)
+            .map(|cached| cached.client.clone())
+    }
+
+    fn cache_client(&self, digest: TokenDigest, client: AuthorizedClient) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.client_keys.len() >= 256 {
+                state.client_keys.clear();
+            }
+            state.client_keys.insert(
+                digest,
+                CachedClientAuth {
+                    client,
+                    expires_at: Instant::now() + Duration::from_secs(10 * 60),
+                },
+            );
+        }
+    }
+
+    fn recently_rejected(&self, digest: &TokenDigest) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        while state
+            .rejected
+            .front()
+            .is_some_and(|(_, expires)| *expires <= now)
+        {
+            state.rejected.pop_front();
+        }
+        state
+            .rejected
+            .iter()
+            .any(|(candidate, _)| bool::from(candidate.ct_eq(digest)))
+    }
+
+    fn cache_rejected(&self, digest: TokenDigest) {
+        if let Ok(mut state) = self.state.lock() {
+            while state.rejected.len() >= 512 {
+                state.rejected.pop_front();
+            }
+            state
+                .rejected
+                .push_back((digest, Instant::now() + Duration::from_secs(5)));
+        }
+    }
+
+    fn invalidate_client_keys(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.client_keys.clear();
+            state.rejected.clear();
+        }
+    }
+}
+
+struct ProfileGateState {
+    active: usize,
+    queued: usize,
+}
+
+struct ProfileGate {
+    state: Mutex<ProfileGateState>,
+    notify: Notify,
+}
+
+struct ProfileConcurrencyManager {
+    gates: Mutex<HashMap<String, Arc<ProfileGate>>>,
+    active: AtomicUsize,
+    queued: AtomicUsize,
+}
+
+#[derive(Debug)]
+enum ProfileAcquireError {
+    QueueFull,
+    QueueTimeout,
+}
+
+struct ProfilePermit {
+    gate: Arc<ProfileGate>,
+    manager: Arc<ProfileConcurrencyManager>,
+}
+
+struct ProfileQueueWaiter {
+    gate: Arc<ProfileGate>,
+    manager: Arc<ProfileConcurrencyManager>,
+    active: bool,
+}
+
+impl ProfileQueueWaiter {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ProfileQueueWaiter {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.queued = state.queued.saturating_sub(1);
+        }
+        self.manager.queued.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ProfilePermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.lock() {
+            state.active = state.active.saturating_sub(1);
+        }
+        self.manager.active.fetch_sub(1, Ordering::Relaxed);
+        self.gate.notify.notify_one();
+    }
+}
+
+impl ProfileConcurrencyManager {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gates: Mutex::new(HashMap::new()),
+            active: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+        })
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.active.load(Ordering::Relaxed),
+            self.queued.load(Ordering::Relaxed),
+        )
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        profile: &MaskedProfile,
+    ) -> Result<(ProfilePermit, i64), ProfileAcquireError> {
+        let max_active = profile.max_concurrency.max(1) as usize;
+        let max_queue = profile.max_queue_depth.max(0) as usize;
+        let timeout = Duration::from_millis(profile.queue_timeout_ms.max(1) as u64);
+        let gate = {
+            let mut gates = self
+                .gates
+                .lock()
+                .map_err(|_| ProfileAcquireError::QueueFull)?;
+            gates
+                .entry(profile.id.clone())
+                .or_insert_with(|| {
+                    Arc::new(ProfileGate {
+                        state: Mutex::new(ProfileGateState {
+                            active: 0,
+                            queued: 0,
+                        }),
+                        notify: Notify::new(),
+                    })
+                })
+                .clone()
+        };
+        let started = Instant::now();
+        let mut waiter: Option<ProfileQueueWaiter> = None;
+        loop {
+            {
+                let mut state = gate
+                    .state
+                    .lock()
+                    .map_err(|_| ProfileAcquireError::QueueFull)?;
+                if state.active < max_active {
+                    state.active += 1;
+                    if let Some(waiter) = waiter.as_mut() {
+                        state.queued = state.queued.saturating_sub(1);
+                        self.queued.fetch_sub(1, Ordering::Relaxed);
+                        waiter.disarm();
+                    }
+                    self.active.fetch_add(1, Ordering::Relaxed);
+                    return Ok((
+                        ProfilePermit {
+                            gate: gate.clone(),
+                            manager: self.clone(),
+                        },
+                        started.elapsed().as_millis() as i64,
+                    ));
+                }
+                if waiter.is_none() {
+                    if state.queued >= max_queue {
+                        return Err(ProfileAcquireError::QueueFull);
+                    }
+                    state.queued += 1;
+                    self.queued.fetch_add(1, Ordering::Relaxed);
+                    waiter = Some(ProfileQueueWaiter {
+                        gate: gate.clone(),
+                        manager: self.clone(),
+                        active: true,
+                    });
+                }
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(ProfileAcquireError::QueueTimeout);
+            }
+            if tokio::time::timeout(timeout - elapsed, gate.notify.notified())
+                .await
+                .is_err()
+            {
+                return Err(ProfileAcquireError::QueueTimeout);
+            }
+        }
+    }
+}
+
+struct GatewayTelemetry {
+    sender: Mutex<Option<mpsc::Sender<GatewayRequestMetricSummary>>>,
+    flush_complete: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    dropped: AtomicI64,
+}
+
+impl GatewayTelemetry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sender: Mutex::new(None),
+            flush_complete: Mutex::new(None),
+            dropped: AtomicI64::new(0),
+        })
+    }
+
+    fn start(&self, repository: Arc<Repository>) {
+        let (sender, mut receiver) = mpsc::channel::<GatewayRequestMetricSummary>(2_048);
+        let (complete_sender, complete_receiver) = std::sync::mpsc::channel();
+        if let Ok(mut slot) = self.sender.lock() {
+            *slot = Some(sender);
+        }
+        if let Ok(mut slot) = self.flush_complete.lock() {
+            *slot = Some(complete_receiver);
+        }
+        tokio::spawn(async move {
+            let _ = repository.prune_gateway_request_metrics();
+            let mut batch = Vec::with_capacity(100);
+            let mut inserted_since_prune = 0_usize;
+            let mut flush_interval = tokio::time::interval(Duration::from_secs(1));
+            flush_interval.tick().await;
+            loop {
+                tokio::select! {
+                    next = receiver.recv() => match next {
+                        Some(metric) => {
+                        batch.push(metric);
+                            if batch.len() >= 100 {
+                                inserted_since_prune +=
+                                    flush_gateway_metric_batch(&repository, &mut batch);
+                            }
+                        }
+                        None => {
+                            inserted_since_prune +=
+                                flush_gateway_metric_batch(&repository, &mut batch);
+                            if inserted_since_prune > 0 {
+                                let _ = repository.prune_gateway_request_metrics();
+                            }
+                            let _ = complete_sender.send(());
+                            break;
+                        }
+                    },
+                    _ = flush_interval.tick() => {
+                        inserted_since_prune +=
+                            flush_gateway_metric_batch(&repository, &mut batch);
+                    }
+                }
+                if inserted_since_prune >= 500 {
+                    let _ = repository.prune_gateway_request_metrics();
+                    inserted_since_prune = 0;
+                }
+            }
+        });
+    }
+
+    fn stop(&self) {
+        if let Ok(mut sender) = self.sender.lock() {
+            sender.take();
+        }
+        if let Ok(mut receiver) = self.flush_complete.lock() {
+            if let Some(receiver) = receiver.take() {
+                let _ = receiver.recv_timeout(Duration::from_secs(2));
+            }
+        }
+    }
+
+    fn record(&self, metric: GatewayRequestMetricSummary) {
+        let sender = self.sender.lock().ok().and_then(|sender| sender.clone());
+        if sender.is_none_or(|sender| sender.try_send(metric).is_err()) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn flush_gateway_metric_batch(
+    repository: &Repository,
+    batch: &mut Vec<GatewayRequestMetricSummary>,
+) -> usize {
+    let count = batch.len();
+    if count > 0 && repository.record_gateway_request_metrics(batch).is_ok() {
+        batch.clear();
+        count
+    } else {
+        0
+    }
 }
 
 #[derive(Default)]
@@ -107,6 +524,11 @@ pub async fn discover_profile_models(
     let key = secrets.get(&secret_ref).await?;
     let report = test_api_service(&stored.profile.provider, &base_url, &key).await?;
     if report.status != "verified" {
+        if report.category == "authentication" {
+            mark_profile_validation_invalid(repository, id, report.message)?;
+        } else {
+            mark_profile_validation_unknown(repository, id, report.message)?;
+        }
         return Err(AppError::UpstreamUnavailable);
     }
     let mappings = if stored.profile.model_mappings.is_empty() {
@@ -129,6 +551,9 @@ pub async fn discover_profile_models(
         .collect();
     stored.profile.model_mappings = mappings;
     stored.profile.health = "healthy".to_owned();
+    stored.profile.validation_status = "valid".to_owned();
+    stored.profile.validated_at_ms = Some(timestamp_ms());
+    stored.profile.validation_message = Some(report.message);
     repository.update_profile(&stored)?;
     Ok(stored.profile)
 }
@@ -366,6 +791,9 @@ pub struct GatewayManager {
     runtime: Mutex<Option<GatewayRuntime>>,
     scheduler: Arc<Mutex<WeightedScheduler>>,
     affinities: Arc<Mutex<HashMap<String, ResponseAffinity>>>,
+    auth_cache: Arc<GatewayAuthCache>,
+    concurrency: Arc<ProfileConcurrencyManager>,
+    telemetry: Arc<GatewayTelemetry>,
 }
 
 impl GatewayManager {
@@ -383,6 +811,9 @@ impl GatewayManager {
             runtime: Mutex::new(None),
             scheduler: Arc::new(Mutex::new(WeightedScheduler::default())),
             affinities: Arc::new(Mutex::new(HashMap::new())),
+            auth_cache: Arc::new(GatewayAuthCache::new()),
+            concurrency: ProfileConcurrencyManager::new(),
+            telemetry: GatewayTelemetry::new(),
         }
     }
 
@@ -398,11 +829,53 @@ impl GatewayManager {
     }
 
     pub fn status(&self) -> AppResult<GatewayStatus> {
-        self.repository.gateway_settings(
+        if let Ok(home) = default_codex_home() {
+            self.auth_cache
+                .refresh_oauth_if_due(&self.repository, &home);
+        }
+        let mut status = self.repository.gateway_settings(
             self.is_running(),
             self.certificate_ready(),
             available_lan_addresses(),
-        )
+        )?;
+        let (active, queued) = self.concurrency.counts();
+        if let Some(route) = status.direct_route.as_mut() {
+            if route.route_mode == "relay_bridge" && !self.auth_cache.oauth_ready() {
+                route.oauth_ready = false;
+                route.status = if route.credential_ready {
+                    "degraded".to_owned()
+                } else {
+                    "unavailable".to_owned()
+                };
+            }
+        }
+        status.active_requests = active;
+        status.queued_requests = queued;
+        Ok(status)
+    }
+
+    pub fn refresh_runtime_auth(&self) -> AppResult<()> {
+        let home = default_codex_home()?;
+        self.auth_cache.refresh_oauth(&self.repository, &home);
+        Ok(())
+    }
+
+    pub fn invalidate_client_key_cache(&self) {
+        self.auth_cache.invalidate_client_keys();
+    }
+
+    pub fn metrics_snapshot(
+        &self,
+        window_minutes: i64,
+    ) -> AppResult<crate::domain::MetricsSnapshot> {
+        let mut metrics = self
+            .repository
+            .gateway_performance(crate::domain::GatewayPerformanceInput { window_minutes })?;
+        let (active, queued) = self.concurrency.counts();
+        metrics.active_requests = active as i64;
+        metrics.queued_requests = queued as i64;
+        metrics.telemetry_dropped = self.telemetry.dropped.load(Ordering::Relaxed);
+        Ok(metrics)
     }
 
     pub async fn start(&self) -> AppResult<GatewayStatus> {
@@ -418,6 +891,7 @@ impl GatewayManager {
                     && profile.profile.in_pool
                     && profile.profile.kind == ProfileKind::CodexOauth
                     && profile.profile.auth_mode == crate::domain::CodexAuthMode::OAuth
+                    && profile.profile.validation_status != "invalid"
             })
         {
             match self
@@ -495,28 +969,29 @@ impl GatewayManager {
         )
         .await
         .map_err(|_| AppError::Internal)?;
+        let http_client = gateway_http_client(&upstream_proxy).map_err(|_| {
+            record_gateway_upstream_error(&self.repository, GATEWAY_ERROR_PROXY_CONFIG);
+            AppError::UpstreamUnavailable
+        })?;
+        let codex_home = default_codex_home()?;
+        self.auth_cache.refresh_oauth(&self.repository, &codex_home);
+        self.telemetry.start(self.repository.clone());
         let api_state = GatewayApiState {
             repository: self.repository.clone(),
             secrets: self.secrets.clone(),
             oauth_credentials: self.oauth_credentials.clone(),
             cidrs,
             oauth_responses_url: Url::parse(CODEX_RESPONSES_URL).map_err(|_| AppError::Internal)?,
-            upstream_proxy,
+            http_client,
+            auth_cache: self.auth_cache.clone(),
+            concurrency: self.concurrency.clone(),
+            telemetry: self.telemetry.clone(),
             certificate_ready: self.certificate_ready(),
+            codex_home,
             scheduler: self.scheduler.clone(),
             affinities: self.affinities.clone(),
         };
-        let app = Router::new()
-            .route("/healthz", get(healthz))
-            .route("/v1/models", get(list_models))
-            .route("/v1/responses", post(responses))
-            .route("/v1/chat/completions", post(chat_completions))
-            .route("/v1/messages", post(messages))
-            .route("/v1beta/*path", post(gemini))
-            .route("/api/chat", post(ollama_chat))
-            .route("/api/generate", post(ollama_generate))
-            .route("/api/tags", get(ollama_tags))
-            .with_state(api_state);
+        let app = gateway_router(api_state);
         let handle = axum_server::Handle::new();
         let run_handle = handle.clone();
         let socket = SocketAddr::new(address, settings.port);
@@ -544,6 +1019,7 @@ impl GatewayManager {
         runtime
             .handle
             .graceful_shutdown(Some(Duration::from_secs(2)));
+        self.telemetry.stop();
         self.status()
     }
 
@@ -556,7 +1032,7 @@ impl GatewayManager {
         Ok(())
     }
 
-    pub fn trust_ca_in_macos_keychain(&self) -> AppResult<()> {
+    pub fn trust_ca_in_system_store(&self) -> AppResult<()> {
         let source = self.certificate_dir.join("gateway-ca.pem");
         if !source.exists() {
             return Err(AppError::NotFound);
@@ -576,7 +1052,59 @@ impl GatewayManager {
             }
             Err(AppError::KeychainInteractionRequired)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            let output = Command::new("certutil.exe")
+                .args(["-user", "-addstore", "Root"])
+                .arg(source)
+                .output()
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            if output.status.success() {
+                return Ok(());
+            }
+            Err(AppError::CaTrustFailed)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let has_update_ca = Command::new("sh")
+                .args(["-lc", "command -v update-ca-certificates"])
+                .output()
+                .is_ok_and(|output| output.status.success());
+            let has_update_ca_trust = Command::new("sh")
+                .args(["-lc", "command -v update-ca-trust"])
+                .output()
+                .is_ok_and(|output| output.status.success());
+            let has_pkexec = Command::new("sh")
+                .args(["-lc", "command -v pkexec"])
+                .output()
+                .is_ok_and(|output| output.status.success());
+            if !has_pkexec {
+                return Err(AppError::EnvironmentPrivilegeRequired);
+            }
+            let source_text = source.display().to_string();
+            let script = if has_update_ca {
+                format!(
+                    "cp '{}' /usr/local/share/ca-certificates/codex-relay-gateway-ca.crt && update-ca-certificates",
+                    source_text.replace('\'', "'\\''")
+                )
+            } else if has_update_ca_trust {
+                format!(
+                    "cp '{}' /etc/pki/ca-trust/source/anchors/codex-relay-gateway-ca.crt && update-ca-trust extract",
+                    source_text.replace('\'', "'\\''")
+                )
+            } else {
+                return Err(AppError::CaTrustFailed);
+            };
+            let output = Command::new("pkexec")
+                .args(["sh", "-lc", &script])
+                .output()
+                .map_err(|_| AppError::RuntimeUnavailable)?;
+            if output.status.success() {
+                return Ok(());
+            }
+            Err(AppError::CaTrustFailed)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
             Err(AppError::RuntimeUnavailable)
         }
@@ -710,17 +1238,130 @@ fn is_private_address(address: IpAddr) -> bool {
     }
 }
 
+fn gateway_router(api_state: GatewayApiState) -> Router {
+    let protected = Router::new()
+        .route("/v1/models", get(list_models))
+        .route("/v1/responses", post(responses))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
+        .route("/v1beta/*path", post(gemini))
+        .route("/api/chat", post(ollama_chat))
+        .route("/api/generate", post(ollama_generate))
+        .route("/api/tags", get(ollama_tags))
+        .layer(DefaultBodyLimit::max(GATEWAY_JSON_BODY_LIMIT_BYTES))
+        .route_layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            authenticate_gateway_request,
+        ));
+    Router::new()
+        .route("/healthz", get(healthz))
+        .merge(protected)
+        .with_state(api_state)
+}
+
+async fn authenticate_gateway_request(
+    State(state): State<GatewayApiState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let auth_started = Instant::now();
+    let Some(client) = authorize(&state, peer.ip(), request.headers()) else {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        state.telemetry.record(GatewayRequestMetricSummary {
+            sequence: 0,
+            request_id: request_id.clone(),
+            started_at_ms: timestamp_ms(),
+            route: request.uri().path().trim_start_matches('/').to_owned(),
+            provider: "unknown".to_owned(),
+            profile_id: None,
+            auth_mode: "rejected".to_owned(),
+            stream: false,
+            auth_latency_ms: auth_started.elapsed().as_millis() as i64,
+            queue_latency_ms: 0,
+            ttfb_ms: None,
+            total_latency_ms: auth_started.elapsed().as_millis() as i64,
+            request_bytes: request
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
+            response_bytes: 0,
+            http_status: StatusCode::UNAUTHORIZED.as_u16(),
+            outcome: "failed".to_owned(),
+            error_category: Some("authentication".to_owned()),
+            upstream_attempts: 0,
+            retry_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            upstream_response_id: None,
+        });
+        let mut response = StatusCode::UNAUTHORIZED.into_response();
+        if let Ok(value) = request_id.parse() {
+            response
+                .headers_mut()
+                .insert("x-codex-relay-request-id", value);
+        }
+        return response;
+    };
+    let metric_client = client.clone();
+    let route = request.uri().path().trim_start_matches('/').to_owned();
+    let request_bytes = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_default();
+    request.extensions_mut().insert(client);
+    let mut response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        state.telemetry.record(GatewayRequestMetricSummary {
+            sequence: 0,
+            request_id: request_id.clone(),
+            started_at_ms: timestamp_ms()
+                .saturating_sub(metric_client.request_started.elapsed().as_millis() as i64),
+            route,
+            provider: "unknown".to_owned(),
+            profile_id: None,
+            auth_mode: metric_client.auth_mode.to_owned(),
+            stream: false,
+            auth_latency_ms: metric_client.auth_latency_ms,
+            queue_latency_ms: 0,
+            ttfb_ms: None,
+            total_latency_ms: metric_client.request_started.elapsed().as_millis() as i64,
+            request_bytes,
+            response_bytes: 0,
+            http_status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            outcome: "failed".to_owned(),
+            error_category: Some("body_limit".to_owned()),
+            upstream_attempts: 0,
+            retry_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            upstream_response_id: None,
+        });
+        if let Ok(value) = request_id.parse() {
+            response
+                .headers_mut()
+                .insert("x-codex-relay-request-id", value);
+        }
+    }
+    response
+}
+
 async fn healthz(State(state): State<GatewayApiState>) -> impl IntoResponse {
-    let gateway =
+    state
+        .auth_cache
+        .refresh_oauth_if_due(&state.repository, &state.codex_home);
+    let mut gateway =
         state
             .repository
             .gateway_settings(true, state.certificate_ready, available_lan_addresses());
     let candidates = candidates_for_model(&state.repository, None).unwrap_or_default();
-    let status = if candidates.is_empty() {
-        "unavailable"
-    } else {
-        "ok"
-    };
     let mut summaries = HashMap::<(GatewayProvider, String), (HashSet<String>, usize)>::new();
     for candidate in candidates {
         let surface = match candidate.profile.kind {
@@ -746,26 +1387,65 @@ async fn healthz(State(state): State<GatewayApiState>) -> impl IntoResponse {
             },
         )
         .collect::<Vec<_>>();
-    let summary = match gateway {
-        Ok(gateway) => GatewayHealthSummary {
-            status: status.to_owned(),
-            running: gateway.running,
-            bind_mode: gateway.bind_mode,
-            service_url: gateway.service_url,
-            available_profiles: gateway.available_profiles,
-            cooling_profiles: gateway.cooling_profiles,
-            certificate_ready: gateway.certificate_ready,
-            client_key_count: gateway.client_key_count,
-            upstream_last_error: gateway.upstream_last_error,
-            providers,
-        },
+    let (active_requests, queued_requests) = state.concurrency.counts();
+    let summary = match gateway.as_mut() {
+        Ok(gateway) => {
+            if let Some(route) = gateway.direct_route.as_mut() {
+                if route.route_mode == "relay_bridge" && !state.auth_cache.oauth_ready() {
+                    route.oauth_ready = false;
+                    route.status = if route.credential_ready {
+                        "degraded".to_owned()
+                    } else {
+                        "unavailable".to_owned()
+                    };
+                }
+            }
+            gateway.active_requests = active_requests;
+            gateway.queued_requests = queued_requests;
+            let status = if gateway.pool_status == "ok"
+                || gateway
+                    .direct_route
+                    .as_ref()
+                    .is_some_and(|route| route.status == "ok")
+            {
+                "ok"
+            } else if gateway
+                .direct_route
+                .as_ref()
+                .is_some_and(|route| route.status == "degraded")
+            {
+                "degraded"
+            } else {
+                "unavailable"
+            };
+            GatewayHealthSummary {
+                status: status.to_owned(),
+                running: gateway.running,
+                bind_mode: gateway.bind_mode.clone(),
+                service_url: gateway.service_url.clone(),
+                available_profiles: gateway.available_profiles,
+                cooling_profiles: gateway.cooling_profiles,
+                pool_status: gateway.pool_status.clone(),
+                direct_route: gateway.direct_route.clone(),
+                active_requests,
+                queued_requests,
+                certificate_ready: gateway.certificate_ready,
+                client_key_count: gateway.client_key_count,
+                upstream_last_error: gateway.upstream_last_error.clone(),
+                providers,
+            }
+        }
         Err(_) => GatewayHealthSummary {
-            status: status.to_owned(),
+            status: "unavailable".to_owned(),
             running: true,
             bind_mode: "unknown".to_owned(),
             service_url: String::new(),
             available_profiles: 0,
             cooling_profiles: 0,
+            pool_status: "unavailable".to_owned(),
+            direct_route: None,
+            active_requests,
+            queued_requests,
             certificate_ready: state.certificate_ready,
             client_key_count: 0,
             upstream_last_error: None,
@@ -790,15 +1470,37 @@ fn provider_surface(profile: &MaskedProfile) -> String {
 
 async fn list_models(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Extension(client): Extension<AuthorizedClient>,
 ) -> Response {
-    if !authorize(&state, peer.ip(), &headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let candidates = match candidates_for_model(&state.repository, None) {
-        Ok(value) => value,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let candidates = match direct_profile_for_codex_client(&state, &client, None) {
+        Ok(Some(profile)) => vec![profile],
+        Ok(None) => match candidates_for_model(&state.repository, None) {
+            Ok(value) => value,
+            Err(_) => {
+                return instrument_immediate_gateway_response(
+                    StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    &state,
+                    &client,
+                    "models",
+                    &GatewayProvider::OpenAiCompatible,
+                    0,
+                    None,
+                    "profile_lookup_failed",
+                )
+            }
+        },
+        Err(_) => {
+            return instrument_immediate_gateway_response(
+                StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                &state,
+                &client,
+                "models",
+                &GatewayProvider::OpenAiCompatible,
+                0,
+                None,
+                "direct_profile_unavailable",
+            )
+        }
     };
     let models = candidates
         .into_iter()
@@ -808,19 +1510,26 @@ async fn list_models(
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "owned_by": "codex-relay"}))
         .collect::<Vec<_>>();
-    Json(json!({"object": "list", "data": data})).into_response()
+    instrument_local_gateway_response(
+        Json(json!({"object": "list", "data": data})).into_response(),
+        &state,
+        &client,
+        "models",
+        &GatewayProvider::OpenAiCompatible,
+        0,
+        None,
+        None,
+    )
 }
 
 async fn responses(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Extension(client): Extension<AuthorizedClient>,
+    payload: Bytes,
 ) -> Response {
-    forward(
+    forward_bytes(
         state,
-        peer.ip(),
-        headers,
+        client,
         payload,
         "responses",
         GatewayProvider::OpenAiCompatible,
@@ -831,14 +1540,12 @@ async fn responses(
 
 async fn chat_completions(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Extension(client): Extension<AuthorizedClient>,
+    payload: Bytes,
 ) -> Response {
-    forward(
+    forward_bytes(
         state,
-        peer.ip(),
-        headers,
+        client,
         payload,
         "chat/completions",
         GatewayProvider::OpenAiCompatible,
@@ -849,14 +1556,12 @@ async fn chat_completions(
 
 async fn messages(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Extension(client): Extension<AuthorizedClient>,
+    payload: Bytes,
 ) -> Response {
-    forward(
+    forward_bytes(
         state,
-        peer.ip(),
-        headers,
+        client,
         payload,
         "v1/messages",
         GatewayProvider::Anthropic,
@@ -867,15 +1572,13 @@ async fn messages(
 
 async fn gemini(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Extension(client): Extension<AuthorizedClient>,
     axum::extract::Path(path): axum::extract::Path<String>,
-    Json(payload): Json<Value>,
+    payload: Bytes,
 ) -> Response {
-    forward(
+    forward_bytes(
         state,
-        peer.ip(),
-        headers,
+        client,
         payload,
         &format!("v1beta/{path}"),
         GatewayProvider::Gemini,
@@ -886,14 +1589,12 @@ async fn gemini(
 
 async fn ollama_chat(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Extension(client): Extension<AuthorizedClient>,
+    payload: Bytes,
 ) -> Response {
-    forward(
+    forward_bytes(
         state,
-        peer.ip(),
-        headers,
+        client,
         payload,
         "api/chat",
         GatewayProvider::Ollama,
@@ -904,14 +1605,12 @@ async fn ollama_chat(
 
 async fn ollama_generate(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Extension(client): Extension<AuthorizedClient>,
+    payload: Bytes,
 ) -> Response {
-    forward(
+    forward_bytes(
         state,
-        peer.ip(),
-        headers,
+        client,
         payload,
         "api/generate",
         GatewayProvider::Ollama,
@@ -924,6 +1623,52 @@ async fn ollama_generate(
 enum GatewayRequestKind {
     Responses,
     ChatCompletions,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayRequestEnvelope {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    previous_response_id: Option<String>,
+}
+
+#[derive(Default)]
+struct StreamTerminalState {
+    buffer: String,
+    terminated: bool,
+    failure_emitted: bool,
+}
+
+impl StreamTerminalState {
+    fn observe_sse(&mut self, bytes: &Bytes) {
+        if self.terminated {
+            return;
+        }
+        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        if self.buffer.contains("data: [DONE]") {
+            self.terminated = true;
+        }
+        for event in drain_sse_events(&mut self.buffer) {
+            if matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.failed" | "response.incomplete" | "error")
+            ) {
+                self.terminated = true;
+            }
+        }
+    }
+
+    fn interruption(&mut self, kind: Option<GatewayRequestKind>) -> Option<Bytes> {
+        if self.terminated || self.failure_emitted {
+            return None;
+        }
+        self.failure_emitted = true;
+        self.terminated = true;
+        Some(Bytes::from(sse_upstream_error_event(kind)))
+    }
 }
 
 #[derive(Clone)]
@@ -1024,10 +1769,11 @@ fn upstream_attempt(
 }
 
 enum ProviderFanoutAttempt {
-    Response(Response, bool),
+    Response(Response, bool, i64, Vec<ProfilePermit>),
     RetryAfter(Duration),
     Unhealthy,
     TemporaryFailure,
+    Backpressure(&'static str),
 }
 
 fn chat_choice_count(payload: &Value) -> Result<usize, String> {
@@ -1120,6 +1866,37 @@ fn upstream_model_for(profile: &MaskedProfile, requested: Option<&str>) -> Optio
         })
 }
 
+fn can_forward_raw(
+    profile: &MaskedProfile,
+    requested_provider: &GatewayProvider,
+    request_kind: Option<GatewayRequestKind>,
+    requested_model: Option<&str>,
+    upstream_model: &str,
+) -> bool {
+    if requested_model != Some(upstream_model) {
+        return false;
+    }
+    if request_kind.is_none() {
+        return profile.provider == *requested_provider;
+    }
+    if !matches!(
+        profile.provider,
+        GatewayProvider::OpenAi | GatewayProvider::OpenAiCompatible
+    ) {
+        return false;
+    }
+    matches!(
+        (request_kind, &profile.wire_api),
+        (
+            Some(GatewayRequestKind::Responses),
+            GatewayWireApi::Responses
+        ) | (
+            Some(GatewayRequestKind::ChatCompletions),
+            GatewayWireApi::ChatCompletions
+        )
+    )
+}
+
 fn payload_with_model(payload: &Value, model: &str) -> Value {
     let mut next = payload.clone();
     if let Some(object) = next.as_object_mut() {
@@ -1130,14 +1907,14 @@ fn payload_with_model(payload: &Value, model: &str) -> Value {
 
 async fn ollama_tags(
     State(state): State<GatewayApiState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Extension(client): Extension<AuthorizedClient>,
 ) -> Response {
-    if !authorize(&state, peer.ip(), &headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let models = candidates_for_model(&state.repository, None)
-        .unwrap_or_default()
+    let candidates = match direct_profile_for_codex_client(&state, &client, None) {
+        Ok(Some(profile)) => vec![profile],
+        Ok(None) => candidates_for_model(&state.repository, None).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let models = candidates
         .into_iter()
         .filter(|candidate| candidate.profile.provider == GatewayProvider::Ollama)
         .flat_map(|candidate| candidate.profile.models)
@@ -1151,80 +1928,444 @@ async fn ollama_tags(
     .into_response()
 }
 
+struct GatewayMetricSeed {
+    request_id: String,
+    started_at_ms: i64,
+    started: Instant,
+    route: String,
+    provider: String,
+    profile_id: Option<String>,
+    auth_mode: String,
+    auth_latency_ms: i64,
+    queue_latency_ms: i64,
+    request_bytes: i64,
+    upstream_attempts: i64,
+    retry_count: i64,
+    error_category: Option<String>,
+    _permits: Vec<ProfilePermit>,
+}
+
+struct GatewayMetricStreamState {
+    seed: Option<GatewayMetricSeed>,
+    telemetry: Arc<GatewayTelemetry>,
+    status: u16,
+    sse: bool,
+    response_bytes: i64,
+    ttfb_ms: Option<i64>,
+    clean_eof: bool,
+    terminal_success: bool,
+    terminal_failure: bool,
+    error_category: Option<String>,
+    sse_buffer: String,
+    json_buffer: Vec<u8>,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    upstream_response_id: Option<String>,
+}
+
+impl GatewayMetricStreamState {
+    fn observe(&mut self, bytes: &Bytes) {
+        if self.ttfb_ms.is_none() {
+            self.ttfb_ms = self
+                .seed
+                .as_ref()
+                .map(|seed| seed.started.elapsed().as_millis() as i64);
+        }
+        self.response_bytes = self.response_bytes.saturating_add(bytes.len() as i64);
+        if self.sse {
+            self.sse_buffer.push_str(&String::from_utf8_lossy(bytes));
+            if self.sse_buffer.contains("data: [DONE]") {
+                self.terminal_success = true;
+            }
+            for event in drain_sse_events(&mut self.sse_buffer) {
+                match event.get("type").and_then(Value::as_str) {
+                    Some("response.completed") => self.terminal_success = true,
+                    Some("response.failed") | Some("error") => self.terminal_failure = true,
+                    _ => {}
+                }
+                let (input, output, total) = usage_breakdown_from_event(&event);
+                self.input_tokens = self.input_tokens.max(input);
+                self.output_tokens = self.output_tokens.max(output);
+                self.total_tokens = self.total_tokens.max(total);
+                if self.upstream_response_id.is_none() {
+                    self.upstream_response_id = response_id_from_event(&event);
+                }
+            }
+        } else if self.json_buffer.len() < GATEWAY_JSON_BODY_LIMIT_BYTES {
+            self.json_buffer.extend_from_slice(bytes);
+        }
+    }
+}
+
+impl Drop for GatewayMetricStreamState {
+    fn drop(&mut self) {
+        let Some(seed) = self.seed.take() else {
+            return;
+        };
+        if !self.sse && !self.json_buffer.is_empty() {
+            if let Ok(value) = serde_json::from_slice::<Value>(&self.json_buffer) {
+                let (input, output, total) = usage_breakdown(&value);
+                self.input_tokens = self.input_tokens.max(input);
+                self.output_tokens = self.output_tokens.max(output);
+                self.total_tokens = self.total_tokens.max(total);
+                if self.upstream_response_id.is_none() {
+                    self.upstream_response_id =
+                        value.get("id").and_then(Value::as_str).map(str::to_owned);
+                }
+            }
+        }
+        let status_success = (200..300).contains(&self.status);
+        let initial_error_category = seed.error_category.clone();
+        let (outcome, error_category) = if self.terminal_failure {
+            ("failed", Some("upstream_response_failed".to_owned()))
+        } else if self.error_category.is_some() {
+            ("failed", self.error_category.clone())
+        } else if initial_error_category.is_some() {
+            ("failed", initial_error_category)
+        } else if !self.clean_eof {
+            ("failed", Some("client_disconnected".to_owned()))
+        } else if self.sse && !self.terminal_success {
+            ("failed", Some("stream_incomplete".to_owned()))
+        } else if status_success {
+            ("success", None)
+        } else {
+            ("failed", Some(format!("http_{}", self.status)))
+        };
+        self.telemetry.record(GatewayRequestMetricSummary {
+            sequence: 0,
+            request_id: seed.request_id,
+            started_at_ms: seed.started_at_ms,
+            route: seed.route,
+            provider: seed.provider,
+            profile_id: seed.profile_id,
+            auth_mode: seed.auth_mode,
+            stream: self.sse,
+            auth_latency_ms: seed.auth_latency_ms,
+            queue_latency_ms: seed.queue_latency_ms,
+            ttfb_ms: self.ttfb_ms,
+            total_latency_ms: seed.started.elapsed().as_millis() as i64,
+            request_bytes: seed.request_bytes,
+            response_bytes: self.response_bytes,
+            http_status: self.status,
+            outcome: outcome.to_owned(),
+            error_category,
+            upstream_attempts: seed.upstream_attempts,
+            retry_count: seed.retry_count,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            upstream_response_id: self.upstream_response_id.clone(),
+        });
+    }
+}
+
+fn instrument_gateway_response(
+    response: Response,
+    seed: GatewayMetricSeed,
+    telemetry: Arc<GatewayTelemetry>,
+    _request_kind: Option<GatewayRequestKind>,
+) -> Response {
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
+        "x-codex-relay-request-id",
+        seed.request_id
+            .parse()
+            .unwrap_or_else(|_| header::HeaderValue::from_static("invalid")),
+    );
+    let status = parts.status.as_u16();
+    let sse = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let state = GatewayMetricStreamState {
+        seed: Some(seed),
+        telemetry,
+        status,
+        sse,
+        response_bytes: 0,
+        ttfb_ms: None,
+        clean_eof: false,
+        terminal_success: false,
+        terminal_failure: false,
+        error_category: None,
+        sse_buffer: String::new(),
+        json_buffer: Vec::new(),
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        upstream_response_id: None,
+    };
+    let stream = body
+        .into_data_stream()
+        .map(Some)
+        .chain(futures_util::stream::once(async { None }))
+        .scan(state, |state, item| {
+            let result = match item {
+                Some(Ok(bytes)) => {
+                    state.observe(&bytes);
+                    Some(Ok::<Bytes, axum::Error>(bytes))
+                }
+                Some(Err(error)) => {
+                    state.error_category = Some("upstream_stream_interrupted".to_owned());
+                    Some(Err(error))
+                }
+                None => {
+                    state.clean_eof = true;
+                    None
+                }
+            };
+            futures_util::future::ready(result)
+        });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn gateway_provider_label(provider: &GatewayProvider) -> &'static str {
+    match provider {
+        GatewayProvider::OpenAi => "openai",
+        GatewayProvider::OpenAiCompatible => "openai_compatible",
+        GatewayProvider::Anthropic => "anthropic",
+        GatewayProvider::Gemini => "gemini",
+        GatewayProvider::Ollama => "ollama",
+    }
+}
+
+fn backpressure_response(code: &'static str) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": {"code": code}})),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+    response
+}
+
+// Keeping metric dimensions explicit at call sites avoids silently omitting a
+// route/auth/body field when recording an early response.
+#[allow(clippy::too_many_arguments)]
+fn instrument_immediate_gateway_response(
+    response: Response,
+    state: &GatewayApiState,
+    authorized_client: &AuthorizedClient,
+    route: &str,
+    requested_provider: &GatewayProvider,
+    request_bytes: i64,
+    request_kind: Option<GatewayRequestKind>,
+    error_category: &str,
+) -> Response {
+    instrument_local_gateway_response(
+        response,
+        state,
+        authorized_client,
+        route,
+        requested_provider,
+        request_bytes,
+        request_kind,
+        Some(error_category),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn instrument_local_gateway_response(
+    response: Response,
+    state: &GatewayApiState,
+    authorized_client: &AuthorizedClient,
+    route: &str,
+    requested_provider: &GatewayProvider,
+    request_bytes: i64,
+    request_kind: Option<GatewayRequestKind>,
+    error_category: Option<&str>,
+) -> Response {
+    let started = authorized_client.request_started;
+    let seed = GatewayMetricSeed {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        started_at_ms: timestamp_ms().saturating_sub(started.elapsed().as_millis() as i64),
+        started,
+        route: route.to_owned(),
+        provider: gateway_provider_label(requested_provider).to_owned(),
+        profile_id: None,
+        auth_mode: authorized_client.auth_mode.to_owned(),
+        auth_latency_ms: authorized_client.auth_latency_ms,
+        queue_latency_ms: 0,
+        request_bytes,
+        upstream_attempts: 0,
+        retry_count: 0,
+        error_category: error_category.map(str::to_owned),
+        _permits: Vec::new(),
+    };
+    instrument_gateway_response(response, seed, state.telemetry.clone(), request_kind)
+}
+
+#[cfg(test)]
 async fn forward(
     state: GatewayApiState,
-    peer: IpAddr,
-    headers: HeaderMap,
+    authorized_client: AuthorizedClient,
     payload: Value,
+    request_bytes: i64,
     route: &str,
     requested_provider: GatewayProvider,
     request_kind: Option<GatewayRequestKind>,
 ) -> Response {
-    if !authorize(&state, peer, &headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    if request_kind == Some(GatewayRequestKind::ChatCompletions) {
-        if let Err(message) = validate_chat_request(&payload) {
-            return openai_bad_request(&message);
-        }
-    }
-    let model = payload.get("model").and_then(Value::as_str);
-    let mut candidates = match candidates_for_model(&state.repository, model) {
-        Ok(value) => value
-            .into_iter()
-            .filter(|candidate| {
-                if candidate.profile.kind == ProfileKind::CodexOauth {
-                    request_kind.is_some()
-                        && requested_provider == GatewayProvider::OpenAiCompatible
-                } else if request_kind.is_some()
-                    && requested_provider == GatewayProvider::OpenAiCompatible
-                {
-                    true
-                } else {
-                    candidate.profile.provider == requested_provider
-                        || matches!(
-                            (&requested_provider, &candidate.profile.provider),
-                            (GatewayProvider::OpenAiCompatible, GatewayProvider::OpenAi)
-                        )
-                }
-            })
-            .collect::<Vec<_>>(),
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": {"code": "model_not_available"}})),
+    let raw_payload = match serde_json::to_vec(&payload) {
+        Ok(payload) => Bytes::from(payload),
+        Err(_) => return openai_bad_request("request body must be valid JSON"),
+    };
+    debug_assert_eq!(raw_payload.len() as i64, request_bytes);
+    forward_bytes(
+        state,
+        authorized_client,
+        raw_payload,
+        route,
+        requested_provider,
+        request_kind,
+    )
+    .await
+}
+
+async fn forward_bytes(
+    state: GatewayApiState,
+    authorized_client: AuthorizedClient,
+    raw_payload: Bytes,
+    route: &str,
+    requested_provider: GatewayProvider,
+    request_kind: Option<GatewayRequestKind>,
+) -> Response {
+    let request_bytes = raw_payload.len() as i64;
+    let envelope = match serde_json::from_slice::<GatewayRequestEnvelope>(&raw_payload) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            return instrument_immediate_gateway_response(
+                openai_bad_request("request body must be valid JSON"),
+                &state,
+                &authorized_client,
+                route,
+                &requested_provider,
+                request_bytes,
+                request_kind,
+                "invalid_json",
             )
-                .into_response()
+        }
+    };
+    let immediate = |response: Response, error_category: &str| {
+        instrument_immediate_gateway_response(
+            response,
+            &state,
+            &authorized_client,
+            route,
+            &requested_provider,
+            request_bytes,
+            request_kind,
+            error_category,
+        )
+    };
+    let mut parsed_payload = None;
+    if request_kind == Some(GatewayRequestKind::ChatCompletions) {
+        let payload = match serde_json::from_slice::<Value>(&raw_payload) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return immediate(
+                    openai_bad_request("request body must be valid JSON"),
+                    "invalid_json",
+                )
+            }
+        };
+        if let Err(message) = validate_chat_request(&payload) {
+            return immediate(openai_bad_request(&message), "invalid_request");
+        }
+        parsed_payload = Some(payload);
+    }
+    let model = envelope.model.as_deref();
+    let mut candidates = match direct_profile_for_codex_client(&state, &authorized_client, model) {
+        Ok(Some(profile)) => vec![profile],
+        Ok(None) => match candidates_for_model(&state.repository, model) {
+            Ok(value) => value
+                .into_iter()
+                .filter(|candidate| {
+                    if candidate.profile.kind == ProfileKind::CodexOauth {
+                        request_kind.is_some()
+                            && requested_provider == GatewayProvider::OpenAiCompatible
+                    } else if request_kind.is_some()
+                        && requested_provider == GatewayProvider::OpenAiCompatible
+                    {
+                        true
+                    } else {
+                        candidate.profile.provider == requested_provider
+                            || matches!(
+                                (&requested_provider, &candidate.profile.provider),
+                                (GatewayProvider::OpenAiCompatible, GatewayProvider::OpenAi)
+                            )
+                    }
+                })
+                .collect::<Vec<_>>(),
+            _ => {
+                return immediate(
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": {"code": "model_not_available"}})),
+                    )
+                        .into_response(),
+                    "model_not_available",
+                )
+            }
+        },
+        Err(AppError::GatewayModelUnavailable) => {
+            return immediate(
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": {"code": "model_not_available"}})),
+                )
+                    .into_response(),
+                "model_not_available",
+            )
+        }
+        Err(_) => {
+            return immediate(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": {"code": "direct_profile_unavailable"}})),
+                )
+                    .into_response(),
+                "direct_profile_unavailable",
+            )
         }
     };
     if candidates.is_empty() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": {"code": "model_not_available"}})),
-        )
-            .into_response();
+        return immediate(
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": {"code": "model_not_available"}})),
+            )
+                .into_response(),
+            "model_not_available",
+        );
     }
     cool_down_exhausted_profiles(&state.repository, &mut candidates);
     if candidates.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {"code": "all_profiles_exhausted"}})),
-        )
-            .into_response();
+        return immediate(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {"code": "all_profiles_exhausted"}})),
+            )
+                .into_response(),
+            "all_profiles_exhausted",
+        );
     }
     if request_kind == Some(GatewayRequestKind::Responses) {
-        if let Some(previous_id) = payload.get("previous_response_id").and_then(Value::as_str) {
+        if let Some(previous_id) = envelope.previous_response_id.as_deref() {
             match affinity_profile(&state, previous_id) {
                 Some(profile_id) => {
                     candidates.retain(|candidate| candidate.profile.id == profile_id);
                     if candidates.is_empty() {
-                        return affinity_conflict();
+                        return immediate(affinity_conflict(), "response_affinity_conflict");
                     }
                 }
                 None => {
                     candidates.retain(|candidate| candidate.profile.kind == ProfileKind::ApiKey);
                     if candidates.is_empty() {
-                        return affinity_conflict();
+                        return immediate(affinity_conflict(), "response_affinity_conflict");
                     }
                 }
             }
@@ -1245,29 +2386,67 @@ async fn forward(
             .unwrap_or_default()
     );
     let candidates = ordered_candidates(candidates, &state.scheduler, &route_key);
-    let client = match gateway_http_client(&state.upstream_proxy) {
-        Ok(client) => client,
-        Err(_) => {
-            record_gateway_upstream_error(&state.repository, GATEWAY_ERROR_PROXY_CONFIG);
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    let started = Instant::now();
+    let http_client = state.http_client.clone();
+    let started = authorized_client.request_started;
+    let started_at_ms = timestamp_ms().saturating_sub(started.elapsed().as_millis() as i64);
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut upstream_attempts = 0_i64;
+    let mut last_backpressure = None;
     for candidate in candidates.into_iter() {
+        let (permit, queue_latency_ms) = match state.concurrency.acquire(&candidate.profile).await {
+            Ok(value) => value,
+            Err(ProfileAcquireError::QueueFull) => {
+                last_backpressure = Some("relay_queue_full");
+                continue;
+            }
+            Err(ProfileAcquireError::QueueTimeout) => {
+                last_backpressure = Some("relay_queue_timeout");
+                continue;
+            }
+        };
+        upstream_attempts += 1;
         if candidate.profile.kind == ProfileKind::CodexOauth {
             let Some(kind) = request_kind else {
                 continue;
             };
-            match forward_oauth_candidate(&state, &client, &candidate, &payload, kind).await {
-                OAuthAttempt::Response(response) => {
-                    let successful = response.status().is_success();
-                    if successful {
+            if parsed_payload.is_none() {
+                parsed_payload = serde_json::from_slice::<Value>(&raw_payload).ok();
+            }
+            let Some(payload) = parsed_payload.as_ref() else {
+                return immediate(
+                    openai_bad_request("request body must be valid JSON"),
+                    "invalid_json",
+                );
+            };
+            match forward_oauth_candidate(&state, &http_client, &candidate, payload, kind).await {
+                OAuthAttempt::Response(response, physical_attempts) => {
+                    upstream_attempts =
+                        upstream_attempts.saturating_add(physical_attempts.saturating_sub(1));
+                    if response.status().is_success() {
                         clear_gateway_upstream_error(&state.repository);
                     }
-                    let _ = state
-                        .repository
-                        .record_metric(successful, started.elapsed().as_millis() as i64);
-                    return response;
+                    let seed = GatewayMetricSeed {
+                        request_id: request_id.clone(),
+                        started_at_ms,
+                        started,
+                        route: route.to_owned(),
+                        provider: gateway_provider_label(&candidate.profile.provider).to_owned(),
+                        profile_id: Some(candidate.profile.id.clone()),
+                        auth_mode: authorized_client.auth_mode.to_owned(),
+                        auth_latency_ms: authorized_client.auth_latency_ms,
+                        queue_latency_ms,
+                        request_bytes,
+                        upstream_attempts,
+                        retry_count: upstream_attempts.saturating_sub(1),
+                        error_category: None,
+                        _permits: vec![permit],
+                    };
+                    return instrument_gateway_response(
+                        response,
+                        seed,
+                        state.telemetry.clone(),
+                        request_kind,
+                    );
                 }
                 OAuthAttempt::RetryAfter(duration) => {
                     cool_down_profile(&state.repository, &candidate.profile.id, duration);
@@ -1300,21 +2479,44 @@ async fn forward(
         let visible_model = visible_model_for(&candidate.profile, model);
         let upstream_model =
             upstream_model_for(&candidate.profile, model).unwrap_or_else(|| visible_model.clone());
-        let client_stream = payload
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let (upstream_route, upstream_payload, response_adapter) = match upstream_attempt(
+        let client_stream = envelope.stream;
+        let raw_passthrough = can_forward_raw(
             &candidate.profile,
-            &payload,
-            route,
+            &requested_provider,
             request_kind,
-            client_stream,
-            visible_model.clone(),
-            upstream_model.clone(),
-        ) {
-            Ok(value) => value,
-            Err(message) => return openai_bad_request(&message),
+            model,
+            &upstream_model,
+        );
+        let (upstream_route, upstream_payload, response_adapter) = if raw_passthrough {
+            (
+                route.to_owned(),
+                None,
+                ApiResponseAdapter::Direct {
+                    visible_model: visible_model.clone(),
+                },
+            )
+        } else {
+            if parsed_payload.is_none() {
+                parsed_payload = serde_json::from_slice::<Value>(&raw_payload).ok();
+            }
+            let Some(payload) = parsed_payload.as_ref() else {
+                return immediate(
+                    openai_bad_request("request body must be valid JSON"),
+                    "invalid_json",
+                );
+            };
+            match upstream_attempt(
+                &candidate.profile,
+                payload,
+                route,
+                request_kind,
+                client_stream,
+                visible_model.clone(),
+                upstream_model.clone(),
+            ) {
+                Ok((route, payload, adapter)) => (route, Some(payload), adapter),
+                Err(message) => return immediate(openai_bad_request(&message), "invalid_request"),
+            }
         };
         let endpoint = match build_upstream_url(&base_url, &upstream_route) {
             Ok(url) => url,
@@ -1330,32 +2532,67 @@ async fn forward(
             visible_model,
         } = &response_adapter
         {
-            let choice_count = match chat_choice_count(&payload) {
+            let Some(payload) = parsed_payload.as_ref() else {
+                return immediate(
+                    openai_bad_request("request body must be valid JSON"),
+                    "invalid_json",
+                );
+            };
+            let choice_count = match chat_choice_count(payload) {
                 Ok(value) => value,
-                Err(message) => return openai_bad_request(&message),
+                Err(message) => return immediate(openai_bad_request(&message), "invalid_request"),
             };
             if choice_count > 1 {
+                drop(permit);
                 match forward_provider_chat_choices(ProviderFanoutRequest {
-                    client: &client,
+                    client: &http_client,
                     endpoint: endpoint.clone(),
                     provider: provider.clone(),
                     key: key.clone(),
-                    upstream_payload: upstream_payload.clone(),
+                    upstream_payload: upstream_payload.clone().unwrap_or_default(),
                     choice_count,
                     client_stream: *client_stream,
                     model: visible_model.clone(),
                     repository: state.repository.clone(),
+                    concurrency: state.concurrency.clone(),
+                    profile: candidate.profile.clone(),
                 })
                 .await
                 {
-                    ProviderFanoutAttempt::Response(response, successful) => {
+                    ProviderFanoutAttempt::Response(
+                        response,
+                        successful,
+                        fanout_queue_ms,
+                        permits,
+                    ) => {
                         if successful {
                             clear_gateway_upstream_error(&state.repository);
                         }
-                        let _ = state
-                            .repository
-                            .record_metric(successful, started.elapsed().as_millis() as i64);
-                        return response;
+                        let physical_attempts =
+                            upstream_attempts.saturating_add(choice_count.saturating_sub(1) as i64);
+                        let seed = GatewayMetricSeed {
+                            request_id: request_id.clone(),
+                            started_at_ms,
+                            started,
+                            route: route.to_owned(),
+                            provider: gateway_provider_label(&candidate.profile.provider)
+                                .to_owned(),
+                            profile_id: Some(candidate.profile.id.clone()),
+                            auth_mode: authorized_client.auth_mode.to_owned(),
+                            auth_latency_ms: authorized_client.auth_latency_ms,
+                            queue_latency_ms: queue_latency_ms.saturating_add(fanout_queue_ms),
+                            request_bytes,
+                            upstream_attempts: physical_attempts,
+                            retry_count: physical_attempts.saturating_sub(1),
+                            error_category: None,
+                            _permits: permits,
+                        };
+                        return instrument_gateway_response(
+                            response,
+                            seed,
+                            state.telemetry.clone(),
+                            request_kind,
+                        );
                     }
                     ProviderFanoutAttempt::RetryAfter(duration) => {
                         cool_down_profile(&state.repository, &candidate.profile.id, duration);
@@ -1377,15 +2614,28 @@ async fn forward(
                         );
                         continue;
                     }
+                    ProviderFanoutAttempt::Backpressure(code) => {
+                        last_backpressure = Some(code);
+                        continue;
+                    }
                 }
             }
         }
-        let request = upstream_request(
-            client.post(endpoint),
-            &candidate.profile.provider,
-            &key,
-            &upstream_payload,
-        );
+        let request = if let Some(upstream_payload) = upstream_payload.as_ref() {
+            upstream_request(
+                http_client.post(endpoint),
+                &candidate.profile.provider,
+                &key,
+                upstream_payload,
+            )
+        } else {
+            upstream_request_bytes(
+                http_client.post(endpoint),
+                &candidate.profile.provider,
+                &key,
+                raw_payload.clone(),
+            )
+        };
         match send_with_first_response_timeout(request).await {
             Ok(response)
                 if response.status().is_server_error()
@@ -1412,10 +2662,7 @@ async fn forward(
                 if successful {
                     clear_gateway_upstream_error(&state.repository);
                 }
-                let _ = state
-                    .repository
-                    .record_metric(successful, started.elapsed().as_millis() as i64);
-                return match response_adapter {
+                let response = match response_adapter {
                     ApiResponseAdapter::Direct { visible_model } => {
                         upstream_response_with_visible_model(
                             response,
@@ -1484,6 +2731,28 @@ async fn forward(
                         .await
                     }
                 };
+                let seed = GatewayMetricSeed {
+                    request_id: request_id.clone(),
+                    started_at_ms,
+                    started,
+                    route: route.to_owned(),
+                    provider: gateway_provider_label(&candidate.profile.provider).to_owned(),
+                    profile_id: Some(candidate.profile.id.clone()),
+                    auth_mode: authorized_client.auth_mode.to_owned(),
+                    auth_latency_ms: authorized_client.auth_latency_ms,
+                    queue_latency_ms,
+                    request_bytes,
+                    upstream_attempts,
+                    retry_count: upstream_attempts.saturating_sub(1),
+                    error_category: None,
+                    _permits: vec![permit],
+                };
+                return instrument_gateway_response(
+                    response,
+                    seed,
+                    state.telemetry.clone(),
+                    request_kind,
+                );
             }
             Err(_) => {
                 record_gateway_upstream_error(&state.repository, GATEWAY_ERROR_FIRST_RESPONSE);
@@ -1496,14 +2765,17 @@ async fn forward(
             }
         }
     }
-    let _ = state
-        .repository
-        .record_metric(false, started.elapsed().as_millis() as i64);
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({"error": {"code": "upstream_unavailable"}})),
+    if let Some(code) = last_backpressure {
+        return immediate(backpressure_response(code), code);
+    }
+    immediate(
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {"code": "upstream_unavailable"}})),
+        )
+            .into_response(),
+        "upstream_unavailable",
     )
-        .into_response()
 }
 
 fn ordered_candidates(
@@ -1604,7 +2876,7 @@ impl WeightedScheduler {
 }
 
 enum OAuthAttempt {
-    Response(Response),
+    Response(Response, i64),
     RetryAfter(Duration),
     ReauthorizationRequired,
     TemporaryFailure,
@@ -1632,7 +2904,7 @@ async fn forward_oauth_candidate(
         }
         GatewayRequestKind::ChatCompletions => match chat_to_responses(client_payload) {
             Ok(value) => value,
-            Err(message) => return OAuthAttempt::Response(openai_bad_request(&message)),
+            Err(message) => return OAuthAttempt::Response(openai_bad_request(&message), 0),
         },
     };
     let mut credential = match state
@@ -1646,6 +2918,7 @@ async fn forward_oauth_candidate(
         }
         Err(_) => return OAuthAttempt::TemporaryFailure,
     };
+    let mut physical_attempts = 1_i64;
     let mut response = match send_oauth_request(
         client,
         &state.oauth_responses_url,
@@ -1661,6 +2934,7 @@ async fn forward_oauth_candidate(
         }
     };
     if response.status() == StatusCode::UNAUTHORIZED {
+        physical_attempts = 2;
         credential = match state
             .oauth_credentials
             .refresh(candidate, CredentialAccess::Background, true)
@@ -1701,11 +2975,10 @@ async fn forward_oauth_candidate(
         return OAuthAttempt::RetryAfter(Duration::from_secs(15));
     }
     if !response.status().is_success() {
-        return OAuthAttempt::Response(upstream_response(
-            response,
-            state.repository.clone(),
-            Some(kind),
-        ));
+        return OAuthAttempt::Response(
+            upstream_response(response, state.repository.clone(), Some(kind)),
+            physical_attempts,
+        );
     }
     let model = client_payload
         .get("model")
@@ -1723,6 +2996,7 @@ async fn forward_oauth_candidate(
             state.affinities.clone(),
         )
         .await,
+        physical_attempts,
     )
 }
 
@@ -1762,72 +3036,82 @@ async fn adapt_oauth_response(
         return match kind {
             GatewayRequestKind::Responses => {
                 let repository = repository.clone();
-                let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
-                    String::new(),
-                    move |buffer, chunk| {
-                        let affinities = affinities.clone();
-                        let profile_id = profile_id.clone();
-                        let result = match chunk {
-                            Ok(bytes) => {
-                                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                for event in drain_sse_events(buffer) {
-                                    let tokens = usage_tokens_from_response_event(&event);
-                                    if tokens > 0 {
-                                        let _ = repository.add_estimated_tokens(tokens);
+                let stream = response
+                    .bytes_stream()
+                    .map_err(std::io::Error::other)
+                    .map(Some)
+                    .chain(futures_util::stream::once(async { None }))
+                    .scan(
+                        (String::new(), StreamTerminalState::default()),
+                        move |(buffer, terminal), chunk| {
+                            let affinities = affinities.clone();
+                            let profile_id = profile_id.clone();
+                            let result = match chunk {
+                                Some(Ok(bytes)) => {
+                                    terminal.observe_sse(&bytes);
+                                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                    for event in drain_sse_events(buffer) {
+                                        if let Some(id) = response_id_from_event(&event) {
+                                            record_affinity(&affinities, &id, &profile_id);
+                                        }
                                     }
-                                    if let Some(id) = response_id_from_event(&event) {
-                                        record_affinity(&affinities, &id, &profile_id);
-                                    }
+                                    Some(Ok::<Bytes, std::io::Error>(bytes))
                                 }
-                                Some(Ok::<Bytes, std::io::Error>(bytes))
-                            }
-                            Err(_) => {
-                                record_gateway_upstream_error(
-                                    &repository,
-                                    GATEWAY_ERROR_STREAM_INTERRUPTED,
-                                );
-                                Some(Ok(Bytes::from(sse_upstream_error_event(Some(
-                                    GatewayRequestKind::Responses,
-                                )))))
-                            }
-                        };
-                        futures_util::future::ready(result)
-                    },
-                );
+                                Some(Err(_)) | None => {
+                                    let interruption =
+                                        terminal.interruption(Some(GatewayRequestKind::Responses));
+                                    if interruption.is_none() {
+                                        return futures_util::future::ready(None);
+                                    }
+                                    record_gateway_upstream_error(
+                                        &repository,
+                                        GATEWAY_ERROR_STREAM_INTERRUPTED,
+                                    );
+                                    Some(Ok(interruption.unwrap_or_default()))
+                                }
+                            };
+                            futures_util::future::ready(result)
+                        },
+                    );
                 sse_response(Body::from_stream(stream))
             }
             GatewayRequestKind::ChatCompletions => {
                 let repository = repository.clone();
-                let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
-                    ChatStreamState::new(model, profile_id, affinities),
-                    move |state, chunk| {
-                        let result = match chunk {
-                            Ok(bytes) => {
-                                state.buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                let events = drain_sse_events(&mut state.buffer);
-                                let mut output = String::new();
-                                for event in events {
-                                    let tokens = usage_tokens_from_response_event(&event);
-                                    if tokens > 0 {
-                                        let _ = repository.add_estimated_tokens(tokens);
+                let stream = response
+                    .bytes_stream()
+                    .map_err(std::io::Error::other)
+                    .map(Some)
+                    .chain(futures_util::stream::once(async { None }))
+                    .scan(
+                        ChatStreamState::new(model, profile_id, affinities),
+                        move |state, chunk| {
+                            let result = match chunk {
+                                Some(Ok(bytes)) => {
+                                    state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                                    let events = drain_sse_events(&mut state.buffer);
+                                    let mut output = String::new();
+                                    for event in events {
+                                        output.push_str(&state.translate(event));
                                     }
-                                    output.push_str(&state.translate(event));
+                                    Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
                                 }
-                                Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
-                            }
-                            Err(_) => {
-                                record_gateway_upstream_error(
-                                    &repository,
-                                    GATEWAY_ERROR_STREAM_INTERRUPTED,
-                                );
-                                Some(Ok(Bytes::from(sse_upstream_error_event(Some(
-                                    GatewayRequestKind::ChatCompletions,
-                                )))))
-                            }
-                        };
-                        futures_util::future::ready(result)
-                    },
-                );
+                                Some(Err(_)) | None => {
+                                    if state.done {
+                                        return futures_util::future::ready(None);
+                                    }
+                                    record_gateway_upstream_error(
+                                        &repository,
+                                        GATEWAY_ERROR_STREAM_INTERRUPTED,
+                                    );
+                                    state.done = true;
+                                    Some(Ok(Bytes::from(sse_upstream_error_event(Some(
+                                        GatewayRequestKind::ChatCompletions,
+                                    )))))
+                                }
+                            };
+                            futures_util::future::ready(result)
+                        },
+                    );
                 sse_response(Body::from_stream(stream))
             }
         };
@@ -2600,36 +3884,41 @@ async fn adapt_chat_completion_response(
     repository: Arc<Repository>,
 ) -> Response {
     if client_stream {
-        let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
-            ChatToResponsesStreamState::new(model),
-            move |state, chunk| {
-                let result = match chunk {
-                    Ok(bytes) => {
-                        state.buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        let events = drain_sse_events(&mut state.buffer);
-                        let mut output = String::new();
-                        for event in events {
-                            let tokens = usage_tokens_from_value(&event);
-                            if tokens > 0 {
-                                let _ = repository.add_estimated_tokens(tokens);
+        let stream = response
+            .bytes_stream()
+            .map_err(std::io::Error::other)
+            .map(Some)
+            .chain(futures_util::stream::once(async { None }))
+            .scan(
+                ChatToResponsesStreamState::new(model),
+                move |state, chunk| {
+                    let result = match chunk {
+                        Some(Ok(bytes)) => {
+                            state.buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            let events = drain_sse_events(&mut state.buffer);
+                            let mut output = String::new();
+                            for event in events {
+                                output.push_str(&state.translate(event));
                             }
-                            output.push_str(&state.translate(event));
+                            Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
                         }
-                        Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
-                    }
-                    Err(_) => {
-                        record_gateway_upstream_error(
-                            &repository,
-                            GATEWAY_ERROR_STREAM_INTERRUPTED,
-                        );
-                        Some(Ok(Bytes::from(sse_upstream_error_event(Some(
-                            GatewayRequestKind::Responses,
-                        )))))
-                    }
-                };
-                futures_util::future::ready(result)
-            },
-        );
+                        Some(Err(_)) | None => {
+                            if state.done {
+                                return futures_util::future::ready(None);
+                            }
+                            record_gateway_upstream_error(
+                                &repository,
+                                GATEWAY_ERROR_STREAM_INTERRUPTED,
+                            );
+                            state.done = true;
+                            Some(Ok(Bytes::from(sse_upstream_error_event(Some(
+                                GatewayRequestKind::Responses,
+                            )))))
+                        }
+                    };
+                    futures_util::future::ready(result)
+                },
+            );
         return sse_response(Body::from_stream(stream));
     }
     let bytes = match response.bytes().await {
@@ -2728,6 +4017,7 @@ struct ChatToResponsesStreamState {
     created: i64,
     text: String,
     emitted_created: bool,
+    done: bool,
 }
 
 impl ChatToResponsesStreamState {
@@ -2739,6 +4029,7 @@ impl ChatToResponsesStreamState {
             created: timestamp_ms() / 1000,
             text: String::new(),
             emitted_created: false,
+            done: false,
         }
     }
 
@@ -2786,6 +4077,7 @@ impl ChatToResponsesStreamState {
             .get("finish_reason")
             .is_some_and(|value| !value.is_null())
         {
+            self.done = true;
             output.push_str(&format!(
                 "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
                 json!({
@@ -2946,6 +4238,7 @@ struct ChatStreamState {
     affinities: Arc<Mutex<HashMap<String, ResponseAffinity>>>,
     tool_indexes: HashMap<i64, usize>,
     has_tools: bool,
+    done: bool,
 }
 
 impl ChatStreamState {
@@ -2963,6 +4256,7 @@ impl ChatStreamState {
             affinities,
             tool_indexes: HashMap::new(),
             has_tools: false,
+            done: false,
         }
     }
 
@@ -3022,6 +4316,7 @@ impl ChatStreamState {
                 )
             }
             Some("response.completed") => {
+                self.done = true;
                 let usage = event
                     .get("response")
                     .and_then(|response| response.get("usage"));
@@ -3035,6 +4330,7 @@ impl ChatStreamState {
                 )
             }
             Some("response.failed" | "response.incomplete") => {
+                self.done = true;
                 "data: {\"error\":{\"code\":\"upstream_response_failed\"}}\n\ndata: [DONE]\n\n"
                     .to_owned()
             }
@@ -3165,27 +4461,45 @@ struct ProviderFanoutRequest<'a> {
     client_stream: bool,
     model: String,
     repository: Arc<Repository>,
+    concurrency: Arc<ProfileConcurrencyManager>,
+    profile: MaskedProfile,
 }
 
 async fn forward_provider_chat_choices(
     request: ProviderFanoutRequest<'_>,
 ) -> ProviderFanoutAttempt {
     let attempts = (0..request.choice_count).map(|_| {
-        let request = upstream_request(
-            request.client.post(request.endpoint.clone()),
-            &request.provider,
-            &request.key,
-            &request.upstream_payload,
-        );
-        send_with_first_response_timeout(request)
+        let concurrency = request.concurrency.clone();
+        let profile = request.profile.clone();
+        let endpoint = request.endpoint.clone();
+        let provider = request.provider.clone();
+        let key = request.key.clone();
+        let payload = request.upstream_payload.clone();
+        async move {
+            let (permit, queue_latency_ms) = concurrency.acquire(&profile).await?;
+            let outbound =
+                upstream_request(request.client.post(endpoint), &provider, &key, &payload);
+            let response = send_with_first_response_timeout(outbound).await;
+            Ok::<_, ProfileAcquireError>((response, queue_latency_ms, permit))
+        }
     });
     let results = join_all(attempts).await;
     let mut responses = Vec::with_capacity(request.choice_count);
+    let mut permits = Vec::with_capacity(request.choice_count);
+    let mut queue_latency_ms = 0_i64;
     for result in results {
-        let response = match result {
-            Ok(response) => response,
-            Err(_) => return ProviderFanoutAttempt::TemporaryFailure,
+        let (response, queued_ms, permit) = match result {
+            Ok((Ok(response), queued_ms, permit)) => (response, queued_ms, permit),
+            Ok((Err(_), _, _)) => return ProviderFanoutAttempt::TemporaryFailure,
+            Err(ProfileAcquireError::QueueFull) => {
+                return ProviderFanoutAttempt::Backpressure("relay_queue_full")
+            }
+            Err(ProfileAcquireError::QueueTimeout) => {
+                return ProviderFanoutAttempt::Backpressure("relay_queue_timeout")
+            }
         };
+        permits.push(permit);
+        queue_latency_ms = queue_latency_ms.max(queued_ms);
         if response.status().is_server_error() || response.status() == StatusCode::TOO_MANY_REQUESTS
         {
             return ProviderFanoutAttempt::RetryAfter(
@@ -3202,6 +4516,8 @@ async fn forward_provider_chat_choices(
             return ProviderFanoutAttempt::Response(
                 upstream_provider_error_response(response).await,
                 false,
+                queue_latency_ms,
+                permits,
             );
         }
         responses.push(response);
@@ -3215,6 +4531,8 @@ async fn forward_provider_chat_choices(
                 request.repository,
             ),
             true,
+            queue_latency_ms,
+            permits,
         )
     } else {
         ProviderFanoutAttempt::Response(
@@ -3226,6 +4544,8 @@ async fn forward_provider_chat_choices(
             )
             .await,
             true,
+            queue_latency_ms,
+            permits,
         )
     }
 }
@@ -3268,13 +4588,12 @@ async fn adapt_provider_chat_fanout_response(
     responses: Vec<reqwest::Response>,
     provider: GatewayProvider,
     model: String,
-    repository: Arc<Repository>,
+    _repository: Arc<Repository>,
 ) -> Response {
     let mut choices = Vec::new();
     let mut prompt_tokens = 0_i64;
     let mut completion_tokens = 0_i64;
     let mut total_tokens = 0_i64;
-    let mut estimated_tokens = 0_i64;
     let created = timestamp_ms() / 1000;
 
     for (index, response) in responses.into_iter().enumerate() {
@@ -3292,7 +4611,6 @@ async fn adapt_provider_chat_fanout_response(
                     .into_response()
             }
         };
-        estimated_tokens += provider_usage_tokens(&provider, &value);
         let chat = provider_value_to_chat(&provider, &value, &model);
         if let Some(usage) = chat.get("usage") {
             prompt_tokens += usage
@@ -3326,7 +4644,6 @@ async fn adapt_provider_chat_fanout_response(
         choices.push(choice);
     }
 
-    let _ = repository.add_estimated_tokens(estimated_tokens);
     Json(json!({
         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         "object": "chat.completion",
@@ -3371,62 +4688,65 @@ fn adapt_provider_chat_fanout_stream(
             )
         })
         .collect::<Vec<_>>();
-    let stream = merged.scan(
-        (states, vec![false; choice_count], 0_usize, false),
-        move |(states, done, done_count, terminated), (index, chunk)| {
-            let repository = repository.clone();
-            let provider = provider.clone();
-            let result = if *terminated {
-                None
-            } else {
-                match chunk {
-                    Ok(bytes) => {
-                        let Some((buffer, state)) = states.get_mut(index) else {
-                            return futures_util::future::ready(None);
-                        };
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        let events = if provider == GatewayProvider::Ollama {
-                            drain_json_lines(buffer)
-                        } else {
-                            drain_sse_events(buffer)
-                        };
-                        let mut output = String::new();
-                        for event in events {
-                            let (translated, tokens) = if provider == GatewayProvider::Ollama {
-                                translate_ollama_event(state, event)
-                            } else {
-                                state.translate(event)
+    let stream = merged
+        .map(Some)
+        .chain(futures_util::stream::once(async { None }))
+        .scan(
+            (states, vec![false; choice_count], 0_usize, false),
+            move |(states, done, done_count, terminated), item| {
+                let repository = repository.clone();
+                let provider = provider.clone();
+                let result = if *terminated {
+                    None
+                } else {
+                    match item {
+                        Some((index, Ok(bytes))) => {
+                            let Some((buffer, state)) = states.get_mut(index) else {
+                                return futures_util::future::ready(None);
                             };
-                            if tokens > 0 {
-                                let _ = repository.add_estimated_tokens(tokens);
+                            buffer.push_str(&String::from_utf8_lossy(&bytes));
+                            let events = if provider == GatewayProvider::Ollama {
+                                drain_json_lines(buffer)
+                            } else {
+                                drain_sse_events(buffer)
+                            };
+                            let mut output = String::new();
+                            for event in events {
+                                let (translated, _tokens) = if provider == GatewayProvider::Ollama {
+                                    translate_ollama_event(state, event)
+                                } else {
+                                    state.translate(event)
+                                };
+                                output.push_str(&translated);
+                                if state.done && !done[index] {
+                                    done[index] = true;
+                                    *done_count += 1;
+                                }
                             }
-                            output.push_str(&translated);
-                            if state.done && !done[index] {
-                                done[index] = true;
-                                *done_count += 1;
+                            if *done_count == done.len() {
+                                output.push_str("data: [DONE]\n\n");
+                                *terminated = true;
                             }
+                            Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
                         }
-                        if *done_count == done.len() {
-                            output.push_str("data: [DONE]\n\n");
+                        Some((_, Err(_))) | None => {
+                            if *done_count == done.len() {
+                                return futures_util::future::ready(None);
+                            }
+                            record_gateway_upstream_error(
+                                &repository,
+                                GATEWAY_ERROR_STREAM_INTERRUPTED,
+                            );
                             *terminated = true;
+                            Some(Ok(Bytes::from(sse_upstream_error_event(Some(
+                                GatewayRequestKind::ChatCompletions,
+                            )))))
                         }
-                        Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
                     }
-                    Err(_) => {
-                        record_gateway_upstream_error(
-                            &repository,
-                            GATEWAY_ERROR_STREAM_INTERRUPTED,
-                        );
-                        *terminated = true;
-                        Some(Ok(Bytes::from(sse_upstream_error_event(Some(
-                            GatewayRequestKind::ChatCompletions,
-                        )))))
-                    }
-                }
-            };
-            futures_util::future::ready(result)
-        },
-    );
+                };
+                futures_util::future::ready(result)
+            },
+        );
     sse_response(Body::from_stream(stream))
 }
 
@@ -3464,8 +4784,6 @@ async fn adapt_provider_response(
                 .into_response()
         }
     };
-    let tokens = provider_usage_tokens(&provider, &value);
-    let _ = repository.add_estimated_tokens(tokens);
     let output = match kind {
         GatewayRequestKind::Responses => provider_value_to_response(&provider, &value, &model),
         GatewayRequestKind::ChatCompletions => provider_value_to_chat(&provider, &value, &model),
@@ -3660,6 +4978,7 @@ fn responses_usage_from_ollama(value: &Value) -> Value {
     json!({"input_tokens": input, "output_tokens": output, "total_tokens": input + output})
 }
 
+#[cfg(test)]
 fn provider_usage_tokens(provider: &GatewayProvider, value: &Value) -> i64 {
     match provider {
         GatewayProvider::Anthropic => value
@@ -3694,35 +5013,43 @@ fn provider_usage_tokens(provider: &GatewayProvider, value: &Value) -> i64 {
     }
 }
 
-fn usage_tokens_from_response_event(event: &Value) -> i64 {
+fn usage_breakdown_from_event(event: &Value) -> (i64, i64, i64) {
     event
         .get("response")
         .and_then(|response| response.get("usage"))
-        .map(usage_tokens_from_value)
-        .or_else(|| event.get("usage").map(usage_tokens_from_value))
+        .or_else(|| event.get("usage"))
+        .map(usage_breakdown)
         .unwrap_or_default()
 }
 
-fn usage_tokens_from_value(value: &Value) -> i64 {
+fn usage_breakdown(value: &Value) -> (i64, i64, i64) {
     let usage = value.get("usage").unwrap_or(value);
-    usage
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .or_else(|| usage.get("inputTokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+        .max(0);
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .or_else(|| usage.get("outputTokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+        .max(0);
+    let total = usage
         .get("total_tokens")
         .or_else(|| usage.get("totalTokens"))
         .and_then(Value::as_i64)
-        .or_else(|| {
-            let input = usage
-                .get("input_tokens")
-                .or_else(|| usage.get("prompt_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            let output = usage
-                .get("output_tokens")
-                .or_else(|| usage.get("completion_tokens"))
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            (input + output > 0).then_some(input + output)
-        })
-        .unwrap_or_default()
+        .unwrap_or_else(|| input.saturating_add(output))
+        .max(input.saturating_add(output));
+    (input, output, total)
+}
+
+#[cfg(test)]
+fn usage_tokens_from_value(value: &Value) -> i64 {
+    usage_breakdown(value).2
 }
 
 struct ProviderSseState {
@@ -4091,32 +5418,41 @@ fn adapt_provider_sse_stream(
     model: String,
     repository: Arc<Repository>,
 ) -> Response {
-    let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
-        (String::new(), ProviderSseState::new(provider, kind, model)),
-        move |(buffer, state), chunk| {
-            let repository = repository.clone();
-            let result = match chunk {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    let events = drain_sse_events(buffer);
-                    let mut output = String::new();
-                    for event in events {
-                        let (translated, tokens) = state.translate(event);
-                        if tokens > 0 {
-                            let _ = repository.add_estimated_tokens(tokens);
+    let stream = response
+        .bytes_stream()
+        .map_err(std::io::Error::other)
+        .map(Some)
+        .chain(futures_util::stream::once(async { None }))
+        .scan(
+            (String::new(), ProviderSseState::new(provider, kind, model)),
+            move |(buffer, state), chunk| {
+                let repository = repository.clone();
+                let result = match chunk {
+                    Some(Ok(bytes)) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let events = drain_sse_events(buffer);
+                        let mut output = String::new();
+                        for event in events {
+                            let (translated, _tokens) = state.translate(event);
+                            output.push_str(&translated);
                         }
-                        output.push_str(&translated);
+                        Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
                     }
-                    Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
-                }
-                Err(_) => {
-                    record_gateway_upstream_error(&repository, GATEWAY_ERROR_STREAM_INTERRUPTED);
-                    Some(Ok(Bytes::from(sse_upstream_error_event(Some(kind)))))
-                }
-            };
-            futures_util::future::ready(result)
-        },
-    );
+                    Some(Err(_)) | None => {
+                        if state.done {
+                            return futures_util::future::ready(None);
+                        }
+                        record_gateway_upstream_error(
+                            &repository,
+                            GATEWAY_ERROR_STREAM_INTERRUPTED,
+                        );
+                        state.done = true;
+                        Some(Ok(Bytes::from(sse_upstream_error_event(Some(kind)))))
+                    }
+                };
+                futures_util::future::ready(result)
+            },
+        );
     sse_response(Body::from_stream(stream))
 }
 
@@ -4140,35 +5476,44 @@ fn adapt_ollama_stream(
     model: String,
     repository: Arc<Repository>,
 ) -> Response {
-    let stream = response.bytes_stream().map_err(std::io::Error::other).scan(
-        (
-            String::new(),
-            ProviderSseState::new(GatewayProvider::Ollama, kind, model),
-        ),
-        move |(buffer, state), chunk| {
-            let repository = repository.clone();
-            let result = match chunk {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    let events = drain_json_lines(buffer);
-                    let mut output = String::new();
-                    for event in events {
-                        let (translated, tokens) = translate_ollama_event(state, event);
-                        if tokens > 0 {
-                            let _ = repository.add_estimated_tokens(tokens);
+    let stream = response
+        .bytes_stream()
+        .map_err(std::io::Error::other)
+        .map(Some)
+        .chain(futures_util::stream::once(async { None }))
+        .scan(
+            (
+                String::new(),
+                ProviderSseState::new(GatewayProvider::Ollama, kind, model),
+            ),
+            move |(buffer, state), chunk| {
+                let repository = repository.clone();
+                let result = match chunk {
+                    Some(Ok(bytes)) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        let events = drain_json_lines(buffer);
+                        let mut output = String::new();
+                        for event in events {
+                            let (translated, _tokens) = translate_ollama_event(state, event);
+                            output.push_str(&translated);
                         }
-                        output.push_str(&translated);
+                        Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
                     }
-                    Some(Ok::<Bytes, std::io::Error>(Bytes::from(output)))
-                }
-                Err(_) => {
-                    record_gateway_upstream_error(&repository, GATEWAY_ERROR_STREAM_INTERRUPTED);
-                    Some(Ok(Bytes::from(sse_upstream_error_event(Some(kind)))))
-                }
-            };
-            futures_util::future::ready(result)
-        },
-    );
+                    Some(Err(_)) | None => {
+                        if state.done {
+                            return futures_util::future::ready(None);
+                        }
+                        record_gateway_upstream_error(
+                            &repository,
+                            GATEWAY_ERROR_STREAM_INTERRUPTED,
+                        );
+                        state.done = true;
+                        Some(Ok(Bytes::from(sse_upstream_error_event(Some(kind)))))
+                    }
+                };
+                futures_util::future::ready(result)
+            },
+        );
     sse_response(Body::from_stream(stream))
 }
 
@@ -4185,24 +5530,28 @@ fn upstream_response(
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
     let stream = response.bytes_stream().map_err(std::io::Error::other);
     if is_sse {
-        let mut buffer = String::new();
-        let stream = stream.map(move |chunk| match chunk {
-            Ok(bytes) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                for event in drain_sse_events(&mut buffer) {
-                    let tokens = usage_tokens_from_response_event(&event)
-                        .max(usage_tokens_from_value(&event));
-                    if tokens > 0 {
-                        let _ = repository.add_estimated_tokens(tokens);
+        let stream = stream
+            .map(Some)
+            .chain(futures_util::stream::once(async { None }))
+            .scan(StreamTerminalState::default(), move |terminal, chunk| {
+                let output = match chunk {
+                    Some(Ok(bytes)) => {
+                        terminal.observe_sse(&bytes);
+                        Some(Ok::<Bytes, std::io::Error>(bytes))
                     }
-                }
-                Ok::<Bytes, std::io::Error>(bytes)
-            }
-            Err(_) => {
-                record_gateway_upstream_error(&repository, GATEWAY_ERROR_STREAM_INTERRUPTED);
-                Ok(Bytes::from(sse_upstream_error_event(kind)))
-            }
-        });
+                    Some(Err(_)) | None => {
+                        let interruption = terminal.interruption(kind);
+                        if interruption.is_some() {
+                            record_gateway_upstream_error(
+                                &repository,
+                                GATEWAY_ERROR_STREAM_INTERRUPTED,
+                            );
+                        }
+                        interruption.map(Ok)
+                    }
+                };
+                futures_util::future::ready(output)
+            });
         let mut output = Response::new(Body::from_stream(stream));
         *output.status_mut() = status;
         if let Some(content_type) = content_type {
@@ -4284,7 +5633,11 @@ fn rewrite_model_fields(value: &mut Value, visible_model: &str) {
 fn gateway_http_client(proxy: &GatewayUpstreamProxy) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
-        .connect_timeout(GATEWAY_CONNECT_TIMEOUT);
+        .connect_timeout(GATEWAY_CONNECT_TIMEOUT)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .pool_max_idle_per_host(16)
+        .tcp_keepalive_interval(Some(Duration::from_secs(20)));
     match proxy {
         GatewayUpstreamProxy::System => {}
         GatewayUpstreamProxy::Manual { url } => {
@@ -4425,7 +5778,7 @@ fn clear_gateway_upstream_error(repository: &Repository) {
 fn sse_upstream_error_event(kind: Option<GatewayRequestKind>) -> &'static str {
     match kind {
         Some(GatewayRequestKind::Responses) => {
-            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_gateway_error\",\"status\":\"failed\"},\"error\":{\"code\":\"upstream_stream_error\",\"message\":\"upstream stream interrupted\"}}\n\ndata: [DONE]\n\n"
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_gateway_error\",\"status\":\"failed\"},\"error\":{\"code\":\"upstream_stream_error\",\"message\":\"upstream stream interrupted\"}}\n\n"
         }
         _ => {
             "data: {\"error\":{\"code\":\"upstream_stream_error\",\"message\":\"upstream stream interrupted\"}}\n\ndata: [DONE]\n\n"
@@ -4462,14 +5815,41 @@ fn upstream_request(
     }
 }
 
-fn authorize(state: &GatewayApiState, peer: IpAddr, headers: &HeaderMap) -> bool {
-    if !state.cidrs.is_empty() && !state.cidrs.iter().any(|network| network.contains(&peer)) {
-        return false;
+fn upstream_request_bytes(
+    request: reqwest::RequestBuilder,
+    provider: &GatewayProvider,
+    key: &str,
+    payload: Bytes,
+) -> reqwest::RequestBuilder {
+    let request = request.header(header::CONTENT_TYPE, "application/json");
+    match provider {
+        GatewayProvider::Anthropic => request
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .body(payload),
+        GatewayProvider::Gemini => request.header("x-goog-api-key", key).body(payload),
+        _ => request.bearer_auth(key).body(payload),
     }
-    let value = headers
+}
+
+fn token_digest(value: &str) -> TokenDigest {
+    Sha256::digest(value.as_bytes()).into()
+}
+
+fn authorize(
+    state: &GatewayApiState,
+    peer: IpAddr,
+    headers: &HeaderMap,
+) -> Option<AuthorizedClient> {
+    let started = Instant::now();
+    if !state.cidrs.is_empty() && !state.cidrs.iter().any(|network| network.contains(&peer)) {
+        return None;
+    }
+    let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let value = bearer
         .or_else(|| {
             headers
                 .get("x-api-key")
@@ -4479,66 +5859,198 @@ fn authorize(state: &GatewayApiState, peer: IpAddr, headers: &HeaderMap) -> bool
             headers
                 .get("x-goog-api-key")
                 .and_then(|value| value.to_str().ok())
-        });
-    let Some(value) = value else {
-        return false;
-    };
-    let keys = match state.repository.valid_key_hashes() {
-        Ok(keys) => keys,
-        Err(_) => return false,
-    };
-    for (id, hash, _) in keys {
+        })?;
+    let digest = token_digest(value);
+
+    if bearer.is_some() {
+        state
+            .auth_cache
+            .refresh_oauth_if_due(&state.repository, &state.codex_home);
+        if state.auth_cache.oauth_matches(&digest) {
+            return Some(AuthorizedClient {
+                codex_managed: true,
+                auth_mode: "oauth",
+                auth_latency_ms: started.elapsed().as_millis() as i64,
+                request_started: started,
+            });
+        }
+    }
+    if let Some(mut cached) = state.auth_cache.cached_client(&digest) {
+        cached.auth_latency_ms = started.elapsed().as_millis() as i64;
+        cached.request_started = started;
+        return Some(cached);
+    }
+    if state.auth_cache.recently_rejected(&digest) {
+        return None;
+    }
+
+    let keys = state.repository.valid_key_hashes().ok()?;
+    let codex_key_ref = state
+        .repository
+        .setting(GATEWAY_CODEX_CLIENT_KEY_REF_SETTING)
+        .ok()
+        .flatten();
+    for (id, hash, secret_ref) in keys {
         if PasswordHash::new(&hash).ok().is_some_and(|parsed| {
+            #[cfg(test)]
+            ARGON2_VERIFY_CALLS.fetch_add(1, Ordering::Relaxed);
             Argon2::default()
                 .verify_password(value.as_bytes(), &parsed)
                 .is_ok()
         }) {
             let _ = state.repository.record_key_use(&id, timestamp_ms());
-            return true;
+            let client = AuthorizedClient {
+                codex_managed: codex_key_ref.as_deref() == Some(secret_ref.as_str()),
+                auth_mode: "client_key",
+                auth_latency_ms: started.elapsed().as_millis() as i64,
+                request_started: started,
+            };
+            state.auth_cache.cache_client(digest, client.clone());
+            return Some(client);
         }
     }
-    false
+    state.auth_cache.cache_rejected(digest);
+    None
+}
+
+fn direct_oauth_auth_snapshot(
+    repository: &Repository,
+    codex_home: &std::path::Path,
+) -> Option<DirectOAuthAuthSnapshot> {
+    let direct_profile_id = repository
+        .setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING)
+        .ok()
+        .flatten()?;
+    let direct_profile = repository.profile(&direct_profile_id).ok()?;
+    if direct_profile.profile.kind != ProfileKind::ApiKey
+        || !matches!(
+            direct_profile.profile.provider,
+            GatewayProvider::OpenAi | GatewayProvider::OpenAiCompatible
+        )
+        || direct_profile.profile.wire_api != GatewayWireApi::Responses
+        || !direct_profile.profile.enabled
+        || !direct_profile.profile.credential_configured
+        || direct_profile.secret_ref.is_none()
+        || direct_profile.profile.health != "healthy"
+        || direct_profile.profile.validation_status == "invalid"
+    {
+        return None;
+    }
+    let oauth_profile_id = direct_profile.profile.codex_oauth_profile_id.as_deref()?;
+    let oauth_profile = repository.profile(oauth_profile_id).ok()?;
+    if oauth_profile.profile.kind != ProfileKind::CodexOauth
+        || oauth_profile.profile.auth_mode != CodexAuthMode::OAuth
+        || oauth_profile.credential_fingerprint.is_some()
+        || !oauth_profile.profile.enabled
+        || !oauth_profile.profile.credential_configured
+        || oauth_profile.profile.health != "healthy"
+        || oauth_profile.profile.validation_status == "invalid"
+    {
+        return None;
+    }
+    let expected_account_id = oauth_profile
+        .profile
+        .account
+        .as_ref()
+        .and_then(|account| account.account_id.as_deref())?;
+    let auth_json = std::fs::read_to_string(codex_home.join("auth.json")).ok()?;
+    let auth = serde_json::from_str::<Value>(&auth_json).ok()?;
+    let tokens = auth.get("tokens")?;
+    let access_token = tokens.get("access_token").and_then(Value::as_str)?;
+    let account_id = tokens.get("account_id").and_then(Value::as_str)?;
+    if account_id != expected_account_id {
+        return None;
+    }
+    Some(DirectOAuthAuthSnapshot {
+        access_token_digest: token_digest(access_token),
+    })
+}
+
+fn direct_profile_for_codex_client(
+    state: &GatewayApiState,
+    client: &AuthorizedClient,
+    model: Option<&str>,
+) -> AppResult<Option<StoredProfile>> {
+    if !client.codex_managed {
+        return Ok(None);
+    }
+    let Some(profile_id) = state
+        .repository
+        .setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING)?
+    else {
+        return Ok(None);
+    };
+    let stored = state.repository.profile(&profile_id)?;
+    let profile = &stored.profile;
+    let now = timestamp_ms();
+    if profile.kind != ProfileKind::ApiKey
+        || !profile.enabled
+        || !profile.credential_configured
+        || profile.health != "healthy"
+        || profile.cooldown_until_ms.is_some_and(|until| until > now)
+    {
+        return Err(AppError::UpstreamUnavailable);
+    }
+    if model.is_some_and(|model| !profile.models.iter().any(|candidate| candidate == model)) {
+        return Err(AppError::GatewayModelUnavailable);
+    }
+    Ok(Some(stored))
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         collections::HashMap,
+        net::SocketAddr,
+        path::PathBuf,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
-        time::Duration,
+        time::{Duration, Instant},
+    };
+
+    use url::Url;
+
+    use argon2::{
+        password_hash::{rand_core::OsRng, SaltString},
+        Argon2, PasswordHasher,
     };
 
     use axum::{
         body::{to_bytes, Body, Bytes},
         extract::State,
-        http::{header, HeaderMap, HeaderValue},
+        http::{header, HeaderMap, HeaderValue, StatusCode},
         response::Response,
         routing::post,
         Json, Router,
     };
+    use futures_util::future::join_all;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        adapt_provider_chat_fanout_response, anthropic_chat_payload, build_upstream_url,
-        chat_choice_count, chat_to_responses, completed_response, gateway_http_client,
-        gemini_chat_payload, mask_proxy_url, model_discovery_route,
-        model_ids_from_provider_response, ollama_chat_payload_from_openai, payload_with_model,
-        provider_usage_tokens, provider_value_to_chat, provider_value_to_response,
-        response_to_chat_completion, responses_to_chat_completion, rewrite_model_fields,
-        send_oauth_request, send_with_first_response_timeout_after, test_api_service,
-        translate_ollama_event, upstream_model_for, upstream_response, validate_binding,
-        validate_manual_proxy_url, visible_model_for, GatewayRequestKind, GatewayUpstreamProxy,
-        ProviderSseState, WeightedScheduler,
+        adapt_provider_chat_fanout_response, anthropic_chat_payload, authorize, build_upstream_url,
+        chat_choice_count, chat_to_responses, completed_response, direct_profile_for_codex_client,
+        forward, gateway_http_client, gateway_router, gemini_chat_payload, mask_proxy_url,
+        model_discovery_route, model_ids_from_provider_response, ollama_chat_payload_from_openai,
+        payload_with_model, provider_usage_tokens, provider_value_to_chat,
+        provider_value_to_response, response_to_chat_completion, responses_to_chat_completion,
+        rewrite_model_fields, send_oauth_request, send_with_first_response_timeout_after,
+        test_api_service, translate_ollama_event, upstream_model_for, upstream_response,
+        validate_binding, validate_manual_proxy_url, visible_model_for, AuthorizedClient,
+        GatewayApiState, GatewayRequestKind, GatewayUpstreamProxy, ProviderSseState,
+        WeightedScheduler, CODEX_RESPONSES_URL, GATEWAY_JSON_BODY_LIMIT_BYTES,
     };
     use crate::error::AppError;
     use crate::{
         database::{Repository, StoredProfile},
         domain::{
-            GatewayModelMapping, GatewayProvider, GatewayWireApi, MaskedProfile, ProfileKind,
+            GatewayModelMapping, GatewayProvider, GatewayWireApi, MaskedClientKey, MaskedProfile,
+            ProfileKind, GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
         },
-        profiles::CodexOAuthCredential,
+        oauth_credentials::OAuthCredentialStore,
+        profiles::{save_oauth_credential_metadata, CodexOAuthCredential},
+        secrets::{MemorySecretStore, SecretStore},
     };
 
     fn candidate(id: &str, weight: i64) -> StoredProfile {
@@ -4560,12 +6072,585 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
             secret_ref: Some(format!("profile:{id}:oauth")),
             credential_fingerprint: None,
         }
+    }
+
+    fn direct_oauth_gateway_state(
+        repository: Arc<Repository>,
+        secrets: Arc<MemorySecretStore>,
+        codex_home: PathBuf,
+    ) -> GatewayApiState {
+        GatewayApiState {
+            repository,
+            secrets: secrets.clone(),
+            oauth_credentials: Arc::new(OAuthCredentialStore::new(secrets)),
+            cidrs: Vec::new(),
+            oauth_responses_url: Url::parse(CODEX_RESPONSES_URL).unwrap(),
+            http_client: gateway_http_client(&GatewayUpstreamProxy::Disabled).unwrap(),
+            auth_cache: Arc::new(super::GatewayAuthCache::new()),
+            concurrency: super::ProfileConcurrencyManager::new(),
+            telemetry: super::GatewayTelemetry::new(),
+            certificate_ready: true,
+            codex_home,
+            scheduler: Arc::new(Mutex::new(WeightedScheduler::default())),
+            affinities: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn install_direct_oauth_profiles(
+        repository: &Repository,
+        secrets: &MemorySecretStore,
+        base_url: &str,
+    ) {
+        let mut direct = candidate("direct-api", 1);
+        direct.profile.kind = ProfileKind::ApiKey;
+        direct.profile.provider = GatewayProvider::OpenAiCompatible;
+        direct.profile.base_url = Some(base_url.to_owned());
+        direct.profile.models = vec!["direct-model".to_owned()];
+        direct.profile.codex_oauth_profile_id = Some("oauth-login".to_owned());
+        direct.secret_ref = Some("profile:direct-api:credential".to_owned());
+        repository.insert_profile(&direct).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "direct-api")
+            .unwrap();
+
+        let oauth = candidate("oauth-login", 1);
+        repository.insert_profile(&oauth).unwrap();
+        save_oauth_credential_metadata(
+            repository,
+            "oauth-login",
+            &CodexOAuthCredential {
+                id_token: "id-token".to_owned(),
+                access_token: "oauth-sentinel".to_owned(),
+                refresh_token: Some("refresh-token".to_owned()),
+                account_id: Some("account-a".to_owned()),
+                last_refresh_ms: 1,
+            },
+        )
+        .unwrap();
+        secrets
+            .set("profile:direct-api:credential", "zeron-key-sentinel")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_oauth_authorization_requires_projected_token_and_bound_account() {
+        let _counter_guard = super::AUTH_COUNTER_TEST_LOCK.lock().await;
+        let repository = Arc::new(Repository::memory());
+        let secrets = Arc::new(MemorySecretStore::new());
+        install_direct_oauth_profiles(&repository, &secrets, "https://api.example.com/v1").await;
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-relay-oauth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"oauth-sentinel","account_id":"account-a"}}"#,
+        )
+        .unwrap();
+        let state = direct_oauth_gateway_state(repository.clone(), secrets, codex_home.clone());
+        let peer = "127.0.0.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer oauth-sentinel"),
+        );
+
+        super::ARGON2_VERIFY_CALLS.store(0, Ordering::Relaxed);
+        let authorized = authorize(&state, peer, &headers).unwrap();
+        assert!(authorized.codex_managed);
+        assert_eq!(super::ARGON2_VERIFY_CALLS.load(Ordering::Relaxed), 0);
+
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer another-token"),
+        );
+        assert!(authorize(&state, peer, &headers).is_none());
+
+        headers.remove(header::AUTHORIZATION);
+        headers.insert("x-api-key", HeaderValue::from_static("oauth-sentinel"));
+        assert!(authorize(&state, peer, &headers).is_none());
+        headers.remove("x-api-key");
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer oauth-sentinel"),
+        );
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"oauth-sentinel","account_id":"account-b"}}"#,
+        )
+        .unwrap();
+        state.auth_cache.refresh_oauth(&repository, &codex_home);
+        assert!(authorize(&state, peer, &headers).is_none());
+
+        let mut oauth = repository.profile("oauth-login").unwrap();
+        oauth.profile.enabled = false;
+        repository.update_profile(&oauth).unwrap();
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"oauth-sentinel","account_id":"account-a"}}"#,
+        )
+        .unwrap();
+        state.auth_cache.refresh_oauth(&repository, &codex_home);
+        assert!(authorize(&state, peer, &headers).is_none());
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_is_rejected_before_large_request_body_is_read() {
+        let repository = Arc::new(Repository::memory());
+        let secrets = Arc::new(MemorySecretStore::new());
+        let state = direct_oauth_gateway_state(repository, secrets, std::env::temp_dir());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                gateway_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer invalid\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            6 * 1024 * 1024
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+            .await
+            .expect("401 must be returned without waiting for the declared request body")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(!response.contains("413 Payload Too Large"));
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_models_fast_path_avoids_argon2_and_stays_below_local_p95_budget() {
+        let _counter_guard = super::AUTH_COUNTER_TEST_LOCK.lock().await;
+        let repository = Arc::new(Repository::memory());
+        let secrets = Arc::new(MemorySecretStore::new());
+        install_direct_oauth_profiles(&repository, &secrets, "https://api.example.com/v1").await;
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-relay-models-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"oauth-sentinel","account_id":"account-a"}}"#,
+        )
+        .unwrap();
+        let state = direct_oauth_gateway_state(repository, secrets, codex_home.clone());
+        state
+            .auth_cache
+            .refresh_oauth(&state.repository, &codex_home);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                gateway_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        super::ARGON2_VERIFY_CALLS.store(0, Ordering::Relaxed);
+        let mut benchmark = Vec::new();
+        for (concurrency, total) in [(1_usize, 20_usize), (4, 24), (8, 32)] {
+            let mut latencies = Vec::with_capacity(total);
+            while latencies.len() < total {
+                let batch_size = concurrency.min(total - latencies.len());
+                let requests = (0..batch_size).map(|_| {
+                    let client = client.clone();
+                    async move {
+                        let started = Instant::now();
+                        let response = client
+                            .get(format!("http://{address}/v1/models"))
+                            .bearer_auth("oauth-sentinel")
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        started.elapsed().as_micros() as i64
+                    }
+                });
+                latencies.extend(join_all(requests).await);
+            }
+            latencies.sort_unstable();
+            let p50_us = latencies[(latencies.len() - 1) * 50 / 100];
+            let p95_us = latencies[(latencies.len() - 1) * 95 / 100];
+            let p99_us = latencies[(latencies.len() - 1) * 99 / 100];
+            benchmark.push((concurrency, p50_us, p95_us, p99_us));
+        }
+
+        assert_eq!(super::ARGON2_VERIFY_CALLS.load(Ordering::Relaxed), 0);
+        for (concurrency, p50_us, p95_us, p99_us) in benchmark {
+            println!(
+                "oauth_models c{concurrency} p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+                p50_us as f64 / 1_000.0,
+                p95_us as f64 / 1_000.0,
+                p99_us as f64 / 1_000.0,
+            );
+            assert!(
+                p95_us < 200_000,
+                "local OAuth /v1/models c{concurrency} p95 was {p95_us} us"
+            );
+        }
+        relay.abort();
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[tokio::test]
+    async fn client_key_argon2_verification_is_cached_after_first_success() {
+        let _counter_guard = super::AUTH_COUNTER_TEST_LOCK.lock().await;
+        let repository = Arc::new(Repository::memory());
+        let secrets = Arc::new(MemorySecretStore::new());
+        let plaintext = "relay_test_client_key";
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::default()
+            .hash_password(plaintext.as_bytes(), &salt)
+            .unwrap()
+            .to_string();
+        repository
+            .insert_client_key(
+                &MaskedClientKey {
+                    id: "key-a".to_owned(),
+                    name: "测试 Key".to_owned(),
+                    masked_value: "relay_****_key".to_owned(),
+                    created_at_ms: 1,
+                    last_used_at_ms: None,
+                    revoked: false,
+                    managed_by: "user".to_owned(),
+                    can_revoke: true,
+                },
+                &hash,
+                "client-key:key-a",
+            )
+            .unwrap();
+        let state = direct_oauth_gateway_state(repository, secrets, std::env::temp_dir());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static(plaintext));
+        let peer = "127.0.0.1".parse().unwrap();
+
+        super::ARGON2_VERIFY_CALLS.store(0, Ordering::Relaxed);
+        assert!(authorize(&state, peer, &headers).is_some());
+        assert_eq!(super::ARGON2_VERIFY_CALLS.load(Ordering::Relaxed), 1);
+        assert!(authorize(&state, peer, &headers).is_some());
+        assert_eq!(super::ARGON2_VERIFY_CALLS.load(Ordering::Relaxed), 1);
+
+        state.auth_cache.invalidate_client_keys();
+        assert!(authorize(&state, peer, &headers).is_some());
+        assert_eq!(super::ARGON2_VERIFY_CALLS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn responses_stream_terminal_state_emits_exactly_one_failure_without_done() {
+        let mut incomplete = super::StreamTerminalState::default();
+        let failure = incomplete
+            .interruption(Some(GatewayRequestKind::Responses))
+            .unwrap();
+        let failure = String::from_utf8_lossy(&failure);
+        assert!(failure.contains("response.failed"));
+        assert!(!failure.contains("[DONE]"));
+        assert!(incomplete
+            .interruption(Some(GatewayRequestKind::Responses))
+            .is_none());
+
+        let mut completed = super::StreamTerminalState::default();
+        completed.observe_sse(&Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+        ));
+        assert!(completed
+            .interruption(Some(GatewayRequestKind::Responses))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn profile_concurrency_gate_caps_active_and_rejects_queue_overflow() {
+        let manager = super::ProfileConcurrencyManager::new();
+        let mut profile = candidate("limited", 1).profile;
+        profile.max_concurrency = 4;
+        profile.max_queue_depth = 8;
+        profile.queue_timeout_ms = 2_000;
+        let mut active = Vec::new();
+        for _ in 0..4 {
+            active.push(manager.acquire(&profile).await.unwrap().0);
+        }
+        let mut queued = Vec::new();
+        for _ in 0..8 {
+            let manager = manager.clone();
+            let profile = profile.clone();
+            queued.push(tokio::spawn(async move { manager.acquire(&profile).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(manager.counts(), (4, 8));
+        assert!(matches!(
+            manager.acquire(&profile).await,
+            Err(super::ProfileAcquireError::QueueFull)
+        ));
+        let cancelled = queued.remove(0);
+        cancelled.abort();
+        let _ = cancelled.await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(manager.counts(), (4, 7));
+        drop(active);
+        for task in queued {
+            let (permit, _) = task.await.unwrap().unwrap();
+            drop(permit);
+        }
+        assert_eq!(manager.counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn direct_oauth_request_is_forwarded_with_third_party_api_key() {
+        async fn echo(
+            headers: HeaderMap,
+            Json(payload): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "id": "resp-direct",
+                "object": "response",
+                "status": "completed",
+                "model": payload.get("model").cloned().unwrap_or_default(),
+                "authorization": headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
+                "output": []
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/responses", post(echo)))
+                .await
+                .unwrap();
+        });
+
+        let repository = Arc::new(Repository::memory());
+        let secrets = Arc::new(MemorySecretStore::new());
+        install_direct_oauth_profiles(&repository, &secrets, &format!("http://{address}/v1")).await;
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-relay-forward-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"oauth-sentinel","account_id":"account-a"}}"#,
+        )
+        .unwrap();
+        let state = direct_oauth_gateway_state(repository, secrets, codex_home.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer oauth-sentinel"),
+        );
+
+        let authorized_client = authorize(&state, "127.0.0.1".parse().unwrap(), &headers).unwrap();
+        let payload = serde_json::json!({
+            "model": "direct-model",
+            "input": "hello",
+            "stream": false
+        });
+        let request_bytes = serde_json::to_vec(&payload).unwrap().len() as i64;
+        let response = forward(
+            state,
+            authorized_client,
+            payload,
+            request_bytes,
+            "responses",
+            GatewayProvider::OpenAiCompatible,
+            Some(GatewayRequestKind::Responses),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["authorization"], "Bearer zeron-key-sentinel");
+        assert!(!body.to_string().contains("oauth-sentinel"));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[tokio::test]
+    async fn gateway_accepts_codex_json_payloads_larger_than_axum_default() {
+        async fn echo(Json(payload): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let content = payload
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|input| input.first())
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_array);
+            let image_count = content
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("input_image")
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            let image_url_bytes = content
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|item| {
+                            item.get("image_url").and_then(serde_json::Value::as_str)
+                        })
+                        .map(str::len)
+                        .sum::<usize>()
+                })
+                .unwrap_or_default();
+            Json(serde_json::json!({
+                "id": "resp-large",
+                "object": "response",
+                "status": "completed",
+                "model": payload.get("model").cloned().unwrap_or_default(),
+                "image_count": image_count,
+                "image_url_bytes": image_url_bytes,
+                "output": []
+            }))
+        }
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let app = Router::new().route("/v1/responses", post(echo)).layer(
+                axum::extract::DefaultBodyLimit::max(GATEWAY_JSON_BODY_LIMIT_BYTES),
+            );
+            axum::serve(upstream_listener, app).await.unwrap();
+        });
+
+        let repository = Arc::new(Repository::memory());
+        let secrets = Arc::new(MemorySecretStore::new());
+        install_direct_oauth_profiles(
+            &repository,
+            &secrets,
+            &format!("http://{upstream_address}/v1"),
+        )
+        .await;
+        let codex_home =
+            std::env::temp_dir().join(format!("codex-relay-large-body-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"oauth-sentinel","account_id":"account-a"}}"#,
+        )
+        .unwrap();
+        let state = direct_oauth_gateway_state(repository, secrets, codex_home.clone());
+
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            axum::serve(
+                relay_listener,
+                gateway_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let image_url = format!("data:image/png;base64,{}", "A".repeat(896 * 1024));
+        let content = (0..6)
+            .map(|_| {
+                serde_json::json!({
+                    "type": "input_image",
+                    "detail": "high",
+                    "image_url": image_url
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "model": "direct-model",
+            "input": [{
+                "role": "user",
+                "content": content
+            }],
+            "stream": false
+        });
+        let serialized_bytes = serde_json::to_vec(&payload).unwrap().len();
+        assert!(serialized_bytes > 5 * 1024 * 1024);
+        assert!(serialized_bytes < GATEWAY_JSON_BODY_LIMIT_BYTES);
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{relay_address}/v1/responses"))
+            .bearer_auth("oauth-sentinel")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["image_count"], 6);
+        assert!(body["image_url_bytes"].as_u64().unwrap() > 5 * 1024 * 1024);
+
+        relay.abort();
+        upstream.abort();
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn codex_managed_client_uses_direct_profile_without_affecting_user_keys() {
+        let repository = Arc::new(Repository::memory());
+        let mut direct = candidate("direct-api", 1);
+        direct.profile.kind = ProfileKind::ApiKey;
+        direct.profile.provider = GatewayProvider::OpenAiCompatible;
+        direct.profile.models = vec!["direct-model".to_owned()];
+        direct.secret_ref = Some("profile:direct-api:credential".to_owned());
+        repository.insert_profile(&direct).unwrap();
+        let mut pooled = candidate("pooled-api", 1);
+        pooled.profile.kind = ProfileKind::ApiKey;
+        pooled.profile.provider = GatewayProvider::OpenAiCompatible;
+        pooled.profile.models = vec!["pool-model".to_owned()];
+        pooled.secret_ref = Some("profile:pooled-api:credential".to_owned());
+        repository.insert_profile(&pooled).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "direct-api")
+            .unwrap();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let state = direct_oauth_gateway_state(repository.clone(), secrets, std::env::temp_dir());
+        let codex_client = AuthorizedClient {
+            codex_managed: true,
+            auth_mode: "client_key",
+            auth_latency_ms: 0,
+            request_started: Instant::now(),
+        };
+        let user_client = AuthorizedClient {
+            codex_managed: false,
+            auth_mode: "client_key",
+            auth_latency_ms: 0,
+            request_started: Instant::now(),
+        };
+
+        let selected = direct_profile_for_codex_client(&state, &codex_client, Some("direct-model"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.profile.id, "direct-api");
+        assert!(matches!(
+            direct_profile_for_codex_client(&state, &codex_client, Some("pool-model")),
+            Err(AppError::GatewayModelUnavailable)
+        ));
+        assert!(
+            direct_profile_for_codex_client(&state, &user_client, Some("pool-model"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4768,7 +6853,8 @@ mod tests {
         assert_eq!(value["choices"][0]["index"], 0);
         assert_eq!(value["choices"][1]["index"], 1);
         assert_eq!(value["usage"]["total_tokens"], 10);
-        assert_eq!(repository.metrics().unwrap().estimated_tokens, 10);
+        // The outer request instrumentation owns aggregate accounting exactly once.
+        assert_eq!(repository.metrics().unwrap().estimated_tokens, 0);
     }
 
     #[test]
@@ -4861,8 +6947,15 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
             secret_ref: None,
             credential_fingerprint: None,
@@ -5238,7 +7331,7 @@ mod tests {
 
         assert!(text.contains("event: response.failed"));
         assert!(text.contains("\"code\":\"upstream_stream_error\""));
-        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("data: [DONE]"));
         assert_eq!(
             repository
                 .setting(super::GATEWAY_LAST_ERROR_SETTING)

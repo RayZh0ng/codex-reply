@@ -2,7 +2,23 @@ import * as RadixSelect from "@radix-ui/react-select";
 import { CaretDown } from "@phosphor-icons/react/CaretDown";
 import { CaretUp } from "@phosphor-icons/react/CaretUp";
 import { Check } from "@phosphor-icons/react/Check";
-import type { ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
+
+const SelectPortalContainerContext = createContext<HTMLElement | null>(null);
+
+export function SelectPortalContainerProvider({
+  children,
+  container,
+}: {
+  children: ReactNode;
+  container: HTMLElement | null;
+}) {
+  return (
+    <SelectPortalContainerContext.Provider value={container}>
+      {children}
+    </SelectPortalContainerContext.Provider>
+  );
+}
 
 export interface SelectOption {
   value: string;
@@ -22,6 +38,7 @@ export interface SelectProps {
   onValueChange: (value: string) => void;
   options: SelectOption[];
   placeholder?: string;
+  portalContainer?: HTMLElement | null;
   size?: "sm" | "md";
   value: string;
 }
@@ -36,9 +53,11 @@ export function Select({
   onValueChange,
   options,
   placeholder = "请选择",
+  portalContainer,
   size = "md",
   value,
 }: SelectProps) {
+  const dialogPortalContainer = useContext(SelectPortalContainerContext);
   const current = options.find((option) => option.value === value);
   return (
     <RadixSelect.Root disabled={disabled} onValueChange={onValueChange} value={value}>
@@ -56,7 +75,11 @@ export function Select({
           <CaretDown size={18} weight="bold" />
         </RadixSelect.Icon>
       </RadixSelect.Trigger>
-      <RadixSelect.Portal>
+      <RadixSelect.Portal
+        container={
+          portalContainer === undefined ? dialogPortalContainer : portalContainer
+        }
+      >
         <RadixSelect.Content
           className="select-content"
           collisionPadding={12}

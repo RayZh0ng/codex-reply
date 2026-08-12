@@ -5,14 +5,22 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type {
+  DashboardSnapshot,
+  GatewayCodexConfigStatus,
+  MaskedProfile,
+} from "../shared/ipc";
 import App from "./App";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
+const events = vi.hoisted(() => ({ listen: vi.fn() }));
 
 vi.mock("@tauri-apps/api/core", () => native);
+vi.mock("@tauri-apps/api/event", () => events);
 
 class ResizeObserver {
   observe() {}
@@ -22,8 +30,21 @@ class ResizeObserver {
 
 vi.stubGlobal("ResizeObserver", ResizeObserver);
 
-const snapshot = {
-  workspace_mode: "per_profile" as const,
+let eventHandlers: Record<string, (event: { payload: unknown }) => void> = {};
+
+beforeEach(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+  eventHandlers = {};
+  events.listen.mockImplementation(
+    (event: string, handler: (event: { payload: unknown }) => void) => {
+      eventHandlers[event] = handler;
+      return Promise.resolve(vi.fn());
+    },
+  );
+});
+
+const snapshot: DashboardSnapshot = {
+  workspace_mode: "shared" as const,
   collaboration: {
     enabled_bots: 0,
     bound_chats: 0,
@@ -63,10 +84,14 @@ const snapshot = {
       priority: 0,
       weight: 1,
       models: [],
+      codex_oauth_profile_id: null,
       health: "unknown",
       cooldown_until_ms: null,
       credential_configured: true,
       is_current: true,
+      validation_status: "unknown",
+      validated_at_ms: null,
+      validation_message: null,
     },
     {
       id: "next",
@@ -78,10 +103,14 @@ const snapshot = {
       priority: 0,
       weight: 1,
       models: [],
+      codex_oauth_profile_id: null,
       health: "unknown",
       cooldown_until_ms: null,
       credential_configured: true,
       is_current: false,
+      validation_status: "unknown",
+      validated_at_ms: null,
+      validation_message: null,
     },
   ],
 };
@@ -91,6 +120,7 @@ afterEach(() => {
   window.localStorage.clear();
   vi.useRealTimers();
   native.invoke.mockReset();
+  events.listen.mockReset();
   vi.restoreAllMocks();
   delete (window as typeof window & { __TAURI_INTERNALS__?: unknown })
     .__TAURI_INTERNALS__;
@@ -184,6 +214,72 @@ describe("App", () => {
         input: { channel: "beta" },
       }),
     );
+  });
+
+  it("shows updater progress events in the global dialog and settings page", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    native.invoke.mockImplementation((command: string) => {
+      if (command === "dashboard_snapshot") return Promise.resolve(snapshot);
+      if (command === "managed_task_status")
+        return Promise.resolve(idleTaskStatusForTest());
+      if (command === "app_update_settings")
+        return Promise.resolve({ channel: "beta", auto_check: false });
+      if (command === "list_desktop_workspaces") return Promise.resolve([]);
+      if (command === "codex_environment_status")
+        return Promise.resolve(emptyCodexEnvironmentForTest());
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "任务工作台" });
+
+    act(() => {
+      emitTauriEvent("app-update-progress", {
+        phase: "downloading",
+        channel: "beta",
+        version: "0.2.0-beta.2",
+        current_version: "0.2.0-beta.1",
+        downloaded_bytes: 2048,
+        content_length: 5120,
+        progress_percent: 40,
+        message: "正在下载更新。",
+        updated_at_ms: 1_700_000_000_000,
+      });
+    });
+
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "正在更新到 Codex Relay 0.2.0-beta.2",
+    );
+    expect(screen.getByRole("dialog")).toHaveTextContent("40%");
+    expect(screen.getByRole("dialog")).toHaveAttribute("aria-busy", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(
+      await screen.findByRole("heading", { name: "软件更新" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("40%").length).toBeGreaterThanOrEqual(2);
+
+    act(() => {
+      emitTauriEvent("app-update-progress", {
+        phase: "failed",
+        channel: "beta",
+        version: "0.2.0-beta.2",
+        current_version: "0.2.0-beta.1",
+        downloaded_bytes: 2048,
+        content_length: 5120,
+        progress_percent: 40,
+        message: "更新下载或安装失败，请稍后重试。",
+        updated_at_ms: 1_700_000_001_000,
+      });
+    });
+
+    expect(screen.getByRole("dialog")).toHaveTextContent("更新下载或安装失败");
+    expect(screen.getByRole("dialog")).not.toHaveAttribute("aria-busy");
+    expect(screen.getByRole("button", { name: "关闭" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "立即检查更新" })).toBeEnabled();
   });
 
   it("refreshes app and collaboration state after collaboration operations", async () => {
@@ -334,7 +430,7 @@ describe("App", () => {
     });
 
     const { container } = render(<App />);
-    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+    await screen.findByRole("heading", { name: "任务工作台" });
 
     expect(native.invoke).not.toHaveBeenCalledWith(
       "list_collaboration_bots",
@@ -367,7 +463,7 @@ describe("App", () => {
       return Promise.reject(new Error(`unexpected command: ${command}`));
     });
     const { container } = render(<App />);
-    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+    await screen.findByRole("heading", { name: "任务工作台" });
 
     fireEvent.click(screen.getByRole("button", { name: "收起侧边栏" }));
     expect(container.querySelector(".app-shell")).toHaveClass("is-sidebar-collapsed");
@@ -403,7 +499,7 @@ describe("App", () => {
       return Promise.reject(new Error(`unexpected command: ${command}`));
     });
     const { container } = render(<App />);
-    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+    await screen.findByRole("heading", { name: "任务工作台" });
 
     expect(container.querySelectorAll(".nav-icon").length).toBeGreaterThan(0);
 
@@ -440,7 +536,7 @@ describe("App", () => {
             profile_id: "next",
             attempt_id: "switch-1",
             status: "switching",
-            message: "正在写入已保存的 Codex 凭据，并启动档案独立工作区。",
+            message: "正在写入已保存的 Codex 凭据，并复用原 Codex 客户端状态。",
           });
         }
         if (command === "current_profile_activation_status") {
@@ -448,8 +544,7 @@ describe("App", () => {
             profile_id: "next",
             attempt_id: "switch-1",
             status: "activated",
-            message:
-              "Codex 凭据已切换，档案独立工作区的 ChatGPT/Codex 桌面实例已启动。",
+            message: "Codex 凭据已切换，并已复用原 Codex 客户端状态。",
           });
         }
         return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -462,14 +557,18 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
 
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent(
-        "Codex 凭据已切换，档案独立工作区的 ChatGPT/Codex 桌面实例已启动。",
+        "Codex 凭据已切换，并已复用原 Codex 客户端状态。",
       ),
     );
     expect(native.invoke).toHaveBeenCalledWith("select_current_profile", {
-      input: { id: "next", confirmed_desktop_restart: false },
+      input: { id: "next", confirmed_desktop_restart: true },
     });
   });
 
@@ -491,8 +590,7 @@ describe("App", () => {
           profile_id: "next",
           attempt_id: "switch-1",
           status: "switching",
-          message:
-            "正在写入已保存的 Codex 凭据，并启动该档案专属的 ChatGPT/Codex 工作区。",
+          message: "正在写入已保存的 Codex 凭据，并复用原 Codex 客户端状态。",
         });
       }
       if (command === "current_profile_activation_status") {
@@ -500,8 +598,7 @@ describe("App", () => {
           profile_id: "next",
           attempt_id: "switch-1",
           status: "switching",
-          message:
-            "正在写入已保存的 Codex 凭据，并启动该档案专属的 ChatGPT/Codex 工作区。",
+          message: "正在写入已保存的 Codex 凭据，并复用原 Codex 客户端状态。",
         });
       }
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -512,7 +609,13 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
-    expect(await screen.findByRole("dialog")).toHaveTextContent("正在切换已保存的账号");
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
+    await waitFor(() =>
+      expect(screen.getByRole("dialog")).toHaveTextContent("正在切换已保存的账号"),
+    );
     expect(screen.queryByRole("button", { name: "取消登录" })).not.toBeInTheDocument();
   });
 
@@ -550,7 +653,9 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
-    expect(await screen.findByRole("dialog")).toHaveTextContent("关闭并重启原客户端？");
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
     expect(native.invoke).not.toHaveBeenCalledWith(
       "select_current_profile",
       expect.anything(),
@@ -564,7 +669,7 @@ describe("App", () => {
     );
   });
 
-  it("reports a keychain failure without suggesting the generic ChatGPT login flow", async () => {
+  it("reports an auth file failure without suggesting the generic ChatGPT login flow", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
       value: {},
@@ -590,9 +695,8 @@ describe("App", () => {
         return Promise.resolve({
           profile_id: "next",
           attempt_id: "switch-1",
-          status: "codex_keychain_write_failed",
-          message:
-            "Codex 凭据已写入，但无法更新 macOS 的 Codex Auth 钥匙串；未启动桌面实例，请解锁钥匙串后重试。",
+          status: "auth_file_write_failed",
+          message: "无法更新默认 Codex auth.json；请确认文件权限后重试。",
         });
       }
       return Promise.reject(new Error(`unexpected command: ${command}`));
@@ -603,9 +707,13 @@ describe("App", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: "设为当前档案：目标账号" }),
     );
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
     await waitFor(() =>
-      expect(screen.getByRole("status")).toHaveTextContent(
-        "无法更新 macOS 的 Codex Auth 钥匙串；未启动桌面实例",
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "无法更新默认 Codex auth.json；请确认文件权限后重试",
       ),
     );
   });
@@ -648,8 +756,12 @@ describe("App", () => {
     const target = await screen.findByRole("button", {
       name: "设为当前档案：目标账号",
     });
-    vi.useFakeTimers();
     fireEvent.click(target);
+    expect(await screen.findByRole("dialog")).toHaveTextContent(
+      "关闭并切换 Codex 客户端？",
+    );
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
     await act(async () => {
       await Promise.resolve();
       await Promise.resolve();
@@ -777,6 +889,246 @@ describe("App", () => {
     );
   });
 
+  it("shows profile operation failures as error feedback without a global state error", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    native.invoke.mockImplementation((command: string) => {
+      if (command === "dashboard_snapshot") return Promise.resolve(snapshot);
+      if (command === "managed_task_status")
+        return Promise.resolve(idleTaskStatusForTest());
+      if (command === "desktop_workspace_settings")
+        return Promise.resolve({ mode: "per_profile" });
+      if (command === "list_desktop_workspaces") return Promise.resolve([]);
+      if (command === "refresh_profile_quotas")
+        return Promise.resolve({ profiles: [], failed_profile_ids: [] });
+      if (command === "refresh_profile_models") {
+        return Promise.reject({
+          code: "profile_update_failed",
+          message: "保存失败",
+        });
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "档案" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "加入网关账号池：当前账号" }),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveClass("toast-error");
+    expect(alert).toHaveTextContent("保存失败");
+    expect(screen.queryByText("无法读取本机状态")).not.toBeInTheDocument();
+  });
+
+  it("treats an active direct OAuth projection warning as a successful update", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const oauthA = {
+      ...snapshot.profiles[0],
+      id: "oauth-a",
+      alias: "Work A",
+      is_current: true,
+    };
+    const oauthB = {
+      ...snapshot.profiles[1],
+      id: "oauth-b",
+      alias: "Work B",
+      is_current: false,
+    };
+    const apiProfile = apiProfileForAppTest("api-active", "oauth-a");
+    let currentSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      profiles: [oauthA, oauthB, apiProfile],
+    };
+    const activeStatus = gatewayConfigForAppTest({
+      enabled: true,
+      directProfileId: "api-active",
+      oauthProfileId: "oauth-a",
+      message: "Codex 正在直连第三方模型提供商：Third Party。",
+    });
+    native.invoke.mockImplementation(
+      (command: string, args?: Record<string, unknown>) => {
+        if (command === "dashboard_snapshot") return Promise.resolve(currentSnapshot);
+        if (command === "managed_task_status")
+          return Promise.resolve(idleTaskStatusForTest());
+        if (command === "refresh_profile_quotas")
+          return Promise.resolve({ profiles: [], failed_profile_ids: [] });
+        if (command === "codex_gateway_config_status")
+          return Promise.resolve(activeStatus);
+        if (command === "update_api_service_profile") {
+          expect(args).toEqual({
+            input: expect.objectContaining({
+              id: "api-active",
+              codex_oauth_profile_id: "oauth-b",
+              provider: "openai_compatible",
+              wire_api: "responses",
+              base_url: "https://api.example.test/v1",
+            }),
+          });
+          const updatedProfile = { ...apiProfile, codex_oauth_profile_id: "oauth-b" };
+          currentSnapshot = {
+            ...currentSnapshot,
+            profiles: [oauthA, oauthB, updatedProfile],
+          };
+          return Promise.resolve({
+            profile: updatedProfile,
+            codex_config: {
+              ...activeStatus,
+              oauth_profile_id: "oauth-b",
+              oauth_profile_alias: "Work B",
+              message:
+                "所选 OAuth 登录档案未能应用；ChatGPT.app 将保持当前登录账号。模型请求仍走第三方提供商。已同步会话并重启 ChatGPT.app。",
+            },
+          });
+        }
+        if (command === "list_collaboration_bots") return Promise.resolve([]);
+        if (command === "list_collaboration_project_bindings")
+          return Promise.resolve([]);
+        if (command === "list_codex_sessions") return Promise.resolve([]);
+        if (command === "list_collaboration_contexts") return Promise.resolve([]);
+        if (command === "list_gateway_model_options")
+          return Promise.resolve(["codex-visible"]);
+        return Promise.reject(new Error(`unexpected command: ${command}`));
+      },
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "档案" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "编辑 API 服务：Third Party" }),
+    );
+    const sheet = await screen
+      .findByRole("heading", { name: "编辑第三方模型提供商" })
+      .then((heading) => heading.closest("section") as HTMLElement);
+    const form = within(sheet);
+    const oauthSelector = form.getByRole("combobox", {
+      name: "OAuth 登录档案（可选）",
+    });
+    await waitFor(() => expect(oauthSelector).toHaveTextContent("Work A"));
+    fireEvent.click(oauthSelector);
+    fireEvent.click(await screen.findByRole("option", { name: /Work B/ }));
+    fireEvent.click(form.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("update_api_service_profile", {
+        input: expect.objectContaining({
+          id: "api-active",
+          codex_oauth_profile_id: "oauth-b",
+        }),
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "所选 OAuth 登录档案未能应用；ChatGPT.app 将保持当前登录账号。模型请求仍走第三方提供商。已同步会话并重启 ChatGPT.app。",
+    );
+    expect(
+      native.invoke.mock.calls.some(
+        ([command, args]) =>
+          command === "update_profile" &&
+          (args as { input?: { id?: string } } | undefined)?.input?.id === "api-active",
+      ),
+    ).toBe(false);
+  });
+
+  it("shows the ordinary provider update notice when an API profile is inactive", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    const oauthA = {
+      ...snapshot.profiles[0],
+      id: "oauth-a",
+      alias: "Work A",
+      is_current: true,
+    };
+    const oauthB = {
+      ...snapshot.profiles[1],
+      id: "oauth-b",
+      alias: "Work B",
+      is_current: false,
+    };
+    const apiProfile = apiProfileForAppTest("api-inactive", "oauth-a");
+    let currentSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      profiles: [oauthA, oauthB, apiProfile],
+    };
+    const inactiveStatus = gatewayConfigForAppTest({
+      enabled: false,
+      directProfileId: null,
+      oauthProfileId: null,
+      message: "Codex 正在使用官方模型配置。",
+    });
+    native.invoke.mockImplementation(
+      (command: string, args?: Record<string, unknown>) => {
+        if (command === "dashboard_snapshot") return Promise.resolve(currentSnapshot);
+        if (command === "managed_task_status")
+          return Promise.resolve(idleTaskStatusForTest());
+        if (command === "refresh_profile_quotas")
+          return Promise.resolve({ profiles: [], failed_profile_ids: [] });
+        if (command === "codex_gateway_config_status")
+          return Promise.resolve(inactiveStatus);
+        if (command === "update_api_service_profile") {
+          expect(args).toEqual({
+            input: expect.objectContaining({
+              id: "api-inactive",
+              codex_oauth_profile_id: "oauth-b",
+            }),
+          });
+          const updatedProfile = { ...apiProfile, codex_oauth_profile_id: "oauth-b" };
+          currentSnapshot = {
+            ...currentSnapshot,
+            profiles: [oauthA, oauthB, updatedProfile],
+          };
+          return Promise.resolve({
+            profile: updatedProfile,
+            codex_config: null,
+          });
+        }
+        if (command === "list_collaboration_bots") return Promise.resolve([]);
+        if (command === "list_collaboration_project_bindings")
+          return Promise.resolve([]);
+        if (command === "list_codex_sessions") return Promise.resolve([]);
+        if (command === "list_collaboration_contexts") return Promise.resolve([]);
+        if (command === "list_gateway_model_options")
+          return Promise.resolve(["codex-visible"]);
+        return Promise.reject(new Error(`unexpected command: ${command}`));
+      },
+    );
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "档案" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "编辑 API 服务：Third Party" }),
+    );
+    const sheet = await screen
+      .findByRole("heading", { name: "编辑第三方模型提供商" })
+      .then((heading) => heading.closest("section") as HTMLElement);
+    const form = within(sheet);
+    const oauthSelector = form.getByRole("combobox", {
+      name: "OAuth 登录档案（可选）",
+    });
+    await waitFor(() => expect(oauthSelector).toHaveTextContent("Work A"));
+    fireEvent.click(oauthSelector);
+    fireEvent.click(await screen.findByRole("option", { name: /Work B/ }));
+    fireEvent.click(form.getByRole("button", { name: "保存修改" }));
+
+    await waitFor(() =>
+      expect(native.invoke).toHaveBeenCalledWith("update_api_service_profile", {
+        input: expect.objectContaining({
+          id: "api-inactive",
+          codex_oauth_profile_id: "oauth-b",
+        }),
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("第三方模型提供商已更新。");
+    expect(screen.getByRole("status")).not.toHaveTextContent("重启");
+  });
+
   it("keeps a background Keychain authorization requirement out of the global error state", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
@@ -804,10 +1156,206 @@ describe("App", () => {
 
     expect(screen.queryByText("keychain interaction required")).not.toBeInTheDocument();
   });
+
+  it("notifies once per valid-to-invalid transition and rearms after recovery", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    let currentSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      profiles: [
+        {
+          ...snapshot.profiles[0],
+          validation_status: "valid" as const,
+          validation_message: "官方 Codex 接口验证通过。",
+        },
+      ],
+    };
+    const validationSequence = ["invalid", "invalid", "valid", "invalid"] as const;
+    let validationIndex = 0;
+    native.invoke.mockImplementation((command: string) => {
+      if (command === "dashboard_snapshot") return Promise.resolve(currentSnapshot);
+      if (command === "managed_task_status")
+        return Promise.resolve(idleTaskStatusForTest());
+      if (command === "desktop_workspace_settings")
+        return Promise.resolve({ mode: "per_profile" });
+      if (command === "list_desktop_workspaces") return Promise.resolve([]);
+      if (command === "refresh_profile_quotas") {
+        const validationStatus =
+          validationSequence[Math.min(validationIndex, validationSequence.length - 1)];
+        validationIndex += 1;
+        const profile = {
+          ...currentSnapshot.profiles[0],
+          validation_status: validationStatus,
+          validation_message:
+            validationStatus === "invalid"
+              ? "官方 Codex 接口拒绝了当前登录凭据，请重新授权。"
+              : "官方 Codex 接口验证通过。",
+        };
+        currentSnapshot = { ...currentSnapshot, profiles: [profile] };
+        return Promise.resolve({ profiles: [profile], failed_profile_ids: [] });
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    const profilesButton = await screen.findByRole("button", { name: "档案" });
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(profilesButton);
+      await Promise.all(Array.from({ length: 8 }, () => Promise.resolve()));
+    });
+    expect(
+      screen.getByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(4_000);
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).not.toBeInTheDocument();
+    vi.useRealTimers();
+
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(commandCalls("refresh_profile_quotas")).toHaveLength(2);
+      expect(commandCalls("dashboard_snapshot")).toHaveLength(3);
+    });
+    expect(
+      screen.queryByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).not.toBeInTheDocument();
+
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(commandCalls("refresh_profile_quotas")).toHaveLength(3);
+      expect(commandCalls("dashboard_snapshot")).toHaveLength(4);
+      expect(screen.getByLabelText("档案有效性：当前账号")).toHaveTextContent(
+        "档案有效",
+      );
+    });
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => {
+      expect(commandCalls("refresh_profile_quotas")).toHaveLength(4);
+      expect(commandCalls("dashboard_snapshot")).toHaveLength(5);
+    });
+    expect(
+      await screen.findByText("档案 当前账号 已失效，请重新授权后再使用。"),
+    ).toBeInTheDocument();
+  });
 });
+
+function apiProfileForAppTest(id: string, codexOAuthProfileId: string): MaskedProfile {
+  return {
+    id,
+    alias: "Third Party",
+    kind: "api_key",
+    base_url: "https://api.example.test/v1",
+    provider: "openai_compatible",
+    wire_api: "responses",
+    enabled: true,
+    in_pool: false,
+    priority: 0,
+    weight: 1,
+    models: ["codex-visible"],
+    model_mappings: [
+      {
+        model: "codex-visible",
+        upstream_model: "provider-real",
+        display_name: "Provider Real",
+        context_window: null,
+      },
+    ],
+    codex_oauth_profile_id: codexOAuthProfileId,
+    health: "healthy",
+    cooldown_until_ms: null,
+    credential_configured: true,
+    is_current: false,
+    validation_status: "unknown",
+    validated_at_ms: null,
+    validation_message: null,
+  };
+}
+
+function gatewayConfigForAppTest({
+  enabled,
+  directProfileId,
+  oauthProfileId,
+  message,
+}: {
+  enabled: boolean;
+  directProfileId: string | null;
+  oauthProfileId: string | null;
+  message: string;
+}): GatewayCodexConfigStatus {
+  return {
+    enabled,
+    mode: enabled && directProfileId ? "third_party" : "official",
+    config_path: "/Users/test/.codex/config.toml",
+    service_url: enabled ? "https://api.example.test/v1" : null,
+    message,
+    auth_status: enabled ? "ok" : "missing",
+    needs_repair: false,
+    direct_profile_id: directProfileId,
+    direct_profile_alias: directProfileId ? "Third Party" : null,
+    oauth_profile_id: oauthProfileId,
+    oauth_profile_alias:
+      oauthProfileId === "oauth-a"
+        ? "Work A"
+        : oauthProfileId === "oauth-b"
+          ? "Work B"
+          : null,
+    oauth_profile_available: Boolean(oauthProfileId),
+    oauth_profile_options: [
+      {
+        id: "oauth-a",
+        alias: "Work A",
+        available: true,
+        reason: null,
+      },
+      {
+        id: "oauth-b",
+        alias: "Work B",
+        available: true,
+        reason: null,
+      },
+    ],
+    history_sync: null,
+    history_sync_status: null,
+  };
+}
 
 function commandCalls(command: string) {
   return native.invoke.mock.calls.filter(([name]) => name === command);
+}
+
+function emitTauriEvent(event: string, payload: unknown) {
+  const handler = eventHandlers[event];
+  if (!handler) throw new Error(`No Tauri listener registered for ${event}`);
+  handler({ payload });
+}
+
+function emptyCodexEnvironmentForTest() {
+  return {
+    platform: "macos",
+    codex_home: "/Users/dev/.codex",
+    can_install: false,
+    message: "Codex 三端最小运行环境检查通过。",
+    last_checked_at_ms: 1_700_000_000_000,
+    summary: {
+      status: "healthy",
+      ok_count: 1,
+      warning_count: 0,
+      missing_count: 0,
+      failed_count: 0,
+      fixable_count: 0,
+      health_percent: 100,
+    },
+    checks: [],
+    install_steps: [],
+    manual_commands: [],
+  };
 }
 
 function idleTaskStatusForTest() {

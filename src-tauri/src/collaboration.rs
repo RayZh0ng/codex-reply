@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -39,7 +39,7 @@ use toml_edit::{value as toml_value, Array, DocumentMut, Item, Table};
 use uuid::Uuid;
 
 use crate::{
-    codex_gateway,
+    codex_gateway, codex_session_history,
     database::{Repository, StoredCodexSession, StoredCollaborationBot},
     domain::{
         CancelCodexSessionInput, CodexAuthMode, CodexSessionEvent, CodexSessionSummary,
@@ -1745,6 +1745,20 @@ impl CollaborationManager {
         if let Some(context) = context.as_ref() {
             write_context_memory_config(&session_home, context.memory_enabled)?;
         }
+        if resume {
+            if let Some(codex_id) = codex_session_id.as_deref() {
+                codex_session_history::restore_codex_session_to_home(
+                    &self.repository,
+                    &self.data_dir,
+                    codex_id,
+                    &session_home,
+                    &format!(
+                        "协作上下文 {}",
+                        short_id(context_id.as_deref().unwrap_or(&session_id))
+                    ),
+                )?;
+            }
+        }
         let image_paths = match self
             .download_incoming_images(&binding.provider, &binding.bot_id, &run_dir, &images)
             .await
@@ -1785,7 +1799,13 @@ impl CollaborationManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(|_| AppError::RuntimeUnavailable)?;
+        let mut child = command.spawn().map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                AppError::CodexCliMissing
+            } else {
+                AppError::RuntimeUnavailable
+            }
+        })?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(codex_instruction.as_bytes())
@@ -4321,10 +4341,11 @@ fn write_gateway_config_to_home(
     data_dir: &Path,
 ) -> AppResult<()> {
     fs::create_dir_all(home).map_err(|_| AppError::RuntimeUnavailable)?;
+    let catalog_path = home.join(COLLABORATION_MODEL_CATALOG_FILENAME);
     let mut document = DocumentMut::new();
     document["model_provider"] = toml_value(COLLABORATION_GATEWAY_PROVIDER);
     document["model"] = toml_value(model);
-    document["model_catalog_json"] = toml_value(COLLABORATION_MODEL_CATALOG_FILENAME);
+    document["model_catalog_json"] = toml_value(catalog_path.display().to_string());
     let providers = document["model_providers"].or_insert(Item::Table(Table::new()));
     let providers = providers
         .as_table_like_mut()
@@ -4376,8 +4397,11 @@ fn write_gateway_model_catalog(home: &Path, model: &str) -> AppResult<()> {
             "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
             "default_reasoning_level": "high",
             "supported_reasoning_levels": [
-                {"effort": "none", "description": "Disable Thinking"},
-                {"effort": "high", "description": "Enabled Thinking"}
+                {"effort": "minimal", "description": "Minimal reasoning"},
+                {"effort": "low", "description": "Low reasoning"},
+                {"effort": "medium", "description": "Medium reasoning"},
+                {"effort": "high", "description": "High reasoning"},
+                {"effort": "xhigh", "description": "Extra high reasoning"}
             ],
             "shell_type": "shell_command",
             "visibility": "list",
@@ -4673,6 +4697,9 @@ fn collaboration_error_message(error: &AppError) -> String {
         }
         AppError::RuntimeUnavailable => {
             "本机运行时或项目目录不可用，请确认工作目录存在且 Codex CLI 可启动。"
+        }
+        AppError::CodexCliMissing => {
+            "未检测到 Codex CLI，请在设置页运行环境检查并安装 @openai/codex。"
         }
         AppError::LocalStateUnavailable => {
             "本机会话状态暂不可读，请在 Codex Relay 客户端协作页刷新机器人连接；若仍出现，请重启 Codex Relay 并保留该错误码。"
@@ -5106,6 +5133,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::Arc,
     };
+    use toml_edit::DocumentMut;
     use uuid::Uuid;
 
     #[test]
@@ -5123,11 +5151,30 @@ mod tests {
         )
         .unwrap();
         let config = fs::read_to_string(root.join("config.toml")).unwrap();
+        let document = config.parse::<DocumentMut>().unwrap();
+        let expected_catalog_path = root
+            .join(COLLABORATION_MODEL_CATALOG_FILENAME)
+            .display()
+            .to_string();
         assert!(config.contains(r#"model = "third-party-coder""#));
         assert!(config.contains(r#"base_url = "https://127.0.0.1:53765/v1""#));
         assert!(config.contains("--relay-gateway-token"));
+        assert_eq!(
+            document["model_catalog_json"].as_str(),
+            Some(expected_catalog_path.as_str())
+        );
         let catalog = fs::read_to_string(root.join(COLLABORATION_MODEL_CATALOG_FILENAME)).unwrap();
         assert!(catalog.contains("third-party-coder"));
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        assert_eq!(
+            catalog["models"][0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["minimal", "low", "medium", "high", "xhigh"]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6234,8 +6281,15 @@ mod tests {
                     cooldown_until_ms: None,
                     credential_configured: true,
                     auth_mode: CodexAuthMode::OAuth,
+                    codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
+                    validation_status: "unknown".to_owned(),
+                    validated_at_ms: None,
+                    validation_message: None,
+                    max_concurrency: 4,
+                    max_queue_depth: 8,
+                    queue_timeout_ms: 15_000,
                 },
                 secret_ref: Some("profile:profile-1:oauth".into()),
                 credential_fingerprint: None,
@@ -6263,8 +6317,15 @@ mod tests {
                     cooldown_until_ms: None,
                     credential_configured: true,
                     auth_mode: CodexAuthMode::OAuth,
+                    codex_oauth_profile_id: None,
                     is_current: false,
                     account: None,
+                    validation_status: "unknown".to_owned(),
+                    validated_at_ms: None,
+                    validation_message: None,
+                    max_concurrency: 4,
+                    max_queue_depth: 8,
+                    queue_timeout_ms: 15_000,
                 },
                 secret_ref: Some(format!("profile:{id}:api-key")),
                 credential_fingerprint: None,

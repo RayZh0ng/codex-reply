@@ -1,42 +1,28 @@
-import { ArrowCounterClockwise } from "@phosphor-icons/react/ArrowCounterClockwise";
+import { Browser } from "@phosphor-icons/react/Browser";
+import { CheckCircle } from "@phosphor-icons/react/CheckCircle";
 import { Desktop } from "@phosphor-icons/react/Desktop";
 import { Moon } from "@phosphor-icons/react/Moon";
+import { ShieldCheck } from "@phosphor-icons/react/ShieldCheck";
 import { Sun } from "@phosphor-icons/react/Sun";
+import { TerminalWindow } from "@phosphor-icons/react/TerminalWindow";
 import { Trash } from "@phosphor-icons/react/Trash";
 import { Warning } from "@phosphor-icons/react/Warning";
+import { Wrench } from "@phosphor-icons/react/Wrench";
+import { XCircle } from "@phosphor-icons/react/XCircle";
 
 import {
   type AppUpdateChannel,
   type AppUpdateInfo,
+  type AppUpdateProgressEvent,
   type AppUpdateSettings,
+  type CodexEnvironmentCheck,
+  type CodexEnvironmentInstallReport,
+  type CodexEnvironmentReport,
   type DesktopWorkspaceHistoryItem,
-  type DesktopWorkspaceMode,
-  type DesktopWorkspaceSettings,
 } from "../../shared/ipc";
 import type { ThemePreference } from "../../shared/theme";
-
-const modes: Array<{
-  mode: DesktopWorkspaceMode;
-  title: string;
-  detail: string;
-}> = [
-  {
-    mode: "fresh",
-    title: "每次全新启动",
-    detail: "每次切换创建空白工作区并保留，可从下方历史记录恢复。",
-  },
-  {
-    mode: "per_profile",
-    title: "账号独立工作区",
-    detail: "每个 Relay 档案使用固定工作区，保留各自的客户端会话、状态与设置。",
-  },
-  {
-    mode: "shared",
-    title: "共享原客户端状态",
-    detail:
-      "使用原有 ChatGPT/Codex 数据目录，保留已保存的本地客户端状态。切换前会请求关闭客户端。",
-  },
-];
+import { Button, EmptyState, InlineNotice, PageHeader } from "../../shared/ui";
+import "./settings.css";
 
 const themes: Array<{
   value: ThemePreference;
@@ -66,7 +52,6 @@ const updateChannels: Array<{
 ];
 
 interface SettingsProps {
-  settings: DesktopWorkspaceSettings;
   workspaces: DesktopWorkspaceHistoryItem[];
   busy: boolean;
   themePreference: ThemePreference;
@@ -74,17 +59,20 @@ interface SettingsProps {
   availableUpdate: AppUpdateInfo | null;
   updateStatus: string | null;
   updateBusy: boolean;
-  onChangeMode: (mode: DesktopWorkspaceMode) => Promise<void>;
+  updateProgress: AppUpdateProgressEvent | null;
+  codexEnvironment: CodexEnvironmentReport | null;
+  codexEnvironmentInstall: CodexEnvironmentInstallReport | null;
+  codexEnvironmentBusy: boolean;
   onThemePreferenceChange: (preference: ThemePreference) => void;
   onChangeUpdateSettings: (settings: AppUpdateSettings) => Promise<void>;
   onCheckUpdate: () => Promise<void>;
   onInstallUpdate: () => Promise<void>;
-  onRestore: (id: string) => Promise<void>;
+  onRefreshCodexEnvironment: () => Promise<void>;
+  onInstallCodexEnvironment: () => Promise<void>;
   onDelete: (id: string, alias: string) => void;
 }
 
 export function Settings({
-  settings,
   workspaces,
   busy,
   themePreference,
@@ -92,22 +80,48 @@ export function Settings({
   availableUpdate,
   updateStatus,
   updateBusy,
-  onChangeMode,
+  updateProgress,
+  codexEnvironment,
+  codexEnvironmentInstall,
+  codexEnvironmentBusy,
   onThemePreferenceChange,
   onChangeUpdateSettings,
   onCheckUpdate,
   onInstallUpdate,
-  onRestore,
+  onRefreshCodexEnvironment,
+  onInstallCodexEnvironment,
   onDelete,
 }: SettingsProps) {
+  const installableMissingIds = new Set(
+    codexEnvironment?.install_steps
+      .filter((step) => step.available)
+      .map((step) => step.id) ?? [],
+  );
+  const hasInstallableMissing =
+    codexEnvironment?.checks.some(
+      (check) => check.status === "missing" && installableMissingIds.has(check.id),
+    ) ?? false;
+  const hasManualCommands = Boolean(codexEnvironment?.manual_commands.length);
+  const canAutoInstall = Boolean(
+    codexEnvironment?.can_install && hasInstallableMissing,
+  );
+  const updateInProgress = Boolean(updateProgress && updateProgress.phase !== "failed");
+  const updateControlsDisabled = busy || updateBusy || updateInProgress;
+  const environmentTone = codexEnvironment
+    ? environmentSummaryTone(codexEnvironment.summary.status)
+    : "neutral";
+  const copyManualCommands = () => {
+    const commands = codexEnvironment?.manual_commands ?? [];
+    if (!commands.length) return;
+    void navigator.clipboard?.writeText(commands.join("\n"));
+  };
+
   return (
     <div className="page settings-page">
-      <header className="page-heading" data-animate="heading">
-        <div>
-          <h1>客户端工作区</h1>
-          <p className="page-subtitle">管理应用外观与 Codex 档案的桌面工作区。</p>
-        </div>
-      </header>
+      <PageHeader
+        description="管理应用外观、软件更新、Codex 本机环境与历史工作区。"
+        title="设置"
+      />
       <section className="surface-card appearance-settings" data-animate="cards">
         <div className="card-heading">
           <div>
@@ -157,7 +171,7 @@ export function Settings({
             >
               <input
                 checked={updateSettings.channel === option.value}
-                disabled={busy || updateBusy}
+                disabled={updateControlsDisabled}
                 name="app-update-channel"
                 onChange={() =>
                   void onChangeUpdateSettings({
@@ -176,7 +190,7 @@ export function Settings({
         <label className="update-toggle">
           <input
             checked={updateSettings.auto_check}
-            disabled={busy || updateBusy}
+            disabled={updateControlsDisabled}
             onChange={(event) =>
               void onChangeUpdateSettings({
                 ...updateSettings,
@@ -188,85 +202,200 @@ export function Settings({
           <span>启动时自动检查更新</span>
         </label>
         {availableUpdate ? (
-          <article className="update-available-panel" role="status">
-            <strong>
-              发现 {formatUpdateChannel(availableUpdate.channel)}
-              更新：{availableUpdate.version}
-            </strong>
+          <InlineNotice
+            tone="success"
+            title={
+              <>
+                发现 {formatUpdateChannel(availableUpdate.channel)}
+                更新：{availableUpdate.version}
+              </>
+            }
+          >
             <p>
               当前版本 {availableUpdate.current_version}
               {availableUpdate.date ? ` · 发布于 ${availableUpdate.date}` : ""}
             </p>
             {availableUpdate.body && <p>{availableUpdate.body}</p>}
-          </article>
+          </InlineNotice>
         ) : (
           updateStatus && <p className="form-note">{updateStatus}</p>
         )}
+        {updateProgress && <UpdateProgressPanel progress={updateProgress} />}
         <div className="update-actions">
-          <button
-            className="quiet-button"
-            disabled={busy || updateBusy}
+          <Button
+            disabled={updateControlsDisabled}
+            loading={updateBusy && !updateInProgress}
+            loadingLabel="正在检查"
+            size="sm"
+            variant="secondary"
             onClick={() => void onCheckUpdate()}
-            type="button"
           >
-            {updateBusy ? "正在检查…" : "立即检查更新"}
-          </button>
+            {updateInProgress ? "正在更新…" : updateBusy ? "正在检查…" : "立即检查更新"}
+          </Button>
           {availableUpdate && (
-            <button
-              className="primary-button"
-              disabled={busy || updateBusy}
+            <Button
+              disabled={updateControlsDisabled}
+              loading={updateInProgress}
+              loadingLabel="正在更新…"
+              size="sm"
+              variant="primary"
               onClick={() => void onInstallUpdate()}
-              type="button"
             >
-              安装并重启
-            </button>
+              {updateInProgress ? "正在更新…" : "安装并重启"}
+            </Button>
           )}
         </div>
       </section>
-      <div className="section-heading compact-section-heading">
-        <div>
-          <h2>工作区模式</h2>
-          <p>选择切换档案时桌面客户端使用的本机状态。</p>
-        </div>
-      </div>
       <section
-        className="workspace-mode-grid"
+        className={`surface-card codex-environment-settings environment-${environmentTone}`}
         data-animate="cards"
-        aria-label="桌面工作区模式"
       >
-        {modes.map((option) => (
-          <label
-            className={`workspace-mode-card ${settings.mode === option.mode ? "selected" : ""}`}
-            key={option.mode}
-          >
-            <input
-              checked={settings.mode === option.mode}
-              disabled={busy}
-              name="workspace-mode"
-              onChange={() => void onChangeMode(option.mode)}
-              type="radio"
-              value={option.mode}
-            />
-            <strong>{option.title}</strong>
-            <span>{option.detail}</span>
-          </label>
-        ))}
-      </section>
-      {settings.mode === "shared" && (
-        <article className="privacy-banner contextual-notice" data-animate="notice">
-          <Warning size={20} weight="fill" />
-          <div>
-            <strong>共享模式只复用原客户端的本机状态</strong>
-            <p>账号 Cookie、钥匙串、云端聊天与记忆不会在档案之间迁移。</p>
+        <div className="environment-hero">
+          <div className="environment-hero-copy">
+            <p className="section-kicker">本机环境</p>
+            <h2>Codex 环境检查</h2>
+            <p>
+              覆盖 Windows / macOS / Linux：Node.js LTS、npm、Codex CLI、Git、 Codex
+              home、OAuth 回调、默认浏览器与 Relay CA。
+            </p>
           </div>
-        </article>
-      )}
+          {codexEnvironment ? (
+            <div className={`environment-score-card is-${environmentTone}`}>
+              <span>{codexEnvironment.summary.health_percent}</span>
+              <small>健康分</small>
+            </div>
+          ) : (
+            <div className="environment-score-card is-neutral">
+              <span>--</span>
+              <small>未检查</small>
+            </div>
+          )}
+        </div>
+        {codexEnvironment ? (
+          <>
+            <article className={`environment-summary-panel is-${environmentTone}`}>
+              <EnvironmentSummaryIcon status={codexEnvironment.summary.status} />
+              <div>
+                <strong>{codexEnvironment.message}</strong>
+                <p>
+                  平台：{formatEnvironmentPlatform(codexEnvironment.platform)}
+                  {codexEnvironment.codex_home
+                    ? ` · Codex home：${codexEnvironment.codex_home}`
+                    : ""}
+                  {codexEnvironment.last_checked_at_ms
+                    ? ` · 上次检查：${formatTimestamp(codexEnvironment.last_checked_at_ms)}`
+                    : ""}
+                </p>
+              </div>
+              <div className="environment-summary-metrics" aria-label="环境检查统计">
+                <span>{codexEnvironment.summary.ok_count} 正常</span>
+                <span>{codexEnvironment.summary.warning_count} 提示</span>
+                <span>{codexEnvironment.summary.missing_count} 缺失</span>
+                <span>{codexEnvironment.summary.failed_count} 失败</span>
+              </div>
+            </article>
+            <ul className="environment-check-grid" aria-label="Codex 环境检查结果">
+              {codexEnvironment.checks.map((check) => (
+                <li
+                  key={check.id}
+                  className={`environment-check-card is-${check.status}`}
+                >
+                  <div className="environment-check-topline">
+                    <span
+                      className={`environment-check-icon ${environmentStatusTone(check.status)}`}
+                    >
+                      <EnvironmentCheckIcon id={check.id} status={check.status} />
+                    </span>
+                    <span
+                      className={`status-pill compact ${environmentStatusTone(check.status)}`}
+                    >
+                      <i />
+                      {environmentStatusLabel(check.status)}
+                    </span>
+                  </div>
+                  <div className="environment-check-body">
+                    <strong>{check.label}</strong>
+                    {check.description && <small>{check.description}</small>}
+                    <p>{check.detail}</p>
+                  </div>
+                  <EnvironmentCheckDetail check={check} />
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : (
+          <EmptyState
+            compact
+            description="检查 Node.js、npm、Codex CLI、Git、OAuth 回调、默认浏览器与 Relay CA。"
+            icon={<TerminalWindow size={22} weight="duotone" />}
+            title="尚未检查本机环境"
+          />
+        )}
+        {codexEnvironmentInstall && (
+          <details
+            className="environment-install-report"
+            open={codexEnvironmentInstall.status !== "completed"}
+          >
+            <summary>
+              <strong>{codexEnvironmentInstall.message}</strong>
+              <span>{codexEnvironmentInstall.logs.length} 个步骤</span>
+            </summary>
+            <ul>
+              {codexEnvironmentInstall.logs.map((log) => (
+                <li key={log.step_id} className={`is-${log.status}`}>
+                  <div>
+                    <strong>{log.label}</strong>
+                    <span>
+                      {environmentStatusLabel(log.status)} · {log.detail}
+                    </span>
+                    {log.next_action && <em>{log.next_action}</em>}
+                    {log.command && <code>{log.command}</code>}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+        <div className="environment-actions">
+          <Button
+            disabled={busy || codexEnvironmentBusy}
+            loading={codexEnvironmentBusy && !canAutoInstall}
+            loadingLabel="正在检查"
+            size="sm"
+            variant="secondary"
+            onClick={() => void onRefreshCodexEnvironment()}
+          >
+            {codexEnvironmentBusy ? "正在检查…" : "重新检查"}
+          </Button>
+          <Button
+            disabled={busy || codexEnvironmentBusy || !canAutoInstall}
+            loading={codexEnvironmentBusy && canAutoInstall}
+            loadingLabel="正在部署"
+            size="sm"
+            variant="primary"
+            onClick={() => void onInstallCodexEnvironment()}
+          >
+            {codexEnvironmentBusy ? "正在部署…" : "一键部署缺失项"}
+          </Button>
+          <Button
+            disabled={busy || codexEnvironmentBusy || !hasManualCommands}
+            size="sm"
+            variant="quiet"
+            onClick={copyManualCommands}
+          >
+            复制修复命令
+          </Button>
+        </div>
+      </section>
       <section className="surface-card workspace-history">
         <div className="card-heading">
           <div>
-            <h2>全新工作区历史</h2>
+            <h2>旧独立工作区清理</h2>
           </div>
         </div>
+        <p className="muted-copy">
+          已取消独立工作区模式。这里仅列出历史遗留的全新工作区，可按需清理其本地客户端数据。
+        </p>
         {workspaces.length ? (
           <ul>
             {workspaces.map((workspace) => (
@@ -280,17 +409,9 @@ export function Settings({
                 </div>
                 <div className="workspace-history-actions">
                   <button
-                    className="quiet-button"
-                    disabled={busy || workspace.profile_alias === "已删除档案"}
-                    onClick={() => void onRestore(workspace.id)}
-                    type="button"
-                  >
-                    <ArrowCounterClockwise size={17} /> 恢复
-                  </button>
-                  <button
                     className="icon-button danger"
                     disabled={busy}
-                    aria-label={`删除 ${workspace.profile_alias} 的工作区`}
+                    aria-label={`删除 ${workspace.profile_alias} 的旧独立工作区`}
                     onClick={() => onDelete(workspace.id, workspace.profile_alias)}
                     type="button"
                   >
@@ -301,13 +422,120 @@ export function Settings({
             ))}
           </ul>
         ) : (
-          <p className="muted-copy">
-            选择“每次全新启动”并切换账号后，保存的工作区会显示在这里。
-          </p>
+          <EmptyState
+            compact
+            description="没有历史独立工作区需要清理。"
+            icon={<ShieldCheck size={20} />}
+            title="工作区状态整洁"
+          />
         )}
       </section>
     </div>
   );
+}
+
+function UpdateProgressPanel({ progress }: { progress: AppUpdateProgressEvent }) {
+  const percent = progress.progress_percent;
+  return (
+    <article className={`update-progress-panel is-${progress.phase}`} role="status">
+      <div className="update-progress-meter-heading">
+        <strong>{updateProgressPhaseLabel(progress.phase)}</strong>
+        <span>
+          {percent === null ? formatBytes(progress.downloaded_bytes) : `${percent}%`}
+        </span>
+      </div>
+      <progress
+        aria-label="更新进度"
+        max={100}
+        value={percent === null ? undefined : percent}
+      />
+      <p>{progress.message}</p>
+      <small>{formatUpdateByteSummary(progress)}</small>
+    </article>
+  );
+}
+
+function updateProgressPhaseLabel(phase: AppUpdateProgressEvent["phase"]) {
+  return (
+    {
+      checking: "准备下载",
+      downloading: "正在下载",
+      downloaded: "下载完成",
+      installing: "正在安装",
+      restarting: "准备重启",
+      failed: "更新失败",
+    }[phase] ?? phase
+  );
+}
+
+function formatUpdateByteSummary(progress: AppUpdateProgressEvent) {
+  if (progress.content_length && progress.content_length > 0) {
+    return `${formatBytes(progress.downloaded_bytes)} / ${formatBytes(progress.content_length)}`;
+  }
+  if (progress.phase === "checking") return "正在连接更新服务…";
+  return `${formatBytes(progress.downloaded_bytes)} 已下载`;
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let next = value;
+  let unitIndex = 0;
+  while (next >= 1024 && unitIndex < units.length - 1) {
+    next /= 1024;
+    unitIndex += 1;
+  }
+  const precision = unitIndex === 0 || Number.isInteger(next) || next >= 10 ? 0 : 1;
+  return `${next.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function EnvironmentSummaryIcon({ status }: { status: string }) {
+  if (status === "healthy") return <CheckCircle size={24} weight="fill" />;
+  if (status === "action_required") return <XCircle size={24} weight="fill" />;
+  return <Warning size={24} weight="fill" />;
+}
+
+function EnvironmentCheckDetail({ check }: { check: CodexEnvironmentCheck }) {
+  const command = check.command?.trim();
+  const nextAction = check.next_action?.trim();
+  const hasNextAction = Boolean(nextAction && !isNoopEnvironmentAction(nextAction));
+
+  if (!command && !hasNextAction) return null;
+
+  return (
+    <div
+      className={`environment-check-detail is-${environmentStatusTone(check.status)}`}
+      aria-label={`${check.label}处理建议`}
+    >
+      <div className="environment-check-detail-heading">
+        <span className="environment-check-detail-label">
+          {command ? "处理建议" : "下一步"}
+        </span>
+        <span className="environment-check-detail-hint">
+          {command ? "含可执行命令" : "查看说明"}
+        </span>
+      </div>
+      <div className="environment-check-detail-panel">
+        {hasNextAction && <p>{nextAction}</p>}
+        {command && <code>{command}</code>}
+      </div>
+    </div>
+  );
+}
+
+function isNoopEnvironmentAction(action: string) {
+  return action.replace(/[。.!！\s]/g, "") === "无需处理";
+}
+
+function EnvironmentCheckIcon({ id, status }: { id: string; status: string }) {
+  if (status === "ok") return <CheckCircle size={18} weight="fill" />;
+  if (status === "failed" || status === "missing") {
+    return <XCircle size={18} weight="fill" />;
+  }
+  if (id === "browser") return <Browser size={18} weight="duotone" />;
+  if (id === "relay_ca") return <ShieldCheck size={18} weight="duotone" />;
+  if (id === "codex_home") return <Wrench size={18} weight="duotone" />;
+  return <TerminalWindow size={18} weight="duotone" />;
 }
 
 function formatTimestamp(value: number) {
@@ -319,4 +547,45 @@ function formatTimestamp(value: number) {
 
 function formatUpdateChannel(channel: AppUpdateChannel) {
   return channel === "beta" ? "Beta" : "稳定版";
+}
+
+function environmentStatusLabel(status: string) {
+  return (
+    {
+      ok: "正常",
+      missing: "缺失",
+      warning: "需处理",
+      failed: "失败",
+      completed: "已完成",
+      skipped: "已跳过",
+      needs_privilege: "需授权",
+      unsupported: "需手动",
+    }[status] ?? status
+  );
+}
+
+function environmentStatusTone(status: string) {
+  if (status === "ok" || status === "completed") return "success";
+  if (status === "warning" || status === "needs_privilege") return "warning";
+  if (status === "missing" || status === "failed" || status === "unsupported")
+    return "danger";
+  return "neutral";
+}
+
+function environmentSummaryTone(status: string) {
+  if (status === "healthy") return "success";
+  if (status === "warning") return "warning";
+  if (status === "action_required") return "danger";
+  return "neutral";
+}
+
+function formatEnvironmentPlatform(platform: string) {
+  return (
+    {
+      windows: "Windows",
+      macos: "macOS",
+      linux: "Linux",
+      other: "其它平台",
+    }[platform] ?? platform
+  );
 }

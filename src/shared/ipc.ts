@@ -5,6 +5,7 @@ export type GatewayProvider =
   "openai" | "openai_compatible" | "anthropic" | "gemini" | "ollama";
 export type GatewayWireApi = "responses" | "chat_completions";
 export type CodexAuthMode = "oauth" | "agent_identity" | "personal_access_token";
+export type ProfileValidationStatus = "valid" | "invalid" | "unknown";
 export type DesktopWorkspaceMode = "fresh" | "per_profile" | "shared";
 export type AppUpdateChannel = "stable" | "beta";
 
@@ -13,6 +14,47 @@ export interface GatewayModelMapping {
   upstream_model: string;
   display_name: string | null;
   context_window: number | null;
+}
+
+export interface CreateApiServiceProfileInput {
+  alias: string;
+  provider: GatewayProvider;
+  wire_api: GatewayWireApi;
+  base_url: string;
+  api_key: string;
+  model_mappings: GatewayModelMapping[];
+  codex_oauth_profile_id: string | null;
+  in_pool: boolean;
+  priority: number;
+  weight: number;
+  max_concurrency?: number;
+  max_queue_depth?: number;
+  queue_timeout_ms?: number;
+}
+
+export interface UpdateProfileInput {
+  id: string;
+  alias: string;
+  provider?: GatewayProvider;
+  wire_api?: GatewayWireApi;
+  base_url?: string;
+  enabled: boolean;
+  in_pool: boolean;
+  priority: number;
+  weight: number;
+  max_concurrency?: number;
+  max_queue_depth?: number;
+  queue_timeout_ms?: number;
+  models: string[];
+  model_mappings?: GatewayModelMapping[];
+  codex_oauth_profile_id?: string | null;
+  api_key: string | null;
+}
+
+export interface TestApiServiceProfileInput {
+  provider: GatewayProvider;
+  base_url: string;
+  api_key: string;
 }
 
 export interface MaskedProfile {
@@ -26,14 +68,21 @@ export interface MaskedProfile {
   in_pool: boolean;
   priority: number;
   weight: number;
+  max_concurrency?: number;
+  max_queue_depth?: number;
+  queue_timeout_ms?: number;
   models: string[];
   model_mappings?: GatewayModelMapping[];
+  codex_oauth_profile_id: string | null;
   health: string;
   cooldown_until_ms: number | null;
   credential_configured: boolean;
   auth_mode?: CodexAuthMode;
   is_current: boolean;
   account?: ProfileAccountSummary | null;
+  validation_status: ProfileValidationStatus;
+  validated_at_ms: number | null;
+  validation_message: string | null;
 }
 
 export interface JsonProfileImportPreviewItem {
@@ -130,6 +179,16 @@ export interface ProfileQuotaRefreshReport {
   failed_profile_ids: string[];
 }
 
+export interface GatewayDirectRouteHealth {
+  status: "ok" | "degraded" | "unavailable" | string;
+  profile_id: string;
+  profile_alias: string;
+  route_mode: "relay_bridge" | "provider_direct" | string;
+  oauth_ready: boolean;
+  credential_ready: boolean;
+  model_count: number;
+}
+
 export interface GatewayStatus {
   running: boolean;
   bind_mode: "lan" | "loopback";
@@ -139,6 +198,10 @@ export interface GatewayStatus {
   cidrs: string[];
   available_profiles: number;
   cooling_profiles: number;
+  pool_status?: "ok" | "unavailable" | string;
+  direct_route?: GatewayDirectRouteHealth | null;
+  active_requests?: number;
+  queued_requests?: number;
   client_key_count: number;
   certificate_ready: boolean;
   service_url: string;
@@ -162,15 +225,25 @@ export interface GatewayOAuthProfileOption {
 
 export interface GatewayCodexConfigStatus {
   enabled: boolean;
+  mode: "official" | "relay_gateway" | "third_party" | string;
   config_path: string;
   service_url: string | null;
   message: string;
   auth_status: "ok" | "missing" | "legacy" | "invalid";
   needs_repair: boolean;
+  direct_profile_id: string | null;
+  direct_profile_alias: string | null;
   oauth_profile_id: string | null;
   oauth_profile_alias: string | null;
   oauth_profile_available: boolean;
   oauth_profile_options: GatewayOAuthProfileOption[];
+  history_sync: CodexHistorySyncReport | null;
+  history_sync_status?: CodexHistoryTransitionStatus | null;
+}
+
+export interface ApiServiceProfileUpdateResult {
+  profile: MaskedProfile;
+  codex_config: GatewayCodexConfigStatus | null;
 }
 
 export interface ApiServiceTestReport {
@@ -184,12 +257,130 @@ export interface ApiServiceTestReport {
   models: string[];
 }
 
+export interface CodexEnvironmentReport {
+  platform: string;
+  codex_home: string | null;
+  can_install: boolean;
+  message: string;
+  last_checked_at_ms: number;
+  summary: CodexEnvironmentSummary;
+  checks: CodexEnvironmentCheck[];
+  install_steps: CodexEnvironmentInstallStep[];
+  manual_commands: string[];
+}
+
+export interface CodexEnvironmentSummary {
+  status: "healthy" | "warning" | "action_required" | string;
+  ok_count: number;
+  warning_count: number;
+  missing_count: number;
+  failed_count: number;
+  fixable_count: number;
+  health_percent: number;
+}
+
+export interface CodexEnvironmentCheck {
+  id: string;
+  label: string;
+  status: "ok" | "missing" | "warning" | "failed" | string;
+  detail: string;
+  command: string | null;
+  description: string | null;
+  next_action: string | null;
+  automatic: boolean;
+}
+
+export interface CodexEnvironmentInstallStep {
+  id: string;
+  label: string;
+  available: boolean;
+  command: string | null;
+  requires_privilege: boolean;
+  next_action: string | null;
+}
+
+export interface CodexEnvironmentInstallReport {
+  status: "completed" | "failed" | string;
+  message: string;
+  logs: CodexEnvironmentInstallLog[];
+  environment: CodexEnvironmentReport;
+}
+
+export interface CodexEnvironmentInstallLog {
+  step_id: string;
+  label: string;
+  status:
+    "completed" | "failed" | "skipped" | "needs_privilege" | "unsupported" | string;
+  detail: string;
+  command: string | null;
+  next_action: string | null;
+}
+
 export interface MetricsSnapshot {
   total_requests: number;
   successful_requests: number;
   failed_requests: number;
   average_latency_ms: number | null;
   estimated_tokens: number;
+  window_minutes?: number;
+  window_requests?: number;
+  window_success_rate?: number | null;
+  requests_per_minute?: number;
+  latency_p50_ms?: number | null;
+  latency_p95_ms?: number | null;
+  latency_p99_ms?: number | null;
+  ttfb_p50_ms?: number | null;
+  ttfb_p95_ms?: number | null;
+  ttfb_p99_ms?: number | null;
+  request_bytes?: number;
+  response_bytes?: number;
+  retry_count?: number;
+  active_requests?: number;
+  queued_requests?: number;
+  telemetry_dropped?: number;
+}
+
+export interface GatewayPerformanceInput {
+  window_minutes: number;
+}
+
+export interface ListGatewayRequestMetricsInput {
+  limit: number;
+  cursor?: number | null;
+  profile_id?: string | null;
+  route?: string | null;
+  status?: string | null;
+}
+
+export interface GatewayRequestMetricSummary {
+  sequence: number;
+  request_id: string;
+  started_at_ms: number;
+  route: string;
+  provider: string;
+  profile_id: string | null;
+  auth_mode: string;
+  stream: boolean;
+  auth_latency_ms: number;
+  queue_latency_ms: number;
+  ttfb_ms: number | null;
+  total_latency_ms: number;
+  request_bytes: number;
+  response_bytes: number;
+  http_status: number;
+  outcome: string;
+  error_category: string | null;
+  upstream_attempts: number;
+  retry_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  upstream_response_id: string | null;
+}
+
+export interface GatewayRequestMetricPage {
+  items: GatewayRequestMetricSummary[];
+  next_cursor: number | null;
 }
 
 export interface MaskedClientKey {
@@ -340,6 +531,124 @@ export interface CodexSessionSummary {
   goal_status: string | null;
 }
 
+export interface CodexHistoryReport {
+  scanned_at_ms: number;
+  limit: number;
+  offset: number;
+  total_sessions: number;
+  selected_project_id: string | null;
+  projects: CodexHistoryProjectSummary[];
+  homes: CodexHistoryHomeSummary[];
+  sessions: CodexHistorySessionSummary[];
+  warnings: string[];
+}
+
+export interface ListCodexHistoryInput {
+  limit?: number;
+  offset?: number;
+  project_id?: string | null;
+}
+
+export interface CodexHistoryProjectSummary {
+  id: string;
+  name: string;
+  cwd: string | null;
+  session_count: number;
+  consistent_count: number;
+  missing_count: number;
+  conflict_count: number;
+  needs_repair_count: number;
+  updated_at_ms: number;
+}
+
+export interface CodexHistoryHomeSummary {
+  id: string;
+  kind: string;
+  label: string;
+  path: string;
+  sync_target: boolean;
+  session_count: number;
+}
+
+export interface CodexHistorySessionSummary {
+  id: string;
+  title: string | null;
+  cwd: string | null;
+  project_id: string;
+  project_name: string;
+  updated_at_ms: number;
+  status: "consistent" | "missing" | "conflict" | "needs_repair" | string;
+  source_count: number;
+  missing_target_count: number;
+  divergent_source_count: number;
+  sources: CodexHistorySourceSummary[];
+}
+
+export interface CodexHistorySourceSummary {
+  home_id: string;
+  home_label: string;
+  home_kind: string;
+  rollout_path: string;
+  archived: boolean;
+  updated_at_ms: number;
+  event_count: number;
+  sha256: string;
+}
+
+export interface CodexHistorySyncReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  homes_scanned: number;
+  sessions_seen: number;
+  sessions_synced: number;
+  files_written: number;
+  files_backed_up: number;
+  metadata_rebuilt: number;
+  warnings: string[];
+}
+
+export interface CodexHistoryTransitionStatus {
+  status: "queued" | "running" | "completed" | "warning" | string;
+  message: string;
+  queued_at_ms: number;
+  completed_at_ms: number | null;
+  warnings: string[];
+}
+
+export interface CodexHistoryMutationReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  sessions_affected: number;
+  files_removed: number;
+  files_backed_up: number;
+  metadata_updated: number;
+  metadata_rebuilt: number;
+  warnings: string[];
+}
+
+export interface CodexHistoryExportReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  sessions_exported: number;
+  files_exported: number;
+  destination_path: string;
+  warnings: string[];
+}
+
+export interface CodexHistoryImportReport {
+  status: "completed" | "warning" | string;
+  message: string;
+  scanned_at_ms: number;
+  sessions_imported: number;
+  files_written: number;
+  files_backed_up: number;
+  metadata_rebuilt: number;
+  warnings: string[];
+}
+
 export interface DashboardSnapshot {
   gateway: GatewayStatus;
   profiles: MaskedProfile[];
@@ -375,11 +684,12 @@ export interface CurrentProfileActivation {
     | "switching"
     | "activated"
     | "auth_file_write_failed"
-    | "codex_keychain_write_failed"
     | "desktop_restart_failed"
     | "failed"
     | "cancelled";
   message: string;
+  history_sync: CodexHistorySyncReport | null;
+  history_sync_status?: CodexHistoryTransitionStatus | null;
 }
 
 export interface DesktopWorkspaceSettings {
@@ -397,6 +707,24 @@ export interface AppUpdateInfo {
   body: string | null;
   date: string | null;
   channel: AppUpdateChannel;
+}
+
+export const APP_UPDATE_PROGRESS_EVENT = "app-update-progress";
+export const CODEX_HISTORY_SYNC_FINISHED_EVENT = "codex-history-sync-finished";
+
+export type AppUpdateProgressPhase =
+  "checking" | "downloading" | "downloaded" | "installing" | "restarting" | "failed";
+
+export interface AppUpdateProgressEvent {
+  phase: AppUpdateProgressPhase;
+  channel: AppUpdateChannel;
+  version: string;
+  current_version: string;
+  downloaded_bytes: number;
+  content_length: number | null;
+  progress_percent: number | null;
+  message: string;
+  updated_at_ms: number;
 }
 
 export interface DesktopWorkspaceHistoryItem {
@@ -474,19 +802,33 @@ function recoveryFor(code: string) {
       internal: "请重启 Codex Relay；若仍出现，请保留该错误码后重试。",
       local_state_unavailable:
         "请在协作页刷新机器人连接；若仍出现，请重启 Codex Relay 并保留该错误码。",
-      runtime_unavailable: "请确认 Codex CLI 可用后重试。",
+      runtime_unavailable:
+        "请在设置页运行 Codex 环境检查，确认 CLI、PATH 与本机目录可用后重试。",
+      oauth_callback_port_unavailable:
+        "请关闭占用 127.0.0.1:1455 的进程，或重启 Codex Relay 后重试。",
+      oauth_browser_launch_failed:
+        "请检查系统默认浏览器设置；Linux 可安装 xdg-utils/gio 后重试。",
+      browser_launch_failed:
+        "请设置系统默认浏览器；Linux 可安装 xdg-utils/gio 后重试。",
+      environment_privilege_required:
+        "该步骤需要系统授权；请按环境检查日志中的命令在终端执行。",
+      environment_package_manager_missing:
+        "未检测到可用包管理器；请按环境检查中的手动命令安装依赖。",
+      ca_trust_failed:
+        "Relay CA 未能写入系统信任；请在网关页导出 CA 后按系统提示手动信任。",
+      codex_cli_missing: "请在设置页运行 Codex 环境检查并安装 Codex CLI。",
       secret_store_unavailable: "请解锁系统安全存储后重试。",
       keychain_interaction_required:
         "请在 macOS 系统弹窗中输入登录钥匙串密码，并选择“始终允许”。",
       profile_credential_migration_required:
         "该档案由旧版应用保存；请使用“更新凭据”重新完成一次 OAuth。",
       profile_runtime_unavailable: "请重新授权该 OAuth 档案后重试。",
+      oauth_identity_mismatch:
+        "请在档案页重新授权所选 OAuth 档案，然后重新切换第三方提供商；Relay 会把该登录态写入 auth.json 并重启 ChatGPT.app。",
       gateway_model_unavailable:
         "请刷新可用模型，并确认对应账号已启用且加入网关账号池。",
       app_update_unavailable: "请检查网络连接，或稍后在设置页手动检查软件更新。",
       auth_file_write_failed: "请确认默认 .codex 目录可写后重试。",
-      codex_keychain_unavailable:
-        "请解锁 macOS 钥匙串并允许 Codex Relay 写入“Codex Auth”后重试。",
     }[code] ?? "请检查本机配置后重试。"
   );
 }
@@ -495,10 +837,12 @@ export const api = {
   dashboard: () => relayInvoke<DashboardSnapshot>("dashboard_snapshot"),
   createProfile: (input: Record<string, unknown>) =>
     relayInvoke<MaskedProfile>("create_profile", { input }),
-  createApiServiceProfile: (input: Record<string, unknown>) =>
+  createApiServiceProfile: (input: CreateApiServiceProfileInput) =>
     relayInvoke<MaskedProfile>("create_api_service_profile", { input }),
-  updateProfile: (input: Record<string, unknown>) =>
+  updateProfile: (input: UpdateProfileInput) =>
     relayInvoke<MaskedProfile>("update_profile", { input }),
+  updateApiServiceProfile: (input: UpdateProfileInput) =>
+    relayInvoke<ApiServiceProfileUpdateResult>("update_api_service_profile", { input }),
   syncProfileAccountInfo: (id: string) =>
     relayInvoke<MaskedProfile>("sync_profile_account_info", { id }),
   refreshProfileQuotas: () =>
@@ -557,13 +901,63 @@ export const api = {
     relayInvoke<GatewayStatus>("update_gateway", { input }),
   startGateway: () => relayInvoke<GatewayStatus>("start_gateway"),
   stopGateway: () => relayInvoke<GatewayStatus>("stop_gateway"),
+  gatewayPerformance: (input: GatewayPerformanceInput = { window_minutes: 60 }) =>
+    relayInvoke<MetricsSnapshot>("gateway_performance", { input }),
+  listGatewayRequestMetrics: (input: ListGatewayRequestMetricsInput) =>
+    relayInvoke<GatewayRequestMetricPage>("list_gateway_request_metrics", { input }),
   exportGatewayCa: (destination: string) =>
     relayInvoke<void>("export_gateway_ca", { destination }),
   trustGatewayCa: () => relayInvoke<void>("trust_gateway_ca"),
   refreshProfileModels: (id: string) =>
     relayInvoke<MaskedProfile>("refresh_profile_models", { id }),
-  testApiServiceProfile: (input: Record<string, unknown>) =>
+  testApiServiceProfile: (input: TestApiServiceProfileInput) =>
     relayInvoke<ApiServiceTestReport>("test_api_service_profile", { input }),
+  testExistingApiServiceProfile: (id: string) =>
+    relayInvoke<ApiServiceTestReport>("test_existing_api_service_profile", { id }),
+  codexEnvironmentStatus: () =>
+    relayInvoke<CodexEnvironmentReport>("codex_environment_status"),
+  installCodexEnvironment: (steps?: string[]) =>
+    relayInvoke<CodexEnvironmentInstallReport>("install_codex_environment", {
+      input: { confirmed: true, steps: steps ?? null },
+    }),
+  listCodexHistory: (input: ListCodexHistoryInput = { limit: 100, offset: 0 }) =>
+    relayInvoke<CodexHistoryReport>("list_codex_history", { input }),
+  syncCodexHistory: () =>
+    relayInvoke<CodexHistorySyncReport>("sync_codex_history", {
+      input: { confirmed: true },
+    }),
+  deleteCodexHistory: (input: {
+    scope: "sessions" | "project";
+    session_ids?: string[];
+    project_id?: string | null;
+  }) =>
+    relayInvoke<CodexHistoryMutationReport>("delete_codex_history", {
+      input: {
+        scope: input.scope,
+        session_ids: input.session_ids ?? [],
+        project_id: input.project_id ?? null,
+        confirmed: true,
+      },
+    }),
+  exportCodexHistory: (input: {
+    scope: "sessions" | "project" | "all";
+    session_ids?: string[];
+    project_id?: string | null;
+    destination_path: string;
+  }) =>
+    relayInvoke<CodexHistoryExportReport>("export_codex_history", {
+      input: {
+        scope: input.scope,
+        session_ids: input.session_ids ?? [],
+        project_id: input.project_id ?? null,
+        destination_path: input.destination_path,
+        confirmed: true,
+      },
+    }),
+  importCodexHistory: (paths: string[]) =>
+    relayInvoke<CodexHistoryImportReport>("import_codex_history", {
+      input: { paths, confirmed: true },
+    }),
   codexGatewayConfigStatus: () =>
     relayInvoke<GatewayCodexConfigStatus>("codex_gateway_config_status"),
   enableCodexGateway: () =>

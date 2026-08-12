@@ -46,7 +46,7 @@ React 功能目录通过 `shared/ipc.ts` 调用 Rust command。前端状态包�
 
 主题偏好是前端设备级设置，取值为 `system | light | dark`，保存在 WebView localStorage；启动渲染前先解析有效主题，系统模式监听 `prefers-color-scheme`，并通过最小 `core:app:allow-set-app-theme` capability 同步原生窗口。浅色和深色均使用同一组语义 tokens，不新增数据库字段或 Rust IPC。所有业务下拉框统一使用 Radix Select 封装，保留键盘导航、typeahead、碰撞避让与 reduced-motion 降级。
 
-总览为首屏静态模块，档案、网关、协作和设置使用动态 import。导航 hover/focus 只预热目标模块；协作列表、客户端 Key、工作区历史和额度同步仅在对应页面读取。`DashboardSnapshot` 直接包含工作区模式和协作聚合计数，首屏无需加载完整协作记录。
+总览为首屏静态模块，档案、网关、协作和设置使用动态 import。导航 hover/focus 只预热目标模块；协作列表、客户端 Key、工作区历史和额度同步仅在对应页面读取。`DashboardSnapshot` 直接包含固定共享工作区状态和协作聚合计数，首屏无需加载完整协作记录。
 
 常用 command：
 
@@ -69,9 +69,9 @@ OAuth 网关适配器直接调用 Codex Responses 上游，集中设置 Bearer t
 
 ## 6. Codex 档案与运行时
 
-每个档案可拥有独立 `CODEX_HOME`、认证数据和运行目录。OAuth 流程启动浏览器或内置窗口、接收回调并保存 token；OAuth token 过期时可使用 refresh token 更新。导入档案以版本化认证封装保存，认证模式为 OAuth、Agent Identity 或 PAT；当前档案切换、受管任务和资料同步都按原认证模式投影官方兼容 `auth.json`。所有已配置的 Codex 档案都会使用 app-server 的 `account/read` 和 `account/rateLimits/read` 尝试读取身份、套餐和额度；只有 OAuth 在 app-server 失败时保留兼容的 OAuth 回退读取路径。导入预检可返回邮箱、账号 ID 与套餐等非敏感身份摘要，提交时写入 `ProfileAccountSummary`；前端默认仅显示邮箱、认证方式和身份状态，账号 ID 以掩码形式放在可展开详情中。OAuth token 仅驻留本地加密凭据库与当前进程的短生命周期缓存，绝不写入 SQLite、IPC 或日志。后台额度刷新使用本地加密凭据库读取/写入路径；该路径不访问 Relay 自身的 macOS 登录钥匙串，因此不会显示系统密码框。升级到本地凭据库后，旧 Keychain 凭据不做交互式迁移，已配置档案会标记为需要重新授权或重新录入。Relay 自身不再使用 `com.codexrelay.app` 登录钥匙串条目；macOS 仅在切换桌面端档案时写入目标 `CODEX_HOME` 对应的 `Codex Auth` 条目。
+每个档案可拥有独立 `CODEX_HOME`、认证数据和运行目录。OAuth 流程启动浏览器或内置窗口、接收回调并保存 token；OAuth token 过期时可使用 refresh token 更新。导入档案以版本化认证封装保存，认证模式为 OAuth、Agent Identity 或 PAT；当前档案切换、受管任务和资料同步都按原认证模式投影官方兼容 `auth.json`。所有已配置的 Codex 档案都会使用 app-server 的 `account/read` 和 `account/rateLimits/read` 尝试读取身份、套餐和额度；只有 OAuth 在 app-server 失败时保留兼容的 OAuth 回退读取路径。导入预检可返回邮箱、账号 ID 与套餐等非敏感身份摘要，提交时写入 `ProfileAccountSummary`；前端默认仅显示邮箱、认证方式和身份状态，账号 ID 以掩码形式放在可展开详情中。OAuth token 仅驻留本地加密凭据库与当前进程的短生命周期缓存，绝不写入 SQLite、IPC 或日志。后台额度刷新和桌面端账号切换均使用本地加密凭据库读取/写入路径，并只向默认 `.codex/auth.json` 与档案专属 `CODEX_HOME/auth.json` 原子投影认证数据；这些路径不访问 Relay 自身的 macOS 登录钥匙串，也不写入目标 `CODEX_HOME` 对应的 `Codex Auth` 条目，因此不会显示系统钥匙串密码框。升级到本地凭据库后，旧 Keychain 凭据不做交互式迁移，已配置档案会标记为需要重新授权或重新录入。
 
-切换当前档案时，应用加载并更新目标档案的认证数据，原子投影到当前用户默认 `.codex/auth.json`，并写入档案专属 `CODEX_HOME`。桌面工作区模式保存在 `app_settings.desktop_workspace_mode`，缺省为 `per_profile`：`fresh` 为每次切换生成并记录一个新的受控 Electron 数据目录；`per_profile` 为每个档案复用稳定目录；`shared` 不传入 `CODEX_ELECTRON_USER_DATA_PATH` 或 `--user-data-dir`，使用原客户端默认目录。共享模式必须由用户确认，后端先请求正常退出 ChatGPT/Codex 并等待；失败时不写入新凭据或当前档案，绝不强制结束进程。macOS 通过 LaunchServices 的 `open -n -a` 传入 `CODEX_HOME`，隔离模式额外传入用户数据目录；Windows 使用等价环境变量和参数。全新工作区仅保存 Relay 的 ID、所属档案与时间元数据，历史记录可恢复或显式删除。档案资料同步通过 `codex app-server` 的 `account/read` 与 `account/rateLimits/read` 读取套餐和 ChatGPT 额度窗口，并把非敏感摘要缓存到 SQLite；官方响应缺失订阅周期或额度时，仅 OAuth 向 OpenAI `chatgpt.com` 的兼容端点查询 entitlement 或 usage 摘要。同步在档案页首次进入、前台恢复、任务结束和页面可见期间每 30 秒执行，最多并发三个档案；每个档案的额度和订阅状态独立保留最近成功值。受管任务以目标档案的 `CODEX_HOME` 启动 `codex exec` 子进程。
+切换当前档案时，应用加载并更新目标档案的认证数据，原子投影到当前用户默认 `.codex/auth.json`，并写入档案专属 `CODEX_HOME`。桌面端固定使用共享原客户端状态：历史 `app_settings.desktop_workspace_mode` 中的 `fresh`、`per_profile`、`shared` 都按 `shared` 读取；启动 ChatGPT/Codex 时不传入 `CODEX_ELECTRON_USER_DATA_PATH` 或 `--user-data-dir`，从而保留原客户端本机聊天记录、记忆、设置与状态。账号切换必须由用户确认，后端先请求正常退出 ChatGPT/Codex 并等待；失败时不写入新凭据或当前档案，绝不强制结束进程。macOS 通过 LaunchServices 的 `open -n -a` 传入 `CODEX_HOME`；Windows 使用等价环境变量和参数。历史全新工作区仅保留 Relay 的 ID、所属档案与时间元数据，设置页只允许显式删除遗留本地数据。档案资料同步通过 `codex app-server` 的 `account/read` 与 `account/rateLimits/read` 读取套餐和 ChatGPT 额度窗口，并把非敏感摘要缓存到 SQLite；官方响应缺失订阅周期或额度时，仅 OAuth 向 OpenAI `chatgpt.com` 的兼容端点查询 entitlement 或 usage 摘要。同步在档案页首次进入、前台恢复、任务结束和页面可见期间每 30 秒执行，最多并发三个档案；每个档案的额度和订阅状态独立保留最近成功值。受管任务以目标档案的 `CODEX_HOME` 启动 `codex exec` 子进程。
 
 ### 6.1 冷启动阶段
 

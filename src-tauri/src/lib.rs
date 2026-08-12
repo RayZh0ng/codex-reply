@@ -1,5 +1,7 @@
+mod codex_environment;
 mod codex_gateway;
 mod codex_runtime;
+mod codex_session_history;
 mod collaboration;
 mod commands;
 mod database;
@@ -34,10 +36,13 @@ pub fn run() {
         .setup(|app| initialise(app))
         .invoke_handler(tauri::generate_handler![
             commands::dashboard_snapshot,
+            commands::gateway_performance,
+            commands::list_gateway_request_metrics,
             commands::list_profiles,
             commands::create_profile,
             commands::create_api_service_profile,
             commands::update_profile,
+            commands::update_api_service_profile,
             commands::sync_profile_account_info,
             commands::refresh_profile_quotas,
             commands::delete_profile,
@@ -63,6 +68,14 @@ pub fn run() {
             commands::trust_gateway_ca,
             commands::refresh_profile_models,
             commands::test_api_service_profile,
+            commands::test_existing_api_service_profile,
+            commands::codex_environment_status,
+            commands::install_codex_environment,
+            commands::list_codex_history,
+            commands::sync_codex_history,
+            commands::delete_codex_history,
+            commands::export_codex_history,
+            commands::import_codex_history,
             commands::codex_gateway_config_status,
             commands::enable_codex_gateway,
             commands::disable_codex_gateway,
@@ -160,6 +173,8 @@ fn initialise(app: &tauri::App) -> Result<(), Box<dyn Error>> {
         runtime,
         collaboration,
         quota_refresh_lock: tokio::sync::Mutex::new(()),
+        history_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+        history_transition_status: Arc::new(std::sync::Mutex::new(None)),
         oauth_credentials,
         json_imports: profile_import::JsonProfileImportStore::default(),
     });

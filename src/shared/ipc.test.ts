@@ -61,6 +61,24 @@ describe("relayInvoke", () => {
     );
   });
 
+  it("guides OAuth identity mismatches to reauthorize the selected profile", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    native.invoke.mockRejectedValueOnce({
+      code: "oauth_identity_mismatch",
+      message: "Codex 当前登录账号与所选 OAuth 档案不一致，请重新授权后重试",
+    });
+
+    await expect(relayInvoke("activate_api_service_profile")).rejects.toEqual(
+      new RelayError(
+        "oauth_identity_mismatch",
+        "Codex 当前登录账号与所选 OAuth 档案不一致，请重新授权后重试（错误码：oauth_identity_mismatch）请在档案页重新授权所选 OAuth 档案，然后重新切换第三方提供商；Relay 会把该登录态写入 auth.json 并重启 ChatGPT.app。",
+      ),
+    );
+  });
+
   it("preserves raw Tauri string errors instead of replacing them with a generic internal message", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,

@@ -1,11 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const GATEWAY_CODEX_CLIENT_KEY_REF_SETTING: &str = "gateway_codex_client_key_ref";
+pub const GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING: &str = "gateway_codex_direct_profile_id";
 pub const GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING: &str = "gateway_codex_oauth_profile_id";
 pub const APP_UPDATE_STABLE_ENDPOINT: &str =
     "https://github.com/RayZh0ng/codex-reply/releases/download/updater/stable.json";
 pub const APP_UPDATE_BETA_ENDPOINT: &str =
     "https://github.com/RayZh0ng/codex-reply/releases/download/updater/beta.json";
+pub const APP_UPDATE_PROGRESS_EVENT: &str = "app-update-progress";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +90,30 @@ impl AppUpdateChannel {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppUpdateProgressPhase {
+    Checking,
+    Downloading,
+    Downloaded,
+    Installing,
+    Restarting,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AppUpdateProgressEvent {
+    pub phase: AppUpdateProgressPhase,
+    pub channel: AppUpdateChannel,
+    pub version: String,
+    pub current_version: String,
+    pub downloaded_bytes: u64,
+    pub content_length: Option<u64>,
+    pub progress_percent: Option<u8>,
+    pub message: String,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AppUpdateSettings {
     pub channel: AppUpdateChannel,
@@ -141,6 +167,9 @@ pub struct MaskedProfile {
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
+    pub max_concurrency: i64,
+    pub max_queue_depth: i64,
+    pub queue_timeout_ms: i64,
     pub models: Vec<String>,
     #[serde(default)]
     pub model_mappings: Vec<GatewayModelMapping>,
@@ -149,8 +178,12 @@ pub struct MaskedProfile {
     pub credential_configured: bool,
     #[serde(default)]
     pub auth_mode: CodexAuthMode,
+    pub codex_oauth_profile_id: Option<String>,
     pub is_current: bool,
     pub account: Option<ProfileAccountSummary>,
+    pub validation_status: String,
+    pub validated_at_ms: Option<i64>,
+    pub validation_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -287,9 +320,17 @@ pub struct CreateProfileInput {
     pub models: Vec<String>,
     #[serde(default)]
     pub model_mappings: Vec<GatewayModelMapping>,
+    #[serde(default)]
+    pub codex_oauth_profile_id: Option<String>,
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
+    #[serde(default = "default_profile_max_concurrency")]
+    pub max_concurrency: i64,
+    #[serde(default = "default_profile_max_queue_depth")]
+    pub max_queue_depth: i64,
+    #[serde(default = "default_profile_queue_timeout_ms")]
+    pub queue_timeout_ms: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,15 +345,39 @@ pub struct CreateApiServiceProfileInput {
     #[serde(default)]
     pub model_mappings: Vec<GatewayModelMapping>,
     #[serde(default)]
+    pub codex_oauth_profile_id: Option<String>,
+    #[serde(default)]
     pub in_pool: bool,
     #[serde(default)]
     pub priority: i64,
     #[serde(default = "default_profile_weight")]
     pub weight: i64,
+    #[serde(default = "default_profile_max_concurrency")]
+    pub max_concurrency: i64,
+    #[serde(default = "default_profile_max_queue_depth")]
+    pub max_queue_depth: i64,
+    #[serde(default = "default_profile_queue_timeout_ms")]
+    pub queue_timeout_ms: i64,
 }
 
 fn default_profile_weight() -> i64 {
     1
+}
+
+pub const DEFAULT_PROFILE_MAX_CONCURRENCY: i64 = 4;
+pub const DEFAULT_PROFILE_MAX_QUEUE_DEPTH: i64 = 8;
+pub const DEFAULT_PROFILE_QUEUE_TIMEOUT_MS: i64 = 15_000;
+
+fn default_profile_max_concurrency() -> i64 {
+    DEFAULT_PROFILE_MAX_CONCURRENCY
+}
+
+fn default_profile_max_queue_depth() -> i64 {
+    DEFAULT_PROFILE_MAX_QUEUE_DEPTH
+}
+
+fn default_profile_queue_timeout_ms() -> i64 {
+    DEFAULT_PROFILE_QUEUE_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -334,18 +399,118 @@ pub struct ApiServiceTestReport {
     pub models: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentReport {
+    pub platform: String,
+    pub codex_home: Option<String>,
+    pub can_install: bool,
+    pub message: String,
+    pub last_checked_at_ms: i64,
+    pub summary: CodexEnvironmentSummary,
+    pub checks: Vec<CodexEnvironmentCheck>,
+    pub install_steps: Vec<CodexEnvironmentInstallStep>,
+    pub manual_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentSummary {
+    pub status: String,
+    pub ok_count: usize,
+    pub warning_count: usize,
+    pub missing_count: usize,
+    pub failed_count: usize,
+    pub fixable_count: usize,
+    pub health_percent: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentCheck {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+    pub command: Option<String>,
+    pub description: Option<String>,
+    pub next_action: Option<String>,
+    pub automatic: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentInstallStep {
+    pub id: String,
+    pub label: String,
+    pub available: bool,
+    pub command: Option<String>,
+    pub requires_privilege: bool,
+    pub next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallCodexEnvironmentInput {
+    pub confirmed: bool,
+    #[serde(default)]
+    pub steps: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentInstallReport {
+    pub status: String,
+    pub message: String,
+    pub logs: Vec<CodexEnvironmentInstallLog>,
+    pub environment: CodexEnvironmentReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexEnvironmentInstallLog {
+    pub step_id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+    pub command: Option<String>,
+    pub next_action: Option<String>,
+}
+
+fn deserialize_present_optional_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateProfileInput {
     pub id: String,
     pub alias: String,
+    #[serde(default)]
+    pub provider: Option<GatewayProvider>,
+    #[serde(default)]
+    pub wire_api: Option<GatewayWireApi>,
+    #[serde(default)]
+    pub base_url: Option<String>,
     pub enabled: bool,
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
+    #[serde(default)]
+    pub max_queue_depth: Option<i64>,
+    #[serde(default)]
+    pub queue_timeout_ms: Option<i64>,
     pub models: Vec<String>,
     #[serde(default)]
     pub model_mappings: Option<Vec<GatewayModelMapping>>,
+    #[serde(default, deserialize_with = "deserialize_present_optional_string")]
+    pub codex_oauth_profile_id: Option<Option<String>>,
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiServiceProfileUpdateResult {
+    pub profile: MaskedProfile,
+    pub codex_config: Option<GatewayCodexConfigStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -364,13 +529,40 @@ pub struct CollaborationSummary {
     pub active_sessions: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub total_requests: i64,
     pub successful_requests: i64,
     pub failed_requests: i64,
     pub average_latency_ms: Option<i64>,
     pub estimated_tokens: i64,
+    pub window_minutes: i64,
+    pub window_requests: i64,
+    pub window_success_rate: Option<f64>,
+    pub requests_per_minute: f64,
+    pub latency_p50_ms: Option<i64>,
+    pub latency_p95_ms: Option<i64>,
+    pub latency_p99_ms: Option<i64>,
+    pub ttfb_p50_ms: Option<i64>,
+    pub ttfb_p95_ms: Option<i64>,
+    pub ttfb_p99_ms: Option<i64>,
+    pub request_bytes: i64,
+    pub response_bytes: i64,
+    pub retry_count: i64,
+    pub active_requests: i64,
+    pub queued_requests: i64,
+    pub telemetry_dropped: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GatewayDirectRouteHealth {
+    pub status: String,
+    pub profile_id: String,
+    pub profile_alias: String,
+    pub route_mode: String,
+    pub oauth_ready: bool,
+    pub credential_ready: bool,
+    pub model_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +575,10 @@ pub struct GatewayStatus {
     pub cidrs: Vec<String>,
     pub available_profiles: usize,
     pub cooling_profiles: usize,
+    pub pool_status: String,
+    pub direct_route: Option<GatewayDirectRouteHealth>,
+    pub active_requests: usize,
+    pub queued_requests: usize,
     pub client_key_count: usize,
     pub certificate_ready: bool,
     pub service_url: String,
@@ -407,10 +603,75 @@ pub struct GatewayHealthSummary {
     pub service_url: String,
     pub available_profiles: usize,
     pub cooling_profiles: usize,
+    pub pool_status: String,
+    pub direct_route: Option<GatewayDirectRouteHealth>,
+    pub active_requests: usize,
+    pub queued_requests: usize,
     pub certificate_ready: bool,
     pub client_key_count: usize,
     pub upstream_last_error: Option<String>,
     pub providers: Vec<GatewayHealthProviderSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayPerformanceInput {
+    #[serde(default = "default_gateway_performance_window_minutes")]
+    pub window_minutes: i64,
+}
+
+fn default_gateway_performance_window_minutes() -> i64 {
+    60
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListGatewayRequestMetricsInput {
+    #[serde(default = "default_gateway_request_metric_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub cursor: Option<i64>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+fn default_gateway_request_metric_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayRequestMetricSummary {
+    pub sequence: i64,
+    pub request_id: String,
+    pub started_at_ms: i64,
+    pub route: String,
+    pub provider: String,
+    pub profile_id: Option<String>,
+    pub auth_mode: String,
+    pub stream: bool,
+    pub auth_latency_ms: i64,
+    pub queue_latency_ms: i64,
+    pub ttfb_ms: Option<i64>,
+    pub total_latency_ms: i64,
+    pub request_bytes: i64,
+    pub response_bytes: i64,
+    pub http_status: u16,
+    pub outcome: String,
+    pub error_category: Option<String>,
+    pub upstream_attempts: i64,
+    pub retry_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub upstream_response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayRequestMetricPage {
+    pub items: Vec<GatewayRequestMetricSummary>,
+    pub next_cursor: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,15 +684,20 @@ pub struct GatewayNetworkAddress {
 #[derive(Debug, Clone, Serialize)]
 pub struct GatewayCodexConfigStatus {
     pub enabled: bool,
+    pub mode: String,
     pub config_path: String,
     pub service_url: Option<String>,
     pub message: String,
     pub auth_status: String,
     pub needs_repair: bool,
+    pub direct_profile_id: Option<String>,
+    pub direct_profile_alias: Option<String>,
     pub oauth_profile_id: Option<String>,
     pub oauth_profile_alias: Option<String>,
     pub oauth_profile_available: bool,
     pub oauth_profile_options: Vec<GatewayOAuthProfileOption>,
+    pub history_sync: Option<CodexHistorySyncReport>,
+    pub history_sync_status: Option<CodexHistoryTransitionStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -757,6 +1023,170 @@ pub struct CodexSessionEvent {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryReport {
+    pub scanned_at_ms: i64,
+    pub limit: usize,
+    pub offset: usize,
+    pub total_sessions: usize,
+    pub selected_project_id: Option<String>,
+    pub projects: Vec<CodexHistoryProjectSummary>,
+    pub homes: Vec<CodexHistoryHomeSummary>,
+    pub sessions: Vec<CodexHistorySessionSummary>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListCodexHistoryInput {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryProjectSummary {
+    pub id: String,
+    pub name: String,
+    pub cwd: Option<String>,
+    pub session_count: usize,
+    pub consistent_count: usize,
+    pub missing_count: usize,
+    pub conflict_count: usize,
+    pub needs_repair_count: usize,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryHomeSummary {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub path: String,
+    pub sync_target: bool,
+    pub session_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistorySessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub updated_at_ms: i64,
+    pub status: String,
+    pub source_count: usize,
+    pub missing_target_count: usize,
+    pub divergent_source_count: usize,
+    pub sources: Vec<CodexHistorySourceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistorySourceSummary {
+    pub home_id: String,
+    pub home_label: String,
+    pub home_kind: String,
+    pub rollout_path: String,
+    pub archived: bool,
+    pub updated_at_ms: i64,
+    pub event_count: usize,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistorySyncReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub homes_scanned: usize,
+    pub sessions_seen: usize,
+    pub sessions_synced: usize,
+    pub files_written: usize,
+    pub files_backed_up: usize,
+    pub metadata_rebuilt: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexHistoryTransitionStatus {
+    pub status: String,
+    pub message: String,
+    pub queued_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncCodexHistoryInput {
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteCodexHistoryInput {
+    pub scope: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportCodexHistoryInput {
+    pub scope: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    pub project_id: Option<String>,
+    pub destination_path: String,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportCodexHistoryInput {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryMutationReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub sessions_affected: usize,
+    pub files_removed: usize,
+    pub files_backed_up: usize,
+    pub metadata_updated: usize,
+    pub metadata_rebuilt: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryExportReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub sessions_exported: usize,
+    pub files_exported: usize,
+    pub destination_path: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexHistoryImportReport {
+    pub status: String,
+    pub message: String,
+    pub scanned_at_ms: i64,
+    pub sessions_imported: usize,
+    pub files_written: usize,
+    pub files_backed_up: usize,
+    pub metadata_rebuilt: usize,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListCodexSessionsInput {
     pub binding_id: Option<String>,
@@ -808,6 +1238,8 @@ pub struct CurrentProfileActivation {
     pub attempt_id: Option<String>,
     pub status: String,
     pub message: String,
+    pub history_sync: Option<CodexHistorySyncReport>,
+    pub history_sync_status: Option<CodexHistoryTransitionStatus>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -880,7 +1312,8 @@ pub struct ManagedTaskStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppUpdateChannel, GatewayProvider, APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT,
+        AppUpdateChannel, GatewayProvider, UpdateProfileInput, APP_UPDATE_BETA_ENDPOINT,
+        APP_UPDATE_STABLE_ENDPOINT,
     };
 
     #[test]
@@ -897,6 +1330,42 @@ mod tests {
             serde_json::to_string(&GatewayProvider::OpenAiCompatible).unwrap(),
             "\"openai_compatible\""
         );
+    }
+
+    #[test]
+    fn update_profile_input_distinguishes_omitted_selected_and_cleared_oauth_profile() {
+        let base = serde_json::json!({
+            "id": "profile-1",
+            "alias": "Profile 1",
+            "enabled": true,
+            "in_pool": false,
+            "priority": 0,
+            "weight": 1,
+            "models": [],
+            "api_key": null
+        });
+
+        let omitted: UpdateProfileInput = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.codex_oauth_profile_id, None);
+
+        let mut selected_value = base.clone();
+        selected_value.as_object_mut().unwrap().insert(
+            "codex_oauth_profile_id".to_string(),
+            serde_json::json!("oauth-profile-1"),
+        );
+        let selected: UpdateProfileInput = serde_json::from_value(selected_value).unwrap();
+        assert_eq!(
+            selected.codex_oauth_profile_id,
+            Some(Some("oauth-profile-1".to_string()))
+        );
+
+        let mut cleared_value = base;
+        cleared_value.as_object_mut().unwrap().insert(
+            "codex_oauth_profile_id".to_string(),
+            serde_json::Value::Null,
+        );
+        let cleared: UpdateProfileInput = serde_json::from_value(cleared_value).unwrap();
+        assert_eq!(cleared.codex_oauth_profile_id, Some(None));
     }
 
     #[test]

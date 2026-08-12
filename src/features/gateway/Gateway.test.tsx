@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
-import type { GatewayStatus } from "../../shared/ipc";
+import type { GatewayCodexConfigStatus, GatewayStatus } from "../../shared/ipc";
 import { api } from "../../shared/ipc";
 import { Gateway } from "./Gateway";
 
@@ -15,15 +15,19 @@ vi.mock("../../shared/ipc", () => ({
     listClientKeys: vi.fn().mockResolvedValue([]),
     codexGatewayConfigStatus: vi.fn().mockResolvedValue({
       enabled: false,
+      mode: "official",
       config_path: "/Users/test/.codex/config.toml",
       service_url: null,
       message: "Codex 尚未切换到 Relay 网关。",
       auth_status: "missing",
       needs_repair: false,
+      direct_profile_id: null,
+      direct_profile_alias: null,
       oauth_profile_id: null,
       oauth_profile_alias: null,
       oauth_profile_available: false,
       oauth_profile_options: [],
+      history_sync: null,
     }),
     createClientKey: vi.fn(),
     revealClientKey: vi.fn(),
@@ -34,6 +38,10 @@ vi.mock("../../shared/ipc", () => ({
     enableCodexGateway: vi.fn(),
     disableCodexGateway: vi.fn(),
     setCodexGatewayOAuthProfile: vi.fn(),
+    listGatewayRequestMetrics: vi.fn().mockResolvedValue({
+      items: [],
+      next_cursor: null,
+    }),
   },
 }));
 
@@ -62,6 +70,7 @@ const gateway: GatewayStatus = {
 function renderGateway(overrides: Partial<GatewayStatus> = {}) {
   const onNavigateProfiles = vi.fn();
   const onRefresh = vi.fn().mockResolvedValue(undefined);
+  const onNotice = vi.fn();
   render(
     <Gateway
       gateway={{ ...gateway, ...overrides }}
@@ -69,12 +78,12 @@ function renderGateway(overrides: Partial<GatewayStatus> = {}) {
       onSave={vi.fn().mockResolvedValue(undefined)}
       onStart={vi.fn().mockResolvedValue(undefined)}
       onStop={vi.fn().mockResolvedValue(undefined)}
-      onNotice={vi.fn()}
+      onNotice={onNotice}
       onNavigateProfiles={onNavigateProfiles}
       onRefresh={onRefresh}
     />,
   );
-  return { onNavigateProfiles, onRefresh };
+  return { onNavigateProfiles, onRefresh, onNotice };
 }
 
 describe("Gateway", () => {
@@ -104,6 +113,61 @@ describe("Gateway", () => {
     expect(
       screen.queryByRole("button", { name: "去档案加入网关" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows direct route health and paged redacted request metrics", async () => {
+    vi.mocked(api.listGatewayRequestMetrics).mockResolvedValueOnce({
+      items: [
+        {
+          sequence: 8,
+          request_id: "request-redacted",
+          started_at_ms: 1_700_000_000_000,
+          route: "v1/responses",
+          provider: "openai_compatible",
+          profile_id: "api-direct",
+          auth_mode: "oauth",
+          stream: true,
+          auth_latency_ms: 1,
+          queue_latency_ms: 2,
+          ttfb_ms: 35,
+          total_latency_ms: 140,
+          request_bytes: 1024,
+          response_bytes: 2048,
+          http_status: 200,
+          outcome: "success",
+          error_category: null,
+          upstream_attempts: 1,
+          retry_count: 0,
+          input_tokens: 10,
+          output_tokens: 5,
+          total_tokens: 15,
+          upstream_response_id: null,
+        },
+      ],
+      next_cursor: 8,
+    });
+
+    renderGateway({
+      pool_status: "unavailable",
+      direct_route: {
+        status: "ok",
+        profile_id: "api-direct",
+        profile_alias: "Zeron",
+        route_mode: "relay_bridge",
+        oauth_ready: true,
+        credential_ready: true,
+        model_count: 1,
+      },
+      active_requests: 2,
+      queued_requests: 1,
+    });
+
+    expect(screen.queryByText("当前没有网关账号成员")).not.toBeInTheDocument();
+    expect(screen.getByText("Direct ok · Zeron")).toBeInTheDocument();
+    expect(screen.getByText("2 活动 · 1 排队")).toBeInTheDocument();
+    expect(await screen.findByText("v1/responses")).toBeInTheDocument();
+    expect(screen.getByText("35 ms / 140 ms")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "加载更多" })).toBeInTheDocument();
   });
 
   it("marks codex-managed keys and hides their revoke action", async () => {
@@ -169,11 +233,14 @@ describe("Gateway", () => {
   it("uses backend oauth profile options and unavailable reasons", async () => {
     vi.mocked(api.codexGatewayConfigStatus).mockResolvedValueOnce({
       enabled: true,
+      mode: "relay_gateway",
       message: "Codex 已切换到 Relay 网关。",
       auth_status: "ok",
       needs_repair: false,
       config_path: "/Users/test/.codex/config.toml",
       service_url: "https://10.12.14.248:53765",
+      direct_profile_id: null,
+      direct_profile_alias: null,
       oauth_profile_id: "oauth-work",
       oauth_profile_alias: "工作 OAuth",
       oauth_profile_available: true,
@@ -197,11 +264,12 @@ describe("Gateway", () => {
           reason: "JSON 导入账号用于反代账号池，不能用于登录态解锁",
         },
       ],
+      history_sync: null,
     });
 
     renderGateway({ available_profiles: 1 });
 
-    expect(await screen.findByText("当前登录档案：工作 OAuth")).toBeInTheDocument();
+    expect(await screen.findByText(/当前登录档案：工作 OAuth/)).toBeInTheDocument();
     const trigger = screen.getByRole("combobox", { name: "OAuth 登录档案" });
     expect(trigger).toHaveTextContent("工作 OAuth");
 
@@ -216,6 +284,54 @@ describe("Gateway", () => {
     expect(screen.getByRole("option", { name: /JSON 导入账号/ })).toHaveAttribute(
       "data-disabled",
     );
+  });
+
+  it("reads and saves the direct profile OAuth binding with mode-specific feedback", async () => {
+    const directStatus = {
+      enabled: true,
+      mode: "third_party",
+      message: "Codex 已切换到第三方模型提供商直连。",
+      auth_status: "ok",
+      needs_repair: false,
+      config_path: "/Users/test/.codex/config.toml",
+      service_url: "https://api.example.com/v1",
+      direct_profile_id: "api-direct",
+      direct_profile_alias: "第三方供应商",
+      oauth_profile_id: "oauth-a",
+      oauth_profile_alias: "账号 A",
+      oauth_profile_available: true,
+      oauth_profile_options: [
+        { id: "oauth-a", alias: "账号 A", available: true, reason: null },
+        { id: "oauth-b", alias: "账号 B", available: true, reason: null },
+      ],
+      history_sync: null,
+    } satisfies GatewayCodexConfigStatus;
+    vi.mocked(api.codexGatewayConfigStatus).mockResolvedValueOnce(directStatus);
+    vi.mocked(api.setCodexGatewayOAuthProfile).mockResolvedValue({
+      ...directStatus,
+      oauth_profile_id: "oauth-b",
+      oauth_profile_alias: "账号 B",
+      message:
+        "Codex 已切换到第三方模型提供商“第三方供应商”；OAuth 已应用，模型请求通过 codex_relay_direct 经本机 Relay 固定转发到该提供商。已同步会话并重启 ChatGPT.app。",
+    });
+    const { onNotice } = renderGateway({ available_profiles: 1 });
+
+    const trigger = await screen.findByRole("combobox", { name: "OAuth 登录档案" });
+    expect(trigger).toHaveTextContent("账号 A");
+    expect(
+      screen.getByText(/codex_relay_direct 经本机 Relay 固定转发/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/OAuth Token 不会发送给第三方/)).toBeInTheDocument();
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("option", { name: "账号 B" }));
+
+    await waitFor(() =>
+      expect(api.setCodexGatewayOAuthProfile).toHaveBeenCalledWith("oauth-b"),
+    );
+    expect(onNotice).toHaveBeenCalledWith(
+      "Codex 已切换到第三方模型提供商“第三方供应商”；OAuth 已应用，模型请求通过 codex_relay_direct 经本机 Relay 固定转发到该提供商。已同步会话并重启 ChatGPT.app。",
+    );
+    expect(trigger).toHaveTextContent("账号 B");
   });
 
   it("reveals and rotates user-managed client keys", async () => {
@@ -291,34 +407,73 @@ describe("Gateway", () => {
   it("repairs codex key and refreshes gateway state", async () => {
     vi.mocked(api.codexGatewayConfigStatus).mockResolvedValue({
       enabled: true,
+      mode: "relay_gateway",
       message: "Codex Relay 网关 Client Key 已失效。",
       auth_status: "invalid",
       needs_repair: true,
       config_path: "/Users/test/.codex/config.toml",
       service_url: null,
+      direct_profile_id: null,
+      direct_profile_alias: null,
       oauth_profile_id: null,
       oauth_profile_alias: null,
       oauth_profile_available: false,
       oauth_profile_options: [],
+      history_sync: null,
     });
     vi.mocked(api.enableCodexGateway).mockResolvedValue({
       enabled: true,
+      mode: "relay_gateway",
       message: "Codex 已切换到 Relay 网关。",
       auth_status: "ok",
       needs_repair: false,
       config_path: "/Users/test/.codex/config.toml",
       service_url: "https://10.12.14.248:53765",
+      direct_profile_id: null,
+      direct_profile_alias: null,
       oauth_profile_id: null,
       oauth_profile_alias: null,
       oauth_profile_available: false,
       oauth_profile_options: [],
+      history_sync: null,
     });
     const { onRefresh } = renderGateway({ available_profiles: 1 });
 
-    fireEvent.click(await screen.findByRole("button", { name: "修复 Codex Key" }));
+    fireEvent.click(await screen.findByRole("button", { name: "修复 Codex 配置" }));
 
     await waitFor(() => expect(api.enableCodexGateway).toHaveBeenCalledOnce());
     await waitFor(() => expect(onRefresh).toHaveBeenCalledOnce());
     expect(api.listClientKeys).toHaveBeenCalledTimes(2);
+  });
+
+  it("allows Codex gateway switching before the gateway has been started", async () => {
+    vi.mocked(api.enableCodexGateway).mockResolvedValue({
+      enabled: true,
+      mode: "relay_gateway",
+      message: "Codex 已切换到 Relay 网关，并已复用原客户端状态。",
+      auth_status: "ok",
+      needs_repair: false,
+      config_path: "/Users/test/.codex/config.toml",
+      service_url: "https://10.12.14.248:53765",
+      direct_profile_id: null,
+      direct_profile_alias: null,
+      oauth_profile_id: null,
+      oauth_profile_alias: null,
+      oauth_profile_available: false,
+      oauth_profile_options: [],
+      history_sync: null,
+    });
+    const { onRefresh } = renderGateway({
+      running: false,
+      certificate_ready: false,
+      available_profiles: 1,
+    });
+
+    const button = await screen.findByRole("button", { name: "设为 Codex 网关" });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+
+    await waitFor(() => expect(api.enableCodexGateway).toHaveBeenCalledOnce());
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledOnce());
   });
 });

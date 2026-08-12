@@ -12,10 +12,13 @@ use crate::{
         AppUpdateChannel, AppUpdateSettings, CodexAuthMode, CodexSessionEvent, CodexSessionSummary,
         CollaborationContextSummary, CollaborationProjectBinding, CollaborationProvider,
         CollaborationSummary, DesktopWorkspaceHistoryItem, DesktopWorkspaceMode,
-        FeishuProjectBinding, GatewayModelMapping, GatewayNetworkAddress, GatewayProvider,
-        GatewayStatus, GatewayWireApi, MaskedClientKey, MaskedCollaborationBot, MaskedFeishuBot,
-        MaskedProfile, MetricsSnapshot, ProfileAccountSummary, ProfileKind, ProfileQuota,
-        ProfileSubscription, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+        FeishuProjectBinding, GatewayDirectRouteHealth, GatewayModelMapping, GatewayNetworkAddress,
+        GatewayPerformanceInput, GatewayProvider, GatewayRequestMetricPage,
+        GatewayRequestMetricSummary, GatewayStatus, GatewayWireApi, ListGatewayRequestMetricsInput,
+        MaskedClientKey, MaskedCollaborationBot, MaskedFeishuBot, MaskedProfile, MetricsSnapshot,
+        ProfileAccountSummary, ProfileKind, ProfileQuota, ProfileSubscription,
+        GATEWAY_CODEX_CLIENT_KEY_REF_SETTING, GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
+        GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
     },
     error::{AppError, AppResult},
 };
@@ -101,6 +104,7 @@ impl Repository {
                       weight INTEGER NOT NULL,
                       models_json TEXT NOT NULL,
                       model_mappings_json TEXT NOT NULL DEFAULT '[]',
+                      codex_oauth_profile_id TEXT,
                       health TEXT NOT NULL,
                       cooldown_until_ms INTEGER,
                       secret_ref TEXT,
@@ -112,7 +116,10 @@ impl Repository {
                       account_id TEXT,
                       account_updated_at_ms INTEGER,
                       account_quota_json TEXT,
-                      account_subscription_json TEXT
+                      account_subscription_json TEXT,
+                      validation_status TEXT NOT NULL DEFAULT 'unknown',
+                      validated_at_ms INTEGER,
+                      validation_message TEXT
                     );
                     CREATE TABLE IF NOT EXISTS app_settings (
                       key TEXT PRIMARY KEY,
@@ -296,6 +303,20 @@ impl Repository {
                       estimated_tokens INTEGER NOT NULL DEFAULT 0
                     );
                     INSERT OR IGNORE INTO metrics(id) VALUES (1);
+                    CREATE TABLE IF NOT EXISTS gateway_request_metrics (
+                      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                      request_id TEXT NOT NULL UNIQUE,
+                      started_at_ms INTEGER NOT NULL,
+                      route TEXT NOT NULL, provider TEXT NOT NULL, profile_id TEXT, auth_mode TEXT NOT NULL,
+                      stream INTEGER NOT NULL, auth_latency_ms INTEGER NOT NULL, queue_latency_ms INTEGER NOT NULL,
+                      ttfb_ms INTEGER, total_latency_ms INTEGER NOT NULL, request_bytes INTEGER NOT NULL,
+                      response_bytes INTEGER NOT NULL, http_status INTEGER NOT NULL, outcome TEXT NOT NULL,
+                      error_category TEXT, upstream_attempts INTEGER NOT NULL, retry_count INTEGER NOT NULL,
+                      input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
+                      upstream_response_id TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_gateway_request_metrics_started ON gateway_request_metrics(started_at_ms DESC);
+                    CREATE INDEX IF NOT EXISTS idx_gateway_request_metrics_profile_started ON gateway_request_metrics(profile_id, started_at_ms DESC);
                     ",
                 )
                 .map_err(|_| AppError::Internal)?;
@@ -323,6 +344,13 @@ impl Repository {
                 ("provider", "TEXT NOT NULL DEFAULT 'openai_compatible'"),
                 ("wire_api", "TEXT NOT NULL DEFAULT 'responses'"),
                 ("model_mappings_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("max_concurrency", "INTEGER NOT NULL DEFAULT 4"),
+                ("max_queue_depth", "INTEGER NOT NULL DEFAULT 8"),
+                ("queue_timeout_ms", "INTEGER NOT NULL DEFAULT 15000"),
+                ("codex_oauth_profile_id", "TEXT"),
+                ("validation_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("validated_at_ms", "INTEGER"),
+                ("validation_message", "TEXT"),
             ] {
                 if !profile_columns.iter().any(|column| column == name) {
                     connection
@@ -401,8 +429,8 @@ impl Repository {
         self.with_connection(|connection| {
             connection
                 .execute(
-                    "INSERT INTO profiles(id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                    "INSERT INTO profiles(id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, max_concurrency, max_queue_depth, queue_timeout_ms, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json, validation_status, validated_at_ms, validation_message)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
@@ -414,8 +442,12 @@ impl Repository {
                         stored.profile.in_pool,
                         stored.profile.priority,
                         stored.profile.weight,
+                        stored.profile.max_concurrency,
+                        stored.profile.max_queue_depth,
+                        stored.profile.queue_timeout_ms,
                         serde_json::to_string(&stored.profile.models).map_err(|_| AppError::Internal)?,
                         serde_json::to_string(&stored.profile.model_mappings).map_err(|_| AppError::Internal)?,
+                        stored.profile.codex_oauth_profile_id,
                         stored.profile.health,
                         stored.profile.cooldown_until_ms,
                         stored.secret_ref,
@@ -428,6 +460,9 @@ impl Repository {
                         stored.profile.account.as_ref().map(|account| account.updated_at_ms),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.quota).ok()),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.subscription).ok()),
+                        stored.profile.validation_status,
+                        stored.profile.validated_at_ms,
+                        stored.profile.validation_message,
                     ],
                 )
                 .map_err(|error| match error {
@@ -449,21 +484,21 @@ impl Repository {
                 .optional()
                 .map_err(|_| AppError::Internal)?;
             let mut statement = connection
-                .prepare("SELECT id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, models_json, model_mappings_json, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json FROM profiles ORDER BY priority, alias")
+                .prepare("SELECT id, alias, kind, base_url, provider, wire_api, enabled, in_pool, priority, weight, max_concurrency, max_queue_depth, queue_timeout_ms, models_json, model_mappings_json, codex_oauth_profile_id, health, cooldown_until_ms, secret_ref, credential_configured, auth_mode, credential_fingerprint, account_display_name, account_email, account_id, account_updated_at_ms, account_quota_json, account_subscription_json, validation_status, validated_at_ms, validation_message FROM profiles ORDER BY priority, alias")
                 .map_err(|_| AppError::Internal)?;
             let rows = statement
                 .query_map([], |row| {
                     let id: String = row.get(0)?;
                     let kind: String = row.get(2)?;
-                    let models_json: String = row.get(10)?;
+                    let models_json: String = row.get(13)?;
                     let models: Vec<String> = serde_json::from_str(&models_json).unwrap_or_default();
-                    let mappings_json: String = row.get(11)?;
+                    let mappings_json: String = row.get(14)?;
                     let parsed_mappings =
                         serde_json::from_str(&mappings_json).unwrap_or_default();
                     let model_mappings = stored_or_identity_model_mappings(&models, parsed_mappings);
                     Ok(StoredProfile {
-                        secret_ref: row.get(14)?,
-                        credential_fingerprint: row.get(17)?,
+                        secret_ref: row.get(18)?,
+                        credential_fingerprint: row.get(21)?,
                         profile: MaskedProfile {
                             id: id.clone(),
                             alias: row.get(1)?,
@@ -475,22 +510,29 @@ impl Repository {
                             in_pool: row.get(7)?,
                             priority: row.get(8)?,
                             weight: row.get(9)?,
+                            max_concurrency: row.get(10)?,
+                            max_queue_depth: row.get(11)?,
+                            queue_timeout_ms: row.get(12)?,
                             models,
                             model_mappings,
-                            health: row.get(12)?,
-                            cooldown_until_ms: row.get(13)?,
-                            credential_configured: row.get(15)?,
-                            auth_mode: parse_auth_mode(&row.get::<_, String>(16)?)
+                            codex_oauth_profile_id: row.get(15)?,
+                            health: row.get(16)?,
+                            cooldown_until_ms: row.get(17)?,
+                            credential_configured: row.get(19)?,
+                            auth_mode: parse_auth_mode(&row.get::<_, String>(20)?)
                                 .unwrap_or_default(),
                             is_current: current_id.as_deref() == Some(id.as_str()),
                             account: account_summary(
-                                row.get(18)?,
-                                row.get(19)?,
-                                row.get(20)?,
-                                row.get(21)?,
                                 row.get(22)?,
                                 row.get(23)?,
+                                row.get(24)?,
+                                row.get(25)?,
+                                row.get(26)?,
+                                row.get(27)?,
                             ),
+                            validation_status: row.get(28)?,
+                            validated_at_ms: row.get(29)?,
+                            validation_message: row.get(30)?,
                         },
                     })
                 })
@@ -510,7 +552,7 @@ impl Repository {
         self.with_connection(|connection| {
             let updated = connection
                 .execute(
-                    "UPDATE profiles SET alias = ?2, provider = ?3, wire_api = ?4, enabled = ?5, in_pool = ?6, priority = ?7, weight = ?8, models_json = ?9, model_mappings_json = ?10, secret_ref = ?11, credential_configured = ?12, auth_mode = ?13, credential_fingerprint = ?14, account_display_name = ?15, account_email = ?16, account_id = ?17, account_updated_at_ms = ?18, account_quota_json = ?19, account_subscription_json = ?20 WHERE id = ?1",
+                    "UPDATE profiles SET alias = ?2, provider = ?3, wire_api = ?4, enabled = ?5, in_pool = ?6, priority = ?7, weight = ?8, max_concurrency = ?9, max_queue_depth = ?10, queue_timeout_ms = ?11, models_json = ?12, model_mappings_json = ?13, codex_oauth_profile_id = ?14, secret_ref = ?15, credential_configured = ?16, auth_mode = ?17, credential_fingerprint = ?18, account_display_name = ?19, account_email = ?20, account_id = ?21, account_updated_at_ms = ?22, account_quota_json = ?23, account_subscription_json = ?24, health = ?25, cooldown_until_ms = ?26, validation_status = ?27, validated_at_ms = ?28, validation_message = ?29 WHERE id = ?1",
                     params![
                         stored.profile.id,
                         stored.profile.alias,
@@ -520,8 +562,12 @@ impl Repository {
                         stored.profile.in_pool,
                         stored.profile.priority,
                         stored.profile.weight,
+                        stored.profile.max_concurrency,
+                        stored.profile.max_queue_depth,
+                        stored.profile.queue_timeout_ms,
                         serde_json::to_string(&stored.profile.models).map_err(|_| AppError::Internal)?,
                         serde_json::to_string(&stored.profile.model_mappings).map_err(|_| AppError::Internal)?,
+                        stored.profile.codex_oauth_profile_id,
                         stored.secret_ref,
                         stored.profile.credential_configured,
                         auth_mode_name(&stored.profile.auth_mode),
@@ -532,6 +578,11 @@ impl Repository {
                         stored.profile.account.as_ref().map(|account| account.updated_at_ms),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.quota).ok()),
                         stored.profile.account.as_ref().and_then(|account| serde_json::to_string(&account.subscription).ok()),
+                        stored.profile.health,
+                        stored.profile.cooldown_until_ms,
+                        stored.profile.validation_status,
+                        stored.profile.validated_at_ms,
+                        stored.profile.validation_message,
                     ],
                 )
                 .map_err(|_| AppError::Internal)?;
@@ -552,6 +603,23 @@ impl Repository {
                     params![id],
                 )
                 .map_err(|_| AppError::Internal)?;
+            connection
+                .execute(
+                    "UPDATE profiles SET codex_oauth_profile_id = NULL WHERE codex_oauth_profile_id = ?1",
+                    params![id],
+                )
+                .map_err(|_| AppError::Internal)?;
+            for setting_key in [
+                GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
+                GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING,
+            ] {
+                connection
+                    .execute(
+                        "DELETE FROM app_settings WHERE key = ?1 AND value = ?2",
+                        params![setting_key, id],
+                    )
+                    .map_err(|_| AppError::Internal)?;
+            }
             Ok(stored.secret_ref)
         })
     }
@@ -622,20 +690,15 @@ impl Repository {
 
     pub fn desktop_workspace_mode(&self) -> AppResult<DesktopWorkspaceMode> {
         match self.setting("desktop_workspace_mode")?.as_deref() {
-            None | Some("per_profile") => Ok(DesktopWorkspaceMode::PerProfile),
-            Some("fresh") => Ok(DesktopWorkspaceMode::Fresh),
-            Some("shared") => Ok(DesktopWorkspaceMode::Shared),
+            None | Some("fresh") | Some("per_profile") | Some("shared") => {
+                Ok(DesktopWorkspaceMode::Shared)
+            }
             Some(_) => Err(AppError::ValidationFailed),
         }
     }
 
-    pub fn set_desktop_workspace_mode(&self, mode: &DesktopWorkspaceMode) -> AppResult<()> {
-        let value = match mode {
-            DesktopWorkspaceMode::Fresh => "fresh",
-            DesktopWorkspaceMode::PerProfile => "per_profile",
-            DesktopWorkspaceMode::Shared => "shared",
-        };
-        self.set_setting("desktop_workspace_mode", value)
+    pub fn set_desktop_workspace_mode(&self, _mode: &DesktopWorkspaceMode) -> AppResult<()> {
+        self.set_setting("desktop_workspace_mode", "shared")
     }
 
     pub fn app_update_settings(&self) -> AppResult<AppUpdateSettings> {
@@ -681,6 +744,7 @@ impl Repository {
         })
     }
 
+    #[cfg(test)]
     pub fn create_desktop_workspace(
         &self,
         id: &str,
@@ -803,6 +867,57 @@ impl Repository {
                 )
                 .optional()
                 .map_err(|_| AppError::Internal)?;
+            let available_profiles = profiles.iter().filter(|p| {
+                let profile = &p.profile;
+                (profile.kind == ProfileKind::ApiKey
+                    || (profile.kind == ProfileKind::CodexOauth
+                        && profile.auth_mode == CodexAuthMode::OAuth))
+                    && profile.enabled
+                    && profile.in_pool
+                    && profile.credential_configured
+                    && !matches!(profile.health.as_str(), "unhealthy" | "reauthorization_required")
+                    && profile.validation_status != "invalid"
+                    && profile.cooldown_until_ms.is_none_or(|until| until <= now_ms)
+            }).count();
+            let direct_profile_id = connection
+                .query_row(
+                    "SELECT value FROM app_settings WHERE key = ?1",
+                    params![GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| AppError::Internal)?;
+            let direct_route = direct_profile_id.and_then(|profile_id| {
+                profiles.iter().find(|stored| stored.profile.id == profile_id).map(|stored| {
+                    let profile = &stored.profile;
+                    let credential_ready = profile.enabled
+                        && profile.credential_configured
+                        && stored.secret_ref.is_some()
+                        && profile.validation_status != "invalid"
+                        && !matches!(profile.health.as_str(), "unhealthy" | "reauthorization_required");
+                    let oauth_ready = profile.codex_oauth_profile_id.as_ref().is_some_and(|oauth_id| {
+                        profiles.iter().any(|oauth| {
+                            oauth.profile.id == *oauth_id
+                                && oauth.profile.kind == ProfileKind::CodexOauth
+                                && oauth.profile.auth_mode == CodexAuthMode::OAuth
+                                && oauth.credential_fingerprint.is_none()
+                                && oauth.profile.enabled
+                                && oauth.profile.credential_configured
+                                && oauth.profile.validation_status != "invalid"
+                                && !matches!(oauth.profile.health.as_str(), "unhealthy" | "reauthorization_required")
+                        })
+                    });
+                    GatewayDirectRouteHealth {
+                        status: if credential_ready && oauth_ready { "ok" } else if credential_ready { "degraded" } else { "unavailable" }.to_owned(),
+                        profile_id: profile.id.clone(),
+                        profile_alias: profile.alias.clone(),
+                        route_mode: if oauth_ready { "relay_bridge" } else { "provider_direct" }.to_owned(),
+                        oauth_ready,
+                        credential_ready,
+                        model_count: profile.models.len(),
+                    }
+                })
+            });
             Ok(GatewayStatus {
                 running,
                 bind_mode,
@@ -810,22 +925,7 @@ impl Repository {
                 available_addresses,
                 port,
                 cidrs: serde_json::from_str(&cidrs_json).unwrap_or_default(),
-                available_profiles: profiles.iter().filter(|p| {
-                    let profile = &p.profile;
-                    (profile.kind == ProfileKind::ApiKey
-                        || (profile.kind == ProfileKind::CodexOauth
-                            && profile.auth_mode == CodexAuthMode::OAuth))
-                        && profile.enabled
-                        && profile.in_pool
-                        && profile.credential_configured
-                        && !matches!(
-                            profile.health.as_str(),
-                            "unhealthy" | "reauthorization_required"
-                        )
-                        && profile
-                            .cooldown_until_ms
-                            .is_none_or(|until| until <= now_ms)
-                }).count(),
+                available_profiles,
                 cooling_profiles: profiles.iter().filter(|p| {
                     let profile = &p.profile;
                     (profile.kind == ProfileKind::ApiKey
@@ -833,6 +933,10 @@ impl Repository {
                             && profile.auth_mode == CodexAuthMode::OAuth))
                         && profile.cooldown_until_ms.is_some()
                 }).count(),
+                pool_status: if available_profiles > 0 { "ok" } else { "unavailable" }.to_owned(),
+                direct_route,
+                active_requests: 0,
+                queued_requests: 0,
                 client_key_count,
                 certificate_ready,
                 service_url: format!("https://{}:{}", bind_address, port),
@@ -1923,31 +2027,197 @@ impl Repository {
         })
     }
 
+    #[cfg(test)]
     pub fn metrics(&self) -> AppResult<MetricsSnapshot> {
+        self.gateway_performance(GatewayPerformanceInput { window_minutes: 60 })
+    }
+
+    pub fn gateway_performance(
+        &self,
+        input: GatewayPerformanceInput,
+    ) -> AppResult<MetricsSnapshot> {
+        let window_minutes = input.window_minutes.clamp(1, 7 * 24 * 60);
+        let since = timestamp_ms().saturating_sub(window_minutes.saturating_mul(60_000));
         self.with_connection(|connection| {
-            connection.query_row("SELECT total_requests, successful_requests, failed_requests, total_latency_ms, latency_samples, estimated_tokens FROM metrics WHERE id = 1", [], |row| {
-                let samples: i64 = row.get(4)?;
-                let latency: i64 = row.get(3)?;
-                let average_latency_ms = if samples > 0 {
-                    Some(latency / samples)
+            let (total_requests, successful_requests, failed_requests, total_latency_ms, latency_samples, estimated_tokens) = connection
+                .query_row(
+                    "SELECT total_requests, successful_requests, failed_requests, total_latency_ms, latency_samples, estimated_tokens FROM metrics WHERE id = 1",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?)),
+                )
+                .map_err(|_| AppError::Internal)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT total_latency_ms, ttfb_ms, request_bytes, response_bytes, retry_count, outcome FROM gateway_request_metrics WHERE started_at_ms >= ?1 ORDER BY started_at_ms",
+                )
+                .map_err(|_| AppError::Internal)?;
+            let rows = statement
+                .query_map(params![since], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(|_| AppError::Internal)?;
+            let mut latencies = Vec::new();
+            let mut ttfbs = Vec::new();
+            let mut window_successes = 0_i64;
+            let mut request_bytes = 0_i64;
+            let mut response_bytes = 0_i64;
+            let mut retry_count = 0_i64;
+            for row in rows {
+                let (latency, ttfb, request_size, response_size, retries, outcome) =
+                    row.map_err(|_| AppError::Internal)?;
+                latencies.push(latency.max(0));
+                if let Some(ttfb) = ttfb {
+                    ttfbs.push(ttfb.max(0));
+                }
+                request_bytes = request_bytes.saturating_add(request_size.max(0));
+                response_bytes = response_bytes.saturating_add(response_size.max(0));
+                retry_count = retry_count.saturating_add(retries.max(0));
+                if outcome == "success" {
+                    window_successes += 1;
+                }
+            }
+            latencies.sort_unstable();
+            ttfbs.sort_unstable();
+            let window_requests = latencies.len() as i64;
+            Ok(MetricsSnapshot {
+                total_requests,
+                successful_requests,
+                failed_requests,
+                average_latency_ms: if latency_samples > 0 {
+                    Some(total_latency_ms / latency_samples)
                 } else {
                     None
-                };
-                Ok(MetricsSnapshot {
-                    total_requests: row.get(0)?,
-                    successful_requests: row.get(1)?,
-                    failed_requests: row.get(2)?,
-                    average_latency_ms,
-                    estimated_tokens: row.get(5)?,
-                })
-            }).map_err(|_| AppError::Internal)
+                },
+                estimated_tokens,
+                window_minutes,
+                window_requests,
+                window_success_rate: if window_requests > 0 {
+                    Some(window_successes as f64 / window_requests as f64)
+                } else {
+                    None
+                },
+                requests_per_minute: window_requests as f64 / window_minutes as f64,
+                latency_p50_ms: percentile(&latencies, 50),
+                latency_p95_ms: percentile(&latencies, 95),
+                latency_p99_ms: percentile(&latencies, 99),
+                ttfb_p50_ms: percentile(&ttfbs, 50),
+                ttfb_p95_ms: percentile(&ttfbs, 95),
+                ttfb_p99_ms: percentile(&ttfbs, 99),
+                request_bytes,
+                response_bytes,
+                retry_count,
+                active_requests: 0,
+                queued_requests: 0,
+                telemetry_dropped: 0,
+            })
         })
     }
 
+    pub fn list_gateway_request_metrics(
+        &self,
+        input: ListGatewayRequestMetricsInput,
+    ) -> AppResult<GatewayRequestMetricPage> {
+        let limit = input.limit.clamp(1, 200);
+        self.with_connection(|connection| {
+            let cursor = input.cursor.unwrap_or(i64::MAX);
+            let mut statement = connection
+                .prepare(
+                    "SELECT sequence, request_id, started_at_ms, route, provider, profile_id, auth_mode, stream, auth_latency_ms, queue_latency_ms, ttfb_ms, total_latency_ms, request_bytes, response_bytes, http_status, outcome, error_category, upstream_attempts, retry_count, input_tokens, output_tokens, total_tokens, upstream_response_id FROM gateway_request_metrics WHERE sequence < ?1 ORDER BY sequence DESC LIMIT 1000",
+                )
+                .map_err(|_| AppError::Internal)?;
+            let rows = statement
+                .query_map(params![cursor], gateway_request_metric_from_row)
+                .map_err(|_| AppError::Internal)?;
+            let mut items = Vec::new();
+            for row in rows {
+                let item = row.map_err(|_| AppError::Internal)?;
+                if input.profile_id.as_deref().is_some_and(|value| item.profile_id.as_deref() != Some(value))
+                    || input.route.as_deref().is_some_and(|value| item.route != value)
+                    || input.status.as_deref().is_some_and(|value| item.outcome != value)
+                {
+                    continue;
+                }
+                items.push(item);
+                if items.len() > limit {
+                    break;
+                }
+            }
+            let next_cursor = (items.len() > limit)
+                .then(|| items[limit - 1].sequence);
+            items.truncate(limit);
+            Ok(GatewayRequestMetricPage { items, next_cursor })
+        })
+    }
+
+    pub fn record_gateway_request_metrics(
+        &self,
+        metrics: &[GatewayRequestMetricSummary],
+    ) -> AppResult<()> {
+        if metrics.is_empty() {
+            return Ok(());
+        }
+        self.with_connection(|connection| {
+            let transaction = connection.unchecked_transaction().map_err(|_| AppError::Internal)?;
+            let mut successful_requests = 0_i64;
+            let mut failed_requests = 0_i64;
+            let mut total_latency_ms = 0_i64;
+            let mut estimated_tokens = 0_i64;
+            for metric in metrics {
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO gateway_request_metrics(request_id, started_at_ms, route, provider, profile_id, auth_mode, stream, auth_latency_ms, queue_latency_ms, ttfb_ms, total_latency_ms, request_bytes, response_bytes, http_status, outcome, error_category, upstream_attempts, retry_count, input_tokens, output_tokens, total_tokens, upstream_response_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                        params![
+                            metric.request_id, metric.started_at_ms, metric.route, metric.provider,
+                            metric.profile_id, metric.auth_mode, metric.stream, metric.auth_latency_ms,
+                            metric.queue_latency_ms, metric.ttfb_ms, metric.total_latency_ms,
+                            metric.request_bytes, metric.response_bytes, metric.http_status,
+                            metric.outcome, metric.error_category, metric.upstream_attempts,
+                            metric.retry_count, metric.input_tokens, metric.output_tokens,
+                            metric.total_tokens, metric.upstream_response_id,
+                        ],
+                    )
+                    .map_err(|_| AppError::Internal)?;
+                if metric.outcome == "success" {
+                    successful_requests += 1;
+                } else {
+                    failed_requests += 1;
+                }
+                total_latency_ms = total_latency_ms.saturating_add(metric.total_latency_ms.max(0));
+                estimated_tokens = estimated_tokens.saturating_add(metric.total_tokens.max(0));
+            }
+            transaction.execute(
+                "UPDATE metrics SET total_requests = total_requests + ?1, successful_requests = successful_requests + ?2, failed_requests = failed_requests + ?3, total_latency_ms = total_latency_ms + ?4, latency_samples = latency_samples + ?1, estimated_tokens = estimated_tokens + ?5 WHERE id = 1",
+                params![metrics.len() as i64, successful_requests, failed_requests, total_latency_ms, estimated_tokens],
+            ).map_err(|_| AppError::Internal)?;
+            transaction.commit().map_err(|_| AppError::Internal)?;
+            Ok(())
+        })
+    }
+
+    pub fn prune_gateway_request_metrics(&self) -> AppResult<()> {
+        let cutoff = timestamp_ms().saturating_sub(7 * 24 * 60 * 60 * 1000);
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM gateway_request_metrics WHERE started_at_ms < ?1 OR sequence NOT IN (SELECT sequence FROM gateway_request_metrics ORDER BY sequence DESC LIMIT 10000)",
+                params![cutoff],
+            ).map_err(|_| AppError::Internal)?;
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
     pub fn record_metric(&self, successful: bool, latency_ms: i64) -> AppResult<()> {
         self.record_metric_with_tokens(successful, latency_ms, 0)
     }
 
+    #[cfg(test)]
     pub fn record_metric_with_tokens(
         &self,
         successful: bool,
@@ -1960,6 +2230,7 @@ impl Repository {
         })
     }
 
+    #[cfg(test)]
     pub fn add_estimated_tokens(&self, estimated_tokens: i64) -> AppResult<()> {
         if estimated_tokens <= 0 {
             return Ok(());
@@ -1974,6 +2245,44 @@ impl Repository {
             Ok(())
         })
     }
+}
+
+fn percentile(values: &[i64], percentile: usize) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    let index = ((values.len() - 1) * percentile).div_ceil(100);
+    values.get(index).copied()
+}
+
+fn gateway_request_metric_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<GatewayRequestMetricSummary> {
+    Ok(GatewayRequestMetricSummary {
+        sequence: row.get(0)?,
+        request_id: row.get(1)?,
+        started_at_ms: row.get(2)?,
+        route: row.get(3)?,
+        provider: row.get(4)?,
+        profile_id: row.get(5)?,
+        auth_mode: row.get(6)?,
+        stream: row.get(7)?,
+        auth_latency_ms: row.get(8)?,
+        queue_latency_ms: row.get(9)?,
+        ttfb_ms: row.get(10)?,
+        total_latency_ms: row.get(11)?,
+        request_bytes: row.get(12)?,
+        response_bytes: row.get(13)?,
+        http_status: row.get::<_, i64>(14)? as u16,
+        outcome: row.get(15)?,
+        error_category: row.get(16)?,
+        upstream_attempts: row.get(17)?,
+        retry_count: row.get(18)?,
+        input_tokens: row.get(19)?,
+        output_tokens: row.get(20)?,
+        total_tokens: row.get(21)?,
+        upstream_response_id: row.get(22)?,
+    })
 }
 
 fn user_client_key_secret_ref_from_connection(
@@ -2569,13 +2878,16 @@ fn parse_profile_kind(value: &str) -> Option<ProfileKind> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{profile_columns, table_columns, Repository, StoredCodexSession, StoredProfile};
+    use super::{
+        profile_columns, table_columns, timestamp_ms, Repository, StoredCodexSession, StoredProfile,
+    };
     use crate::{
         domain::{
             AppUpdateChannel, AppUpdateSettings, CodexSessionEvent, CodexSessionSummary,
             CollaborationProvider, CollaborationSummary, DesktopWorkspaceMode, GatewayProvider,
-            GatewayWireApi, MaskedClientKey, MaskedProfile, ProfileKind,
-            GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+            GatewayRequestMetricSummary, GatewayWireApi, MaskedClientKey, MaskedProfile,
+            ProfileKind, GATEWAY_CODEX_CLIENT_KEY_REF_SETTING,
+            GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING,
         },
         error::AppError,
         profiles,
@@ -2603,8 +2915,15 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
             secret_ref: Some(format!("profile:{id}:credential")),
             credential_fingerprint: None,
@@ -2740,6 +3059,43 @@ mod tests {
     }
 
     #[test]
+    fn deleting_oauth_profile_clears_api_unlock_bindings_and_gateway_settings() {
+        let repository = Repository::memory();
+        let oauth = stored_profile("oauth-login", ProfileKind::CodexOauth, "healthy");
+        repository.insert_profile(&oauth).unwrap();
+        let mut api = stored_profile("api-profile", ProfileKind::ApiKey, "healthy");
+        api.profile.codex_oauth_profile_id = Some("oauth-login".to_owned());
+        repository.insert_profile(&api).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING, "oauth-login")
+            .unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "oauth-login")
+            .unwrap();
+
+        let secret_ref = repository.delete_profile("oauth-login").unwrap();
+
+        assert_eq!(
+            secret_ref.as_deref(),
+            Some("profile:oauth-login:credential")
+        );
+        assert!(repository
+            .profile("api-profile")
+            .unwrap()
+            .profile
+            .codex_oauth_profile_id
+            .is_none());
+        assert!(repository
+            .setting(GATEWAY_CODEX_OAUTH_PROFILE_ID_SETTING)
+            .unwrap()
+            .is_none());
+        assert!(repository
+            .setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn migrates_legacy_profiles_without_account_columns() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -2777,14 +3133,53 @@ mod tests {
         assert!(columns.contains(&"account_subscription_json".to_owned()));
         assert!(columns.contains(&"wire_api".to_owned()));
         assert!(columns.contains(&"model_mappings_json".to_owned()));
+        assert!(columns.contains(&"codex_oauth_profile_id".to_owned()));
+        assert!(columns.contains(&"validation_status".to_owned()));
+        assert!(columns.contains(&"validated_at_ms".to_owned()));
+        assert!(columns.contains(&"validation_message".to_owned()));
+        assert!(columns.contains(&"max_concurrency".to_owned()));
+        assert!(columns.contains(&"max_queue_depth".to_owned()));
+        assert!(columns.contains(&"queue_timeout_ms".to_owned()));
         let api_profile = repository.profile("legacy-api").unwrap().profile;
         assert_eq!(api_profile.wire_api, GatewayWireApi::Responses);
         assert_eq!(api_profile.model_mappings.len(), 1);
         assert_eq!(api_profile.model_mappings[0].model, "model-a");
         assert_eq!(api_profile.model_mappings[0].upstream_model, "model-a");
+        assert_eq!(api_profile.validation_status, "unknown");
+        assert!(api_profile.validated_at_ms.is_none());
+        assert!(api_profile.validation_message.is_none());
+        assert_eq!(api_profile.max_concurrency, 4);
+        assert_eq!(api_profile.max_queue_depth, 8);
+        assert_eq!(api_profile.queue_timeout_ms, 15_000);
         let profile = repository.profile("legacy").unwrap().profile;
         assert!(profile.account.is_none());
         assert!(profile.credential_configured);
+        assert_eq!(profile.validation_status, "unknown");
+    }
+
+    #[test]
+    fn profile_validation_fields_round_trip_for_all_states() {
+        let repository = Repository::memory();
+        let mut stored = stored_profile("validation", ProfileKind::CodexOauth, "healthy");
+        repository.insert_profile(&stored).unwrap();
+
+        for (index, status) in ["valid", "invalid", "unknown"].into_iter().enumerate() {
+            stored.profile.validation_status = status.to_owned();
+            stored.profile.validated_at_ms = Some(1_700_000_000_000 + index as i64);
+            stored.profile.validation_message = Some(format!("{status} message"));
+            repository.update_profile(&stored).unwrap();
+
+            let persisted = repository.profile("validation").unwrap().profile;
+            assert_eq!(persisted.validation_status, status);
+            assert_eq!(
+                persisted.validated_at_ms,
+                Some(1_700_000_000_000 + index as i64)
+            );
+            assert_eq!(
+                persisted.validation_message,
+                Some(format!("{status} message"))
+            );
+        }
     }
 
     #[test]
@@ -2973,6 +3368,102 @@ mod tests {
     }
 
     #[test]
+    fn gateway_request_metrics_batch_updates_aggregate_once_per_request() {
+        let repository = Repository::memory();
+        let make_metric = |id: &str, outcome: &str, tokens: i64| GatewayRequestMetricSummary {
+            sequence: 0,
+            request_id: id.to_owned(),
+            started_at_ms: timestamp_ms(),
+            route: "responses".to_owned(),
+            provider: "openai_compatible".to_owned(),
+            profile_id: Some("zeron".to_owned()),
+            auth_mode: "oauth".to_owned(),
+            stream: true,
+            auth_latency_ms: 1,
+            queue_latency_ms: 2,
+            ttfb_ms: Some(3),
+            total_latency_ms: 10,
+            request_bytes: 100,
+            response_bytes: 200,
+            http_status: if outcome == "success" { 200 } else { 502 },
+            outcome: outcome.to_owned(),
+            error_category: (outcome != "success").then(|| "upstream".to_owned()),
+            upstream_attempts: 1,
+            retry_count: 0,
+            input_tokens: tokens / 2,
+            output_tokens: tokens - tokens / 2,
+            total_tokens: tokens,
+            upstream_response_id: None,
+        };
+        repository
+            .record_gateway_request_metrics(&[
+                make_metric("request-a", "success", 12),
+                make_metric("request-b", "failed", 8),
+            ])
+            .unwrap();
+
+        let metrics = repository.metrics().unwrap();
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.successful_requests, 1);
+        assert_eq!(metrics.failed_requests, 1);
+        assert_eq!(metrics.estimated_tokens, 20);
+        assert_eq!(metrics.window_requests, 2);
+        assert_eq!(metrics.latency_p50_ms, Some(10));
+        assert_eq!(metrics.ttfb_p95_ms, Some(3));
+    }
+
+    #[test]
+    fn gateway_request_metrics_prune_by_age_and_count_without_resetting_aggregates() {
+        let repository = Repository::memory();
+        let now = timestamp_ms();
+        let metrics = (0..10_005)
+            .map(|index| GatewayRequestMetricSummary {
+                sequence: 0,
+                request_id: format!("retention-{index}"),
+                started_at_ms: if index == 10_004 {
+                    now - 8 * 24 * 60 * 60 * 1000
+                } else {
+                    now
+                },
+                route: "responses".to_owned(),
+                provider: "openai_compatible".to_owned(),
+                profile_id: Some("zeron".to_owned()),
+                auth_mode: "oauth".to_owned(),
+                stream: false,
+                auth_latency_ms: 1,
+                queue_latency_ms: 0,
+                ttfb_ms: Some(2),
+                total_latency_ms: 3,
+                request_bytes: 10,
+                response_bytes: 20,
+                http_status: 200,
+                outcome: "success".to_owned(),
+                error_category: None,
+                upstream_attempts: 1,
+                retry_count: 0,
+                input_tokens: 1,
+                output_tokens: 1,
+                total_tokens: 2,
+                upstream_response_id: None,
+            })
+            .collect::<Vec<_>>();
+        repository.record_gateway_request_metrics(&metrics).unwrap();
+        repository.prune_gateway_request_metrics().unwrap();
+
+        let retained = repository
+            .with_connection(|connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM gateway_request_metrics", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|_| AppError::Internal)
+            })
+            .unwrap();
+        assert_eq!(retained, 9_999);
+        assert_eq!(repository.metrics().unwrap().total_requests, 10_005);
+    }
+
+    #[test]
     fn client_key_material_can_rotate_only_user_keys() {
         let repository = Repository::memory();
         insert_test_client_key(&repository, "user", "用户 Key", "client-key:user");
@@ -3074,8 +3565,15 @@ mod tests {
                 cooldown_until_ms: None,
                 credential_configured: true,
                 auth_mode: Default::default(),
+                codex_oauth_profile_id: None,
                 is_current: false,
                 account: None,
+                validation_status: "unknown".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
             secret_ref: Some(format!("profile:{id}:credential")),
             credential_fingerprint: None,
@@ -3138,14 +3636,57 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_a_per_profile_workspace_and_rejects_unknown_values() {
+    fn gateway_status_reports_a_healthy_direct_bridge_outside_the_pool() {
+        let repository = Repository::memory();
+        let mut oauth = stored_profile("oauth-login", ProfileKind::CodexOauth, "healthy");
+        oauth.profile.in_pool = false;
+        repository.insert_profile(&oauth).unwrap();
+        let mut direct = stored_profile("zeron", ProfileKind::ApiKey, "healthy");
+        direct.profile.in_pool = false;
+        direct.profile.codex_oauth_profile_id = Some("oauth-login".to_owned());
+        repository.insert_profile(&direct).unwrap();
+        repository
+            .set_setting(GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING, "zeron")
+            .unwrap();
+
+        let status = repository.gateway_settings(true, true, Vec::new()).unwrap();
+
+        assert_eq!(status.pool_status, "unavailable");
+        assert_eq!(status.available_profiles, 0);
+        let direct = status.direct_route.expect("direct route health");
+        assert_eq!(direct.status, "ok");
+        assert_eq!(direct.route_mode, "relay_bridge");
+        assert!(direct.oauth_ready);
+        assert!(direct.credential_ready);
+    }
+
+    #[test]
+    fn desktop_workspace_mode_is_fixed_to_shared_and_rejects_unknown_values() {
         let repository = Repository::memory();
         assert_eq!(
             repository.desktop_workspace_mode().unwrap(),
-            DesktopWorkspaceMode::PerProfile
+            DesktopWorkspaceMode::Shared
+        );
+        for legacy_mode in [
+            DesktopWorkspaceMode::Fresh,
+            DesktopWorkspaceMode::PerProfile,
+            DesktopWorkspaceMode::Shared,
+        ] {
+            repository.set_desktop_workspace_mode(&legacy_mode).unwrap();
+            assert_eq!(
+                repository.desktop_workspace_mode().unwrap(),
+                DesktopWorkspaceMode::Shared
+            );
+        }
+        repository
+            .set_setting("desktop_workspace_mode", "fresh")
+            .unwrap();
+        assert_eq!(
+            repository.desktop_workspace_mode().unwrap(),
+            DesktopWorkspaceMode::Shared
         );
         repository
-            .set_desktop_workspace_mode(&DesktopWorkspaceMode::Shared)
+            .set_setting("desktop_workspace_mode", "per_profile")
             .unwrap();
         assert_eq!(
             repository.desktop_workspace_mode().unwrap(),

@@ -13,9 +13,19 @@ import {
   type CreatedClientKey,
   type GatewayCodexConfigStatus,
   type GatewayStatus,
+  type GatewayRequestMetricPage,
+  type CodexHistoryTransitionStatus,
   type MaskedClientKey,
 } from "../../shared/ipc";
-import { Select } from "../../shared/ui/Select";
+import {
+  Button,
+  EmptyState,
+  InlineNotice,
+  PageHeader,
+  Select,
+  StatusPill,
+} from "../../shared/ui";
+import "./gateway.css";
 
 const NO_OAUTH_PROFILE = "__none__";
 
@@ -26,6 +36,7 @@ interface GatewayProps {
   onStart: () => Promise<void>;
   onStop: () => Promise<void>;
   onNotice: (message: string) => void;
+  onHistorySyncStatus?: (status: CodexHistoryTransitionStatus) => void;
   onNavigateProfiles: () => void;
   onRefresh: () => Promise<void>;
 }
@@ -37,6 +48,7 @@ export function Gateway({
   onStart,
   onStop,
   onNotice,
+  onHistorySyncStatus = () => undefined,
   onNavigateProfiles,
   onRefresh,
 }: GatewayProps) {
@@ -45,6 +57,13 @@ export function Gateway({
   const [keyName, setKeyName] = useState("");
   const [loadingKeys, setLoadingKeys] = useState(true);
   const [codexConfig, setCodexConfig] = useState<GatewayCodexConfigStatus | null>(null);
+  const [requestMetrics, setRequestMetrics] = useState<GatewayRequestMetricPage>({
+    items: [],
+    next_cursor: null,
+  });
+  const [loadingMetrics, setLoadingMetrics] = useState(true);
+  const codexConfigMode = codexConfig?.mode ?? "official";
+  const codexManaged = codexConfigMode !== "official";
   const oauthCandidates = codexConfig?.oauth_profile_options ?? [];
   const hasAvailableOAuthCandidate = oauthCandidates.some(
     (profile) => profile.available,
@@ -58,14 +77,14 @@ export function Gateway({
     {
       value: NO_OAUTH_PROFILE,
       label: "不绑定登录档案",
-      description: "只切换模型请求，不改写 Codex 登录态",
+      description: "保留当前 Codex 登录态，只切换模型请求地址",
     },
     ...oauthCandidates.map((profile) => ({
       value: profile.id,
       label: profile.alias,
       disabled: !profile.available,
       description: profile.available
-        ? "OAuth 授权登录态解锁"
+        ? "只用于解锁 Codex 登录态"
         : (profile.reason ?? "需要重新检查登录状态"),
     })),
     ...(selectedOAuthMissing
@@ -82,6 +101,28 @@ export function Gateway({
         ]
       : []),
   ];
+  const loadRequestMetrics = useCallback(async (cursor?: number | null) => {
+    setLoadingMetrics(true);
+    try {
+      const page = await api.listGatewayRequestMetrics({
+        limit: 25,
+        cursor: cursor ?? null,
+      });
+      if (!page || !Array.isArray(page.items)) {
+        throw new Error("invalid gateway metrics response");
+      }
+      setRequestMetrics((current) =>
+        cursor == null
+          ? page
+          : { items: [...current.items, ...page.items], next_cursor: page.next_cursor },
+      );
+    } catch {
+      if (cursor == null) setRequestMetrics({ items: [], next_cursor: null });
+    } finally {
+      setLoadingMetrics(false);
+    }
+  }, []);
+
   const reloadKeys = useCallback(async () => {
     setLoadingKeys(true);
     try {
@@ -108,6 +149,14 @@ export function Gateway({
   useEffect(() => {
     void reloadCodexConfig();
   }, [reloadCodexConfig]);
+  useEffect(() => {
+    void loadRequestMetrics();
+  }, [
+    gateway.running,
+    gateway.active_requests,
+    gateway.queued_requests,
+    loadRequestMetrics,
+  ]);
   const createKey = async () => {
     const created = await api.createClientKey(keyName);
     setNewKey(created);
@@ -145,6 +194,7 @@ export function Gateway({
         ? await api.disableCodexGateway()
         : await api.enableCodexGateway();
       setCodexConfig(next);
+      if (next.history_sync_status) onHistorySyncStatus(next.history_sync_status);
       await Promise.all([reloadKeys(), onRefresh()]);
       onNotice(next.message);
     } catch (error) {
@@ -156,21 +206,23 @@ export function Gateway({
       const profileId = value === NO_OAUTH_PROFILE ? null : value;
       const next = await api.setCodexGatewayOAuthProfile(profileId);
       setCodexConfig(next);
-      onNotice(
-        profileId
-          ? "Codex 网关 OAuth 登录档案已绑定。"
-          : "Codex 网关 OAuth 登录档案已清空。",
-      );
+      onNotice(next.message);
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "OAuth 登录档案未保存。");
     }
   };
-  const codexActionRequiresRunning = !codexConfig?.enabled || codexConfig.needs_repair;
   const codexButtonLabel = codexConfig?.needs_repair
-    ? "修复 Codex Key"
-    : codexConfig?.enabled
-      ? "恢复原 Codex 配置"
+    ? "修复 Codex 配置"
+    : codexManaged
+      ? "恢复官方配置"
       : "设为 Codex 网关";
+  const codexStatusLabel = codexConfig?.needs_repair
+    ? "需要修复 Codex 配置"
+    : codexConfigMode === "third_party"
+      ? "第三方直连"
+      : codexConfigMode === "relay_gateway"
+        ? "已接入 Relay 网关"
+        : "官方模型配置";
   const exportCa = async () => {
     try {
       const destination = await save({
@@ -188,61 +240,60 @@ export function Gateway({
   const trustCa = async () => {
     try {
       await api.trustGatewayCa();
-      onNotice("Relay CA 已加入 macOS 登录钥匙串。请重新启动 Codex 会话后重试。");
+      onNotice("Relay CA 已加入当前系统信任存储。请重新启动 Codex 会话后重试。");
     } catch (error) {
       onNotice(error instanceof Error ? error.message : "无法安装 Relay CA。");
     }
   };
   return (
     <div className="page gateway-page">
-      <header className="page-heading" data-animate="heading">
-        <div>
-          <p className="section-kicker">Gateway</p>
-          <h1>本机 / 局域网 API 网关</h1>
-          <p className="page-subtitle">
-            所有入口均使用 HTTPS。可限制为
-            127.0.0.1，也可绑定检测到的私有局域网地址；始终需要客户端 Key。
-          </p>
+      <PageHeader
+        actions={
+          <Button
+            disabled={busy}
+            leadingIcon={
+              gateway.running ? (
+                <Power size={18} weight="bold" />
+              ) : (
+                <Play size={18} weight="fill" />
+              )
+            }
+            variant={gateway.running ? "danger" : "primary"}
+            onClick={() => void (gateway.running ? onStop() : onStart())}
+          >
+            {gateway.running ? "停止服务" : "启动 API 服务"}
+          </Button>
+        }
+        description="所有入口均使用 HTTPS。可限制为 127.0.0.1，也可绑定检测到的私有局域网地址；始终需要客户端 Key。"
+        meta={
           <div className="gateway-heading-meta">
             <code>{gateway.service_url}</code>
             <span>{gateway.available_profiles} 个可用 API 成员</span>
           </div>
-        </div>
-        <button
-          className={gateway.running ? "danger-button" : "primary-button"}
-          disabled={busy}
-          type="button"
-          onClick={() => void (gateway.running ? onStop() : onStart())}
-        >
-          {gateway.running ? (
-            <Power size={18} weight="bold" />
-          ) : (
-            <Play size={18} weight="fill" />
-          )}
-          {gateway.running ? "停止服务" : "启动 API 服务"}
-        </button>
-      </header>
+        }
+        title="本机 / 局域网 API 网关"
+      />
       <GatewayStatusSummary gateway={gateway} />
-      {gateway.available_profiles === 0 && (
-        <section className="gateway-warning" aria-label="网关账号成员提示">
-          <div className="gateway-warning-row">
-            <div>
-              <strong>当前没有网关账号成员</strong>
-              <p>
-                {gateway.running
-                  ? "服务已启动，但还没有可用账号成员。请到档案页刷新模型并把账号加入网关。"
-                  : "启动前请先到档案页刷新模型并把账号加入网关；也可先完成监听与证书配置。"}
-              </p>
-            </div>
-            <button
-              className="primary-button compact-action"
-              type="button"
-              onClick={onNavigateProfiles}
-            >
+      <GatewayRequestMetrics
+        loading={loadingMetrics}
+        page={requestMetrics}
+        onLoadMore={(cursor) => void loadRequestMetrics(cursor)}
+      />
+      {gateway.available_profiles === 0 && gateway.direct_route?.status !== "ok" && (
+        <InlineNotice
+          action={
+            <Button size="sm" variant="primary" onClick={onNavigateProfiles}>
               去档案加入网关
-            </button>
-          </div>
-        </section>
+            </Button>
+          }
+          aria-label="网关账号成员提示"
+          tone="warning"
+          title="当前没有网关账号成员"
+        >
+          {gateway.running
+            ? "服务已启动，但还没有可用账号成员。请到档案页刷新模型并把账号加入网关。"
+            : "启动前请先到档案页刷新模型并把账号加入网关；也可先完成监听与证书配置。"}
+        </InlineNotice>
       )}
       {newKey && (
         <SecretOnce
@@ -257,7 +308,7 @@ export function Gateway({
           <article className="surface-card security-card gateway-card">
             <div className="card-heading">
               <div>
-                <p className="section-kicker">Protection</p>
+                <p className="section-kicker">访问保护</p>
                 <h2>访问保护</h2>
               </div>
               <ShieldCheck size={23} weight="duotone" />
@@ -304,7 +355,7 @@ export function Gateway({
           <article className="surface-card security-card gateway-card codex-gateway-card">
             <div className="card-heading">
               <div>
-                <p className="section-kicker">Codex</p>
+                <p className="section-kicker">Codex 配置</p>
                 <h2>Codex 网关切换</h2>
               </div>
               <LockKey size={23} weight="duotone" />
@@ -312,14 +363,10 @@ export function Gateway({
             <div className="codex-config-overview">
               <span
                 className={`codex-config-status ${
-                  codexConfig?.enabled && !codexConfig.needs_repair ? "" : "is-disabled"
+                  codexManaged && !codexConfig?.needs_repair ? "" : "is-disabled"
                 }`}
               >
-                {codexConfig?.needs_repair
-                  ? "需要修复 Codex Key"
-                  : codexConfig?.enabled
-                    ? "已接入 Relay 网关"
-                    : "未接入 Relay 网关"}
+                {codexStatusLabel}
               </span>
               <p className="muted-copy codex-config-copy">
                 {codexConfig?.message ?? "正在读取 Codex 配置状态…"}
@@ -342,15 +389,11 @@ export function Gateway({
               </label>
               <button
                 className={`codex-config-button ${
-                  codexConfig?.enabled && !codexConfig.needs_repair
+                  codexManaged && !codexConfig?.needs_repair
                     ? "quiet-button"
                     : "primary-button"
                 }`}
-                disabled={
-                  busy ||
-                  !codexConfig ||
-                  (codexActionRequiresRunning && !gateway.running)
-                }
+                disabled={busy || !codexConfig}
                 type="button"
                 onClick={() => void toggleCodexGateway()}
               >
@@ -358,20 +401,24 @@ export function Gateway({
               </button>
             </div>
             <p className="codex-config-helper">
-              {codexConfig?.oauth_profile_id
-                ? codexConfig.oauth_profile_available
-                  ? `当前登录档案：${codexConfig.oauth_profile_alias ?? codexConfig.oauth_profile_id}`
-                  : (selectedOAuthOption?.reason ??
-                    "已绑定的 OAuth 登录档案当前不可读，请重新授权或清空绑定。")
-                : hasAvailableOAuthCandidate
-                  ? "未绑定时保留本机登录档案，只把模型请求路由到账号池成员。"
-                  : "还没有可用于登录态解锁的 OAuth 授权档案；JSON 导入账号只用于反代账号池。"}
+              {codexConfigMode === "third_party"
+                ? codexConfig?.oauth_profile_id && codexConfig.oauth_profile_available
+                  ? `当前第三方：${codexConfig.direct_profile_alias ?? codexConfig.direct_profile_id ?? "第三方供应商"}；ChatGPT 使用所选 OAuth 登录，模型请求通过 codex_relay_direct 经本机 Relay 固定转发，OAuth Token 不会发送给第三方。`
+                  : `当前直连：${codexConfig?.direct_profile_alias ?? codexConfig?.direct_profile_id ?? "第三方供应商"}；OAuth 未应用时保留当前 ChatGPT 登录，模型请求仍直接发送到该供应商 Base URL。`
+                : codexConfig?.oauth_profile_id
+                  ? codexConfig.oauth_profile_available
+                    ? `当前登录档案：${codexConfig.oauth_profile_alias ?? codexConfig.oauth_profile_id}；只解锁 Codex 登录态，模型请求继续走 Relay 网关账号池。`
+                    : (selectedOAuthOption?.reason ??
+                      "已绑定的 OAuth 登录档案当前不可读，请重新授权或清空绑定。")
+                  : hasAvailableOAuthCandidate
+                    ? "未绑定时保留本机登录档案；切换后模型请求继续走 Relay 网关账号池。"
+                    : "还没有可用于登录态解锁的 OAuth 授权档案；JSON/PAT/Agent Identity 档案只用于反代账号池。"}
             </p>
           </article>
           <article className="surface-card key-card gateway-card">
             <div className="card-heading">
               <div>
-                <p className="section-kicker">Client access</p>
+                <p className="section-kicker">客户端访问</p>
                 <h2>客户端 Key</h2>
               </div>
               <Key size={22} />
@@ -398,46 +445,60 @@ export function Gateway({
               <ul className="key-list">
                 {keys.map((key) => (
                   <li key={key.id}>
-                    <div>
-                      <strong>{key.name}</strong>
-                      {key.managed_by === "codex_gateway" && (
-                        <span className="managed-key-badge">Codex 自动管理</span>
-                      )}
-                      <span>{key.masked_value}</span>
+                    <div className="key-info">
+                      <span className="key-title-row">
+                        <strong>{key.name}</strong>
+                        {key.managed_by === "codex_gateway" && (
+                          <span className="managed-key-badge">Codex 自动管理</span>
+                        )}
+                      </span>
+                      <code className="key-mask">{key.masked_value}</code>
                     </div>
-                    {key.can_revoke && (
-                      <div className="key-actions">
-                        <button
-                          className="quiet-button compact-action"
-                          type="button"
-                          aria-label={`查看 ${key.name}`}
-                          onClick={() => void revealKey(key)}
-                        >
-                          查看
-                        </button>
-                        <button
-                          className="quiet-button compact-action"
-                          type="button"
-                          aria-label={`轮换 ${key.name}`}
-                          onClick={() => void rotateKey(key.id)}
-                        >
-                          轮换
-                        </button>
-                        <button
-                          className="icon-button danger"
-                          type="button"
-                          aria-label={`撤销 ${key.name}`}
-                          onClick={() => void revoke(key.id)}
-                        >
-                          <Trash size={17} />
-                        </button>
-                      </div>
-                    )}
+                    <div
+                      aria-hidden={key.can_revoke ? undefined : true}
+                      className={
+                        key.can_revoke ? "key-actions" : "key-actions is-empty"
+                      }
+                    >
+                      {key.can_revoke && (
+                        <>
+                          <button
+                            className="quiet-button compact-action"
+                            type="button"
+                            aria-label={`查看 ${key.name}`}
+                            onClick={() => void revealKey(key)}
+                          >
+                            查看
+                          </button>
+                          <button
+                            className="quiet-button compact-action"
+                            type="button"
+                            aria-label={`轮换 ${key.name}`}
+                            onClick={() => void rotateKey(key.id)}
+                          >
+                            轮换
+                          </button>
+                          <button
+                            className="icon-button danger"
+                            type="button"
+                            aria-label={`撤销 ${key.name}`}
+                            onClick={() => void revoke(key.id)}
+                          >
+                            <Trash size={17} />
+                          </button>
+                        </>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>
             ) : (
-              <p className="muted-copy">创建一个 Key 后，局域网客户端才能调用网关。</p>
+              <EmptyState
+                compact
+                description="创建后只向受信任客户端分发；每个请求都必须携带 Key。"
+                icon={<Key size={19} />}
+                title="还没有客户端 Key"
+              />
             )}
           </article>
         </aside>
@@ -446,18 +507,122 @@ export function Gateway({
   );
 }
 
+function GatewayRequestMetrics({
+  loading,
+  page,
+  onLoadMore,
+}: {
+  loading: boolean;
+  page: GatewayRequestMetricPage;
+  onLoadMore: (cursor: number) => void;
+}) {
+  return (
+    <section className="gateway-request-metrics" aria-label="最近网关请求">
+      <div className="gateway-panel-heading">
+        <div>
+          <h2>最近请求</h2>
+          <p>仅保存脱敏路由、耗时、状态、字节数与 usage，不保存提示词或响应正文。</p>
+        </div>
+        <StatusPill
+          tone={
+            page.items.some((item) => item.outcome !== "success")
+              ? "warning"
+              : "neutral"
+          }
+        >
+          {page.items.length} 条
+        </StatusPill>
+      </div>
+      {page.items.length === 0 ? (
+        <p className="gateway-metric-empty">
+          {loading ? "正在读取请求指标…" : "暂无请求指标。"}
+        </p>
+      ) : (
+        <div className="gateway-metric-table-wrap">
+          <table className="gateway-metric-table">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>路由</th>
+                <th>状态</th>
+                <th>TTFB / 总耗时</th>
+                <th>队列</th>
+                <th>尝试</th>
+              </tr>
+            </thead>
+            <tbody>
+              {page.items.map((item) => (
+                <tr key={item.request_id}>
+                  <td>{new Date(item.started_at_ms).toLocaleTimeString()}</td>
+                  <td>
+                    <code>{item.route}</code>
+                    <small>
+                      {item.provider} · {item.auth_mode}
+                      {item.stream ? " · SSE" : ""}
+                    </small>
+                  </td>
+                  <td>
+                    <StatusPill
+                      tone={item.outcome === "success" ? "success" : "danger"}
+                    >
+                      {item.http_status}
+                    </StatusPill>
+                    <small>{item.error_category ?? item.outcome}</small>
+                  </td>
+                  <td>
+                    {item.ttfb_ms == null ? "—" : `${item.ttfb_ms} ms`} /{" "}
+                    {item.total_latency_ms} ms
+                  </td>
+                  <td>{item.queue_latency_ms} ms</td>
+                  <td>
+                    {item.upstream_attempts}
+                    {item.retry_count ? ` · ${item.retry_count} retry` : ""}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {page.next_cursor != null && (
+        <Button
+          disabled={loading}
+          size="sm"
+          variant="secondary"
+          onClick={() => onLoadMore(page.next_cursor!)}
+        >
+          {loading ? "加载中…" : "加载更多"}
+        </Button>
+      )}
+    </section>
+  );
+}
+
 function GatewayStatusSummary({ gateway }: { gateway: GatewayStatus }) {
   return (
     <section className="gateway-status-summary" aria-label="网关状态摘要">
       <div className="gateway-status-main">
-        <span className={`status-pill ${gateway.running ? "success" : "neutral"}`}>
-          <i /> {gateway.running ? "服务运行中" : "服务未启动"}
-        </span>
+        <StatusPill tone={gateway.running ? "success" : "neutral"}>
+          {gateway.running ? "服务运行中" : "服务未启动"}
+        </StatusPill>
         <code className="gateway-endpoint">{gateway.service_url}</code>
       </div>
       <div className="gateway-status-actions" aria-label="网关关键状态">
         <span className="gateway-status-meta">
-          {gateway.available_profiles} 个账号池成员
+          账号池{" "}
+          {gateway.pool_status ??
+            (gateway.available_profiles > 0 ? "ok" : "unavailable")}{" "}
+          · {gateway.available_profiles} 个成员
+        </span>
+        <span className="gateway-status-meta">{gateway.cooling_profiles} 个冷却中</span>
+        <span className="gateway-status-meta">
+          Direct {gateway.direct_route?.status ?? "unavailable"}
+          {gateway.direct_route?.profile_alias
+            ? ` · ${gateway.direct_route.profile_alias}`
+            : ""}
+        </span>
+        <span className="gateway-status-meta">
+          {gateway.active_requests ?? 0} 活动 · {gateway.queued_requests ?? 0} 排队
         </span>
         <span className="gateway-status-meta">{gateway.cooling_profiles} 个冷却中</span>
         <span className="gateway-status-meta">
@@ -538,7 +703,7 @@ function GatewayForm({
     >
       <div className="card-heading">
         <div>
-          <p className="section-kicker">Configuration</p>
+          <p className="section-kicker">服务配置</p>
           <h2>服务配置</h2>
         </div>
         <LockKey size={23} weight="duotone" />
