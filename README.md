@@ -16,7 +16,7 @@
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2-24C8DB" />
 </p>
 
-> 当前版本：`v0.2.0-beta.10`。项目处于 MVP beta 阶段，功能边界以 [docs/PRD.md](docs/PRD.md) 为准。
+> 当前版本：`v0.2.0`。项目处于 MVP beta 阶段，功能边界以 [docs/PRD.md](docs/PRD.md) 为准。
 
 ## 目录
 
@@ -293,9 +293,9 @@ git commit -m "feat(collaboration): add memory contexts"
 本仓库的 release workflow 监听 `v*` tag：
 
 ```bash
-git tag v0.2.0-beta.10
+git tag v0.2.0
 git push origin <release-branch>
-git push origin v0.2.0-beta.10
+git push origin v0.2.0
 ```
 
 `vX.Y.Z-beta.N` 会生成 GitHub prerelease，并覆盖 updater Release 中的 `beta.json` manifest；正式版 `vX.Y.Z` 覆盖 `stable.json`。
