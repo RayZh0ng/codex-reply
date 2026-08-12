@@ -25,9 +25,9 @@ use crate::{
     codex_environment::default_codex_home,
     database::StoredProfile,
     domain::{
-        CurrentProfileActivation, DesktopWorkspaceMode, ManagedTaskStatus, OAuthImportStatus,
-        ProfileKind, ProfileQuota, ProfileQuotaBucket, ProfileQuotaWindow, ProfileSubscription,
-        StartManagedTaskInput,
+        CodexHistoryTransitionStatus, CurrentProfileActivation, DesktopWorkspaceMode,
+        ManagedTaskStatus, OAuthImportStatus, ProfileKind, ProfileQuota, ProfileQuotaBucket,
+        ProfileQuotaWindow, ProfileSubscription, StartManagedTaskInput,
     },
     error::{AppError, AppResult},
     oauth_credentials::{
@@ -40,7 +40,8 @@ use crate::{
 const MANAGED_TASK_ARGS: [&str; 5] = ["exec", "--ephemeral", "--sandbox", "workspace-write", "-"];
 const DESKTOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const DESKTOP_QUIT_TIMEOUT: Duration = Duration::from_secs(5);
-const DESKTOP_APP_CANDIDATES: [&str; 2] = ["ChatGPT", "Codex"];
+const DESKTOP_LAUNCH_APP_CANDIDATES: [&str; 1] = ["ChatGPT"];
+const DESKTOP_QUIT_APP_CANDIDATES: [&str; 2] = ["ChatGPT", "Codex"];
 const OAUTH_CALLBACK_PORT: u16 = 1455;
 const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const PERSONAL_ACCESS_TOKEN_WHOAMI_URL: &str =
@@ -242,7 +243,7 @@ impl DesktopCredentialStore for SystemDesktopCredentialStore {
 
 #[cfg(target_os = "macos")]
 fn launch_macos_desktop(codex_home: &Path, user_data_dir: Option<&Path>) -> AppResult<()> {
-    DESKTOP_APP_CANDIDATES
+    DESKTOP_LAUNCH_APP_CANDIDATES
         .iter()
         .copied()
         .find_map(|app| open_macos_desktop_app(app, codex_home, user_data_dir).ok())
@@ -290,7 +291,7 @@ fn macos_desktop_launch_args(
 
 #[cfg(target_os = "macos")]
 fn quit_macos_desktop() -> AppResult<()> {
-    for app in DESKTOP_APP_CANDIDATES {
+    for app in DESKTOP_QUIT_APP_CANDIDATES {
         let _ = Command::new("osascript")
             .args(["-e", &format!("tell application \"{app}\" to quit")])
             .stdin(Stdio::null())
@@ -304,13 +305,35 @@ fn quit_macos_desktop() -> AppResult<()> {
 #[cfg(target_os = "macos")]
 fn desktop_processes_running() -> bool {
     Command::new("pgrep")
-        .args(["-x", "ChatGPT"])
-        .status()
-        .is_ok_and(|status| status.success())
-        || Command::new("pgrep")
-            .args(["-x", "Codex"])
-            .status()
-            .is_ok_and(|status| status.success())
+        .args(["-fl", "ChatGPT|Codex"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(macos_desktop_process_line_matches)
+        })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_desktop_process_line_matches(line: &str) -> bool {
+    let trimmed = line.trim();
+    let command = trimmed
+        .find(char::is_whitespace)
+        .map(|index| trimmed[index..].trim())
+        .unwrap_or(trimmed);
+    let executable = command
+        .rsplit('/')
+        .next()
+        .unwrap_or(command)
+        .split(" --")
+        .next()
+        .unwrap_or(command)
+        .trim();
+    executable == "ChatGPT"
+        || executable == "Codex"
+        || executable.starts_with("ChatGPT Helper")
+        || executable.starts_with("Codex Helper")
 }
 
 #[cfg(target_os = "macos")]
@@ -487,6 +510,11 @@ struct CurrentProfileAttempt {
     profile_id: String,
     phase: CurrentProfileAttemptPhase,
     workspace_mode: DesktopWorkspaceMode,
+}
+
+struct PreparedDesktopLaunch {
+    home: PathBuf,
+    user_data_dir: Option<PathBuf>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CurrentProfileAttemptPhase {
@@ -1361,6 +1389,7 @@ fn rate_limit_window(window: RateLimitWindow) -> ProfileQuotaWindow {
 
 pub struct CodexRuntime {
     root: PathBuf,
+    default_home_override: Option<PathBuf>,
     secrets: Arc<dyn SecretStore>,
     runner: Arc<dyn CodexRunner>,
     browser: Arc<dyn BrowserLauncher>,
@@ -1378,6 +1407,7 @@ impl CodexRuntime {
         let _ = fs::remove_dir_all(root.join("quota-refresh"));
         Self::with_dependencies(
             root,
+            None,
             secrets,
             Arc::new(SystemCodexRunner),
             Arc::new(SystemBrowserLauncher),
@@ -1594,6 +1624,7 @@ impl CodexRuntime {
     }
     fn with_dependencies(
         root: PathBuf,
+        default_home_override: Option<PathBuf>,
         secrets: Arc<dyn SecretStore>,
         runner: Arc<dyn CodexRunner>,
         browser: Arc<dyn BrowserLauncher>,
@@ -1602,6 +1633,7 @@ impl CodexRuntime {
     ) -> Self {
         Self {
             root,
+            default_home_override,
             secrets,
             runner,
             browser,
@@ -1706,6 +1738,153 @@ impl CodexRuntime {
             CurrentProfileAttemptPhase::Switching,
             workspace_mode,
         ))
+    }
+
+    pub fn activate_shared_profile_after_history<F>(
+        self: &Arc<Self>,
+        profile: StoredProfile,
+        mut credential: CodexOAuthCredential,
+        sync_history: F,
+    ) -> AppResult<CurrentProfileActivation>
+    where
+        F: FnOnce(&Path) -> CodexHistoryTransitionStatus,
+    {
+        self.verify_profile(&profile)?;
+        let _operation = self.auth_operation.lock().map_err(|_| AppError::Internal)?;
+        if self
+            .current_profile_attempt
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .as_ref()
+            .is_some_and(|attempt| attempt.phase == CurrentProfileAttemptPhase::Switching)
+        {
+            return Err(AppError::Conflict);
+        }
+        let id = Uuid::new_v4().to_string();
+        let profile_id = profile.profile.id.clone();
+        let credential_ref = profile
+            .secret_ref
+            .clone()
+            .ok_or(AppError::ProfileRuntimeUnavailable)?;
+        *self
+            .current_profile_attempt
+            .lock()
+            .map_err(|_| AppError::Internal)? = Some(CurrentProfileAttempt {
+            id: id.clone(),
+            profile_id: profile_id.clone(),
+            phase: CurrentProfileAttemptPhase::Switching,
+            workspace_mode: DesktopWorkspaceMode::Shared,
+        });
+
+        let mut history_sync_status = None;
+        let result = (|| -> AppResult<CurrentProfileAttemptPhase> {
+            if credential_needs_refresh(&credential) {
+                credential = tauri::async_runtime::block_on(refresh_credential(&credential))?;
+                let serialized =
+                    serde_json::to_string(&credential).map_err(|_| AppError::Internal)?;
+                tauri::async_runtime::block_on(self.secrets.set(&credential_ref, &serialized))?;
+            }
+            if self.write_default_credential(&credential).is_err() {
+                return Ok(CurrentProfileAttemptPhase::AuthFileWriteFailed);
+            }
+            self.stop_managed_task()?;
+            let auth_json = credential.auth_json()?;
+            let prepared = match self.prepare_profile_desktop_auth_json(
+                &profile_id,
+                &auth_json,
+                &DesktopWorkspaceLaunch::Shared,
+            ) {
+                Ok(prepared) => prepared,
+                Err(_) => return Ok(CurrentProfileAttemptPhase::DesktopRestartFailed),
+            };
+            if self.quit_desktop_for_shared_switch().is_err() {
+                return Ok(CurrentProfileAttemptPhase::DesktopRestartFailed);
+            }
+            history_sync_status = Some(sync_history(&prepared.home));
+            Ok(desktop_switch_phase(
+                self.launch_prepared_desktop(&prepared),
+            ))
+        })();
+        let phase = result.unwrap_or(CurrentProfileAttemptPhase::Failed);
+        if let Ok(mut attempt) = self.current_profile_attempt.lock() {
+            if attempt.as_ref().is_some_and(|current| current.id == id) {
+                if let Some(current) = attempt.as_mut() {
+                    current.phase = phase;
+                }
+            }
+        }
+        let mut activation =
+            current_profile_status(profile_id, Some(id), phase, DesktopWorkspaceMode::Shared);
+        activation.history_sync_status = history_sync_status;
+        Ok(activation)
+    }
+
+    pub fn activate_shared_profile_auth_json_after_history<F>(
+        self: &Arc<Self>,
+        profile: StoredProfile,
+        auth_json: String,
+        sync_history: F,
+    ) -> AppResult<CurrentProfileActivation>
+    where
+        F: FnOnce(&Path) -> CodexHistoryTransitionStatus,
+    {
+        self.verify_profile(&profile)?;
+        let _operation = self.auth_operation.lock().map_err(|_| AppError::Internal)?;
+        if self
+            .current_profile_attempt
+            .lock()
+            .map_err(|_| AppError::Internal)?
+            .as_ref()
+            .is_some_and(|attempt| attempt.phase == CurrentProfileAttemptPhase::Switching)
+        {
+            return Err(AppError::Conflict);
+        }
+        let id = Uuid::new_v4().to_string();
+        let profile_id = profile.profile.id.clone();
+        *self
+            .current_profile_attempt
+            .lock()
+            .map_err(|_| AppError::Internal)? = Some(CurrentProfileAttempt {
+            id: id.clone(),
+            profile_id: profile_id.clone(),
+            phase: CurrentProfileAttemptPhase::Switching,
+            workspace_mode: DesktopWorkspaceMode::Shared,
+        });
+
+        let mut history_sync_status = None;
+        let result = (|| -> AppResult<CurrentProfileAttemptPhase> {
+            if self.write_default_auth_json(&auth_json).is_err() {
+                return Ok(CurrentProfileAttemptPhase::AuthFileWriteFailed);
+            }
+            self.stop_managed_task()?;
+            let prepared = match self.prepare_profile_desktop_auth_json(
+                &profile_id,
+                &auth_json,
+                &DesktopWorkspaceLaunch::Shared,
+            ) {
+                Ok(prepared) => prepared,
+                Err(_) => return Ok(CurrentProfileAttemptPhase::DesktopRestartFailed),
+            };
+            if self.quit_desktop_for_shared_switch().is_err() {
+                return Ok(CurrentProfileAttemptPhase::DesktopRestartFailed);
+            }
+            history_sync_status = Some(sync_history(&prepared.home));
+            Ok(desktop_switch_phase(
+                self.launch_prepared_desktop(&prepared),
+            ))
+        })();
+        let phase = result.unwrap_or(CurrentProfileAttemptPhase::Failed);
+        if let Ok(mut attempt) = self.current_profile_attempt.lock() {
+            if attempt.as_ref().is_some_and(|current| current.id == id) {
+                if let Some(current) = attempt.as_mut() {
+                    current.phase = phase;
+                }
+            }
+        }
+        let mut activation =
+            current_profile_status(profile_id, Some(id), phase, DesktopWorkspaceMode::Shared);
+        activation.history_sync_status = history_sync_status;
+        Ok(activation)
     }
 
     fn complete_switch(
@@ -1963,14 +2142,22 @@ impl CodexRuntime {
     }
 
     fn write_default_credential(&self, credential: &CodexOAuthCredential) -> AppResult<()> {
-        let home = default_codex_home()?;
+        let home = self.default_codex_home()?;
         self.write_credential_to_home(&home, credential)
     }
 
     fn write_default_auth_json(&self, auth_json: &str) -> AppResult<()> {
-        let home = default_codex_home()?;
+        let home = self.default_codex_home()?;
         self.write_auth_json_to_home(&home, auth_json)
     }
+
+    fn default_codex_home(&self) -> AppResult<PathBuf> {
+        self.default_home_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_codex_home)
+    }
+
     fn write_credential_to_home(
         &self,
         home: &Path,
@@ -2004,18 +2191,9 @@ impl CodexRuntime {
         credential: &CodexOAuthCredential,
         workspace: &DesktopWorkspaceLaunch,
     ) -> AppResult<()> {
-        let home = self.profile_home(profile_id);
-        self.write_credential_to_home(&home, credential)?;
         let auth_json = credential.auth_json()?;
-        self.desktop_credentials.project(&home, &auth_json)?;
-        let user_data_dir = match workspace {
-            DesktopWorkspaceLaunch::Fresh(id) => Some(self.fresh_desktop_user_data(id)),
-            DesktopWorkspaceLaunch::Shared => None,
-        };
-        if let Some(directory) = user_data_dir.as_deref() {
-            fs::create_dir_all(directory).map_err(|_| AppError::RuntimeUnavailable)?;
-        }
-        self.desktop.launch(&home, user_data_dir.as_deref())
+        let prepared = self.prepare_profile_desktop_auth_json(profile_id, &auth_json, workspace)?;
+        self.launch_prepared_desktop(&prepared)
     }
 
     fn launch_profile_desktop_auth_json(
@@ -2024,17 +2202,37 @@ impl CodexRuntime {
         auth_json: &str,
         workspace: &DesktopWorkspaceLaunch,
     ) -> AppResult<()> {
-        let home = self.profile_home(profile_id);
-        self.write_auth_json_to_home(&home, auth_json)?;
-        self.desktop_credentials.project(&home, auth_json)?;
-        let user_data_dir = match workspace {
-            DesktopWorkspaceLaunch::Fresh(id) => Some(self.fresh_desktop_user_data(id)),
-            DesktopWorkspaceLaunch::Shared => None,
+        let prepared = self.prepare_profile_desktop_auth_json(profile_id, auth_json, workspace)?;
+        self.launch_prepared_desktop(&prepared)
+    }
+
+    fn prepare_profile_desktop_auth_json(
+        &self,
+        profile_id: &str,
+        auth_json: &str,
+        workspace: &DesktopWorkspaceLaunch,
+    ) -> AppResult<PreparedDesktopLaunch> {
+        let profile_home = self.profile_home(profile_id);
+        self.write_auth_json_to_home(&profile_home, auth_json)?;
+        self.desktop_credentials.project(&profile_home, auth_json)?;
+        let (home, user_data_dir) = match workspace {
+            DesktopWorkspaceLaunch::Fresh(id) => {
+                (profile_home, Some(self.fresh_desktop_user_data(id)))
+            }
+            DesktopWorkspaceLaunch::Shared => (self.default_codex_home()?, None),
         };
         if let Some(directory) = user_data_dir.as_deref() {
             fs::create_dir_all(directory).map_err(|_| AppError::RuntimeUnavailable)?;
         }
-        self.desktop.launch(&home, user_data_dir.as_deref())
+        Ok(PreparedDesktopLaunch {
+            home,
+            user_data_dir,
+        })
+    }
+
+    fn launch_prepared_desktop(&self, prepared: &PreparedDesktopLaunch) -> AppResult<()> {
+        self.desktop
+            .launch(&prepared.home, prepared.user_data_dir.as_deref())
     }
     fn stop_managed_task(&self) -> AppResult<()> {
         let mut task = self.managed_task.lock().map_err(|_| AppError::Internal)?;
@@ -2074,9 +2272,11 @@ impl CodexRuntime {
     pub fn quit_desktop_for_shared_switch(&self) -> AppResult<()> {
         self.desktop.quit_running()
     }
-    pub fn restart_default_desktop_for_shared_switch(&self) -> AppResult<()> {
-        self.desktop.quit_running()?;
-        self.desktop.launch(&default_codex_home()?, None)
+    pub fn default_codex_home_for_shared_switch(&self) -> AppResult<PathBuf> {
+        self.default_codex_home()
+    }
+    pub fn launch_desktop_for_shared_switch(&self, codex_home: &Path) -> AppResult<()> {
+        self.desktop.launch(codex_home, None)
     }
     pub fn delete_fresh_desktop_workspace(&self, id: &str) -> AppResult<()> {
         Uuid::parse_str(id).map_err(|_| AppError::ValidationFailed)?;
@@ -2590,7 +2790,7 @@ fn current_profile_status(
         ),
         CurrentProfileAttemptPhase::Activated => (
             "activated",
-            format!("Codex 凭据已切换，{workspace}的 ChatGPT/Codex 桌面实例已启动。"),
+            format!("Codex 凭据已切换，{workspace}的 ChatGPT.app 桌面实例已启动。"),
         ),
         CurrentProfileAttemptPhase::AuthFileWriteFailed => (
             "auth_file_write_failed",
@@ -2598,7 +2798,7 @@ fn current_profile_status(
         ),
         CurrentProfileAttemptPhase::DesktopRestartFailed => (
             "desktop_restart_failed",
-            format!("Codex 凭据已切换，但{workspace}的 ChatGPT/Codex 桌面实例未能启动；请确认应用已安装后重试。"),
+            format!("Codex 凭据已切换，但{workspace}的 ChatGPT.app 桌面实例未能启动；请确认应用已安装后重试。"),
         ),
         CurrentProfileAttemptPhase::Failed => {
             ("failed", "账号切换未完成；请检查保存的 OAuth 凭据后重试。".into())
@@ -3000,6 +3200,7 @@ mod tests {
     fn runtime_with_browser(browser: Arc<dyn BrowserLauncher>) -> CodexRuntime {
         CodexRuntime::with_dependencies(
             PathBuf::from("/relay"),
+            None,
             Arc::new(crate::secrets::MemorySecretStore::new()),
             Arc::new(NoopRunner),
             browser,
@@ -3039,6 +3240,40 @@ mod tests {
                 .unwrap()
                 .push(codex_home.to_path_buf());
             Ok(())
+        }
+    }
+
+    fn stored_oauth_profile(id: &str) -> StoredProfile {
+        StoredProfile {
+            profile: crate::domain::MaskedProfile {
+                id: id.to_owned(),
+                alias: "Test OAuth".to_owned(),
+                kind: ProfileKind::CodexOauth,
+                base_url: None,
+                provider: crate::domain::GatewayProvider::OpenAi,
+                wire_api: crate::domain::GatewayWireApi::Responses,
+                enabled: true,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+                models: Vec::new(),
+                model_mappings: Vec::new(),
+                health: "healthy".to_owned(),
+                cooldown_until_ms: None,
+                credential_configured: true,
+                auth_mode: crate::domain::CodexAuthMode::OAuth,
+                codex_oauth_profile_id: None,
+                is_current: false,
+                account: None,
+                validation_status: "valid".to_owned(),
+                validated_at_ms: None,
+                validation_message: None,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
+            },
+            secret_ref: Some(format!("profile:{id}:credential")),
+            credential_fingerprint: None,
         }
     }
 
@@ -3311,14 +3546,89 @@ mod tests {
     }
 
     #[test]
+    fn shared_activation_syncs_history_after_projection_before_launching() {
+        let root = std::env::temp_dir().join(format!("codex-relay-test-{}", Uuid::new_v4()));
+        let default_home = root.join("default-home");
+        let desktop = Arc::new(RecordingDesktop::default());
+        let keychain = Arc::new(RecordingDesktopCredentialStore {
+            projections: Mutex::new(Vec::new()),
+        });
+        let runtime = Arc::new(CodexRuntime::with_dependencies(
+            root.clone(),
+            Some(default_home.clone()),
+            Arc::new(crate::secrets::MemorySecretStore::new()),
+            Arc::new(NoopRunner),
+            Arc::new(RecordingBrowser {
+                urls: Mutex::new(Vec::new()),
+                fails: false,
+            }),
+            desktop.clone(),
+            keychain.clone(),
+        ));
+        let credential = CodexOAuthCredential {
+            id_token: "id".into(),
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            account_id: None,
+            last_refresh_ms: 1,
+        };
+        let saw_history_sync = Arc::new(Mutex::new(false));
+        let saw_history_sync_in_callback = Arc::clone(&saw_history_sync);
+        let profile_home = root.join("runtimes/profile-a");
+
+        let activation = runtime
+            .activate_shared_profile_after_history(
+                stored_oauth_profile("profile-a"),
+                credential,
+                |home| {
+                    assert_eq!(home, default_home.as_path());
+                    assert!(default_home.join("auth.json").exists());
+                    assert!(profile_home.join("auth.json").exists());
+                    assert_eq!(
+                        keychain.projections.lock().unwrap().as_slice(),
+                        &[profile_home.to_path_buf()]
+                    );
+                    assert_eq!(*desktop.quits.lock().unwrap(), 1);
+                    assert!(desktop.launches.lock().unwrap().is_empty());
+                    *saw_history_sync_in_callback.lock().unwrap() = true;
+                    CodexHistoryTransitionStatus {
+                        status: "completed".to_owned(),
+                        message: "history synced".to_owned(),
+                        queued_at_ms: 1,
+                        completed_at_ms: Some(2),
+                        warnings: Vec::new(),
+                    }
+                },
+            )
+            .unwrap();
+
+        assert_eq!(activation.status, "activated");
+        assert_eq!(
+            activation
+                .history_sync_status
+                .as_ref()
+                .map(|status| status.status.as_str()),
+            Some("completed")
+        );
+        assert!(*saw_history_sync.lock().unwrap());
+        assert_eq!(
+            desktop.launches.lock().unwrap().as_slice(),
+            &[(default_home, None)]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn projects_credentials_to_profile_home_before_launching() {
         let root = std::env::temp_dir().join(format!("codex-relay-test-{}", Uuid::new_v4()));
+        let default_home = root.join("default-home");
         let desktop = Arc::new(RecordingDesktop::default());
         let keychain = Arc::new(RecordingDesktopCredentialStore {
             projections: Mutex::new(Vec::new()),
         });
         let runtime = CodexRuntime::with_dependencies(
             root.clone(),
+            Some(default_home.clone()),
             Arc::new(crate::secrets::MemorySecretStore::new()),
             Arc::new(NoopRunner),
             Arc::new(RecordingBrowser {
@@ -3368,16 +3678,21 @@ mod tests {
             keychain.projections.lock().unwrap().as_slice(),
             std::slice::from_ref(&home)
         );
-        assert_eq!(desktop.launches.lock().unwrap().as_slice(), &[(home, None)]);
+        assert_eq!(
+            desktop.launches.lock().unwrap().as_slice(),
+            &[(default_home, None)]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn shared_workspace_launch_never_receives_an_electron_data_directory() {
         let root = std::env::temp_dir().join(format!("codex-relay-test-{}", Uuid::new_v4()));
+        let default_home = root.join("default-home");
         let desktop = Arc::new(RecordingDesktop::default());
         let runtime = CodexRuntime::with_dependencies(
             root.clone(),
+            Some(default_home.clone()),
             Arc::new(crate::secrets::MemorySecretStore::new()),
             Arc::new(NoopRunner),
             Arc::new(RecordingBrowser {
@@ -3403,7 +3718,7 @@ mod tests {
 
         assert_eq!(
             desktop.launches.lock().unwrap().as_slice(),
-            &[(root.join("runtimes/profile-a"), None)]
+            &[(default_home, None)]
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -3425,8 +3740,23 @@ mod tests {
     }
 
     #[test]
-    fn keeps_desktop_app_candidate_order_stable() {
-        assert_eq!(DESKTOP_APP_CANDIDATES, ["ChatGPT", "Codex"]);
+    fn launches_chatgpt_app_without_falling_back_to_codex_app() {
+        assert_eq!(DESKTOP_LAUNCH_APP_CANDIDATES, ["ChatGPT"]);
+        assert_eq!(DESKTOP_QUIT_APP_CANDIDATES, ["ChatGPT", "Codex"]);
+    }
+
+    #[test]
+    fn recognizes_chatgpt_and_codex_helper_processes() {
+        assert!(macos_desktop_process_line_matches("123 ChatGPT"));
+        assert!(macos_desktop_process_line_matches(
+            "123 ChatGPT Helper (Renderer)"
+        ));
+        assert!(macos_desktop_process_line_matches(
+            "123 /Applications/ChatGPT.app/Contents/Frameworks/ChatGPT Helper (GPU).app/Contents/MacOS/ChatGPT Helper (GPU) --type=gpu-process"
+        ));
+        assert!(macos_desktop_process_line_matches("123 Codex Helper"));
+        assert!(!macos_desktop_process_line_matches("123 Codex Relay"));
+        assert!(!macos_desktop_process_line_matches("123 Other App"));
     }
 
     #[test]

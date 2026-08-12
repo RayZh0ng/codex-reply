@@ -15,11 +15,14 @@ import {
   type AppUpdateInfo,
   type AppUpdateProgressEvent,
   type AppUpdateSettings,
+  type CodexEnvironmentCheck,
   type CodexEnvironmentInstallReport,
   type CodexEnvironmentReport,
   type DesktopWorkspaceHistoryItem,
 } from "../../shared/ipc";
 import type { ThemePreference } from "../../shared/theme";
+import { Button, EmptyState, InlineNotice, PageHeader } from "../../shared/ui";
+import "./settings.css";
 
 const themes: Array<{
   value: ThemePreference;
@@ -115,12 +118,10 @@ export function Settings({
 
   return (
     <div className="page settings-page">
-      <header className="page-heading" data-animate="heading">
-        <div>
-          <h1>客户端工作区</h1>
-          <p className="page-subtitle">管理应用外观与 Codex 档案的桌面工作区。</p>
-        </div>
-      </header>
+      <PageHeader
+        description="管理应用外观、软件更新、Codex 本机环境与历史工作区。"
+        title="设置"
+      />
       <section className="surface-card appearance-settings" data-animate="cards">
         <div className="card-heading">
           <div>
@@ -201,39 +202,47 @@ export function Settings({
           <span>启动时自动检查更新</span>
         </label>
         {availableUpdate ? (
-          <article className="update-available-panel" role="status">
-            <strong>
-              发现 {formatUpdateChannel(availableUpdate.channel)}
-              更新：{availableUpdate.version}
-            </strong>
+          <InlineNotice
+            tone="success"
+            title={
+              <>
+                发现 {formatUpdateChannel(availableUpdate.channel)}
+                更新：{availableUpdate.version}
+              </>
+            }
+          >
             <p>
               当前版本 {availableUpdate.current_version}
               {availableUpdate.date ? ` · 发布于 ${availableUpdate.date}` : ""}
             </p>
             {availableUpdate.body && <p>{availableUpdate.body}</p>}
-          </article>
+          </InlineNotice>
         ) : (
           updateStatus && <p className="form-note">{updateStatus}</p>
         )}
         {updateProgress && <UpdateProgressPanel progress={updateProgress} />}
         <div className="update-actions">
-          <button
-            className="quiet-button"
+          <Button
             disabled={updateControlsDisabled}
+            loading={updateBusy && !updateInProgress}
+            loadingLabel="正在检查"
+            size="sm"
+            variant="secondary"
             onClick={() => void onCheckUpdate()}
-            type="button"
           >
             {updateInProgress ? "正在更新…" : updateBusy ? "正在检查…" : "立即检查更新"}
-          </button>
+          </Button>
           {availableUpdate && (
-            <button
-              className="primary-button"
+            <Button
               disabled={updateControlsDisabled}
+              loading={updateInProgress}
+              loadingLabel="正在更新…"
+              size="sm"
+              variant="primary"
               onClick={() => void onInstallUpdate()}
-              type="button"
             >
               {updateInProgress ? "正在更新…" : "安装并重启"}
-            </button>
+            </Button>
           )}
         </div>
       </section>
@@ -243,7 +252,7 @@ export function Settings({
       >
         <div className="environment-hero">
           <div className="environment-hero-copy">
-            <p className="section-kicker">Environment</p>
+            <p className="section-kicker">本机环境</p>
             <h2>Codex 环境检查</h2>
             <p>
               覆盖 Windows / macOS / Linux：Node.js LTS、npm、Codex CLI、Git、 Codex
@@ -309,22 +318,18 @@ export function Settings({
                     {check.description && <small>{check.description}</small>}
                     <p>{check.detail}</p>
                   </div>
-                  {(check.command || check.next_action) && (
-                    <details className="environment-check-detail">
-                      <summary>修复详情</summary>
-                      {check.next_action && <span>{check.next_action}</span>}
-                      {check.command && <code>{check.command}</code>}
-                    </details>
-                  )}
+                  <EnvironmentCheckDetail check={check} />
                 </li>
               ))}
             </ul>
           </>
         ) : (
-          <div className="environment-empty-state">
-            <TerminalWindow size={24} weight="duotone" />
-            <p>点击“重新检查”获取当前 Codex 本机环境状态。</p>
-          </div>
+          <EmptyState
+            compact
+            description="检查 Node.js、npm、Codex CLI、Git、OAuth 回调、默认浏览器与 Relay CA。"
+            icon={<TerminalWindow size={22} weight="duotone" />}
+            title="尚未检查本机环境"
+          />
         )}
         {codexEnvironmentInstall && (
           <details
@@ -352,30 +357,34 @@ export function Settings({
           </details>
         )}
         <div className="environment-actions">
-          <button
-            className="quiet-button"
+          <Button
             disabled={busy || codexEnvironmentBusy}
+            loading={codexEnvironmentBusy && !canAutoInstall}
+            loadingLabel="正在检查"
+            size="sm"
+            variant="secondary"
             onClick={() => void onRefreshCodexEnvironment()}
-            type="button"
           >
             {codexEnvironmentBusy ? "正在检查…" : "重新检查"}
-          </button>
-          <button
-            className="primary-button"
+          </Button>
+          <Button
             disabled={busy || codexEnvironmentBusy || !canAutoInstall}
+            loading={codexEnvironmentBusy && canAutoInstall}
+            loadingLabel="正在部署"
+            size="sm"
+            variant="primary"
             onClick={() => void onInstallCodexEnvironment()}
-            type="button"
           >
             {codexEnvironmentBusy ? "正在部署…" : "一键部署缺失项"}
-          </button>
-          <button
-            className="quiet-button"
+          </Button>
+          <Button
             disabled={busy || codexEnvironmentBusy || !hasManualCommands}
+            size="sm"
+            variant="quiet"
             onClick={copyManualCommands}
-            type="button"
           >
             复制修复命令
-          </button>
+          </Button>
         </div>
       </section>
       <section className="surface-card workspace-history">
@@ -413,7 +422,12 @@ export function Settings({
             ))}
           </ul>
         ) : (
-          <p className="muted-copy">当前没有可清理的旧独立工作区。</p>
+          <EmptyState
+            compact
+            description="没有历史独立工作区需要清理。"
+            icon={<ShieldCheck size={20} />}
+            title="工作区状态整洁"
+          />
         )}
       </section>
     </div>
@@ -479,6 +493,38 @@ function EnvironmentSummaryIcon({ status }: { status: string }) {
   if (status === "healthy") return <CheckCircle size={24} weight="fill" />;
   if (status === "action_required") return <XCircle size={24} weight="fill" />;
   return <Warning size={24} weight="fill" />;
+}
+
+function EnvironmentCheckDetail({ check }: { check: CodexEnvironmentCheck }) {
+  const command = check.command?.trim();
+  const nextAction = check.next_action?.trim();
+  const hasNextAction = Boolean(nextAction && !isNoopEnvironmentAction(nextAction));
+
+  if (!command && !hasNextAction) return null;
+
+  return (
+    <div
+      className={`environment-check-detail is-${environmentStatusTone(check.status)}`}
+      aria-label={`${check.label}处理建议`}
+    >
+      <div className="environment-check-detail-heading">
+        <span className="environment-check-detail-label">
+          {command ? "处理建议" : "下一步"}
+        </span>
+        <span className="environment-check-detail-hint">
+          {command ? "含可执行命令" : "查看说明"}
+        </span>
+      </div>
+      <div className="environment-check-detail-panel">
+        {hasNextAction && <p>{nextAction}</p>}
+        {command && <code>{command}</code>}
+      </div>
+    </div>
+  );
+}
+
+function isNoopEnvironmentAction(action: string) {
+  return action.replace(/[。.!！\s]/g, "") === "无需处理";
 }
 
 function EnvironmentCheckIcon({ id, status }: { id: string; status: string }) {

@@ -16,6 +16,47 @@ export interface GatewayModelMapping {
   context_window: number | null;
 }
 
+export interface CreateApiServiceProfileInput {
+  alias: string;
+  provider: GatewayProvider;
+  wire_api: GatewayWireApi;
+  base_url: string;
+  api_key: string;
+  model_mappings: GatewayModelMapping[];
+  codex_oauth_profile_id: string | null;
+  in_pool: boolean;
+  priority: number;
+  weight: number;
+  max_concurrency?: number;
+  max_queue_depth?: number;
+  queue_timeout_ms?: number;
+}
+
+export interface UpdateProfileInput {
+  id: string;
+  alias: string;
+  provider?: GatewayProvider;
+  wire_api?: GatewayWireApi;
+  base_url?: string;
+  enabled: boolean;
+  in_pool: boolean;
+  priority: number;
+  weight: number;
+  max_concurrency?: number;
+  max_queue_depth?: number;
+  queue_timeout_ms?: number;
+  models: string[];
+  model_mappings?: GatewayModelMapping[];
+  codex_oauth_profile_id?: string | null;
+  api_key: string | null;
+}
+
+export interface TestApiServiceProfileInput {
+  provider: GatewayProvider;
+  base_url: string;
+  api_key: string;
+}
+
 export interface MaskedProfile {
   id: string;
   alias: string;
@@ -27,6 +68,9 @@ export interface MaskedProfile {
   in_pool: boolean;
   priority: number;
   weight: number;
+  max_concurrency?: number;
+  max_queue_depth?: number;
+  queue_timeout_ms?: number;
   models: string[];
   model_mappings?: GatewayModelMapping[];
   codex_oauth_profile_id: string | null;
@@ -135,6 +179,16 @@ export interface ProfileQuotaRefreshReport {
   failed_profile_ids: string[];
 }
 
+export interface GatewayDirectRouteHealth {
+  status: "ok" | "degraded" | "unavailable" | string;
+  profile_id: string;
+  profile_alias: string;
+  route_mode: "relay_bridge" | "provider_direct" | string;
+  oauth_ready: boolean;
+  credential_ready: boolean;
+  model_count: number;
+}
+
 export interface GatewayStatus {
   running: boolean;
   bind_mode: "lan" | "loopback";
@@ -144,6 +198,10 @@ export interface GatewayStatus {
   cidrs: string[];
   available_profiles: number;
   cooling_profiles: number;
+  pool_status?: "ok" | "unavailable" | string;
+  direct_route?: GatewayDirectRouteHealth | null;
+  active_requests?: number;
+  queued_requests?: number;
   client_key_count: number;
   certificate_ready: boolean;
   service_url: string;
@@ -264,6 +322,65 @@ export interface MetricsSnapshot {
   failed_requests: number;
   average_latency_ms: number | null;
   estimated_tokens: number;
+  window_minutes?: number;
+  window_requests?: number;
+  window_success_rate?: number | null;
+  requests_per_minute?: number;
+  latency_p50_ms?: number | null;
+  latency_p95_ms?: number | null;
+  latency_p99_ms?: number | null;
+  ttfb_p50_ms?: number | null;
+  ttfb_p95_ms?: number | null;
+  ttfb_p99_ms?: number | null;
+  request_bytes?: number;
+  response_bytes?: number;
+  retry_count?: number;
+  active_requests?: number;
+  queued_requests?: number;
+  telemetry_dropped?: number;
+}
+
+export interface GatewayPerformanceInput {
+  window_minutes: number;
+}
+
+export interface ListGatewayRequestMetricsInput {
+  limit: number;
+  cursor?: number | null;
+  profile_id?: string | null;
+  route?: string | null;
+  status?: string | null;
+}
+
+export interface GatewayRequestMetricSummary {
+  sequence: number;
+  request_id: string;
+  started_at_ms: number;
+  route: string;
+  provider: string;
+  profile_id: string | null;
+  auth_mode: string;
+  stream: boolean;
+  auth_latency_ms: number;
+  queue_latency_ms: number;
+  ttfb_ms: number | null;
+  total_latency_ms: number;
+  request_bytes: number;
+  response_bytes: number;
+  http_status: number;
+  outcome: string;
+  error_category: string | null;
+  upstream_attempts: number;
+  retry_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  upstream_response_id: string | null;
+}
+
+export interface GatewayRequestMetricPage {
+  items: GatewayRequestMetricSummary[];
+  next_cursor: number | null;
 }
 
 export interface MaskedClientKey {
@@ -706,6 +823,8 @@ function recoveryFor(code: string) {
       profile_credential_migration_required:
         "该档案由旧版应用保存；请使用“更新凭据”重新完成一次 OAuth。",
       profile_runtime_unavailable: "请重新授权该 OAuth 档案后重试。",
+      oauth_identity_mismatch:
+        "请在档案页重新授权所选 OAuth 档案，然后重新切换第三方提供商；Relay 会把该登录态写入 auth.json 并重启 ChatGPT.app。",
       gateway_model_unavailable:
         "请刷新可用模型，并确认对应账号已启用且加入网关账号池。",
       app_update_unavailable: "请检查网络连接，或稍后在设置页手动检查软件更新。",
@@ -718,11 +837,11 @@ export const api = {
   dashboard: () => relayInvoke<DashboardSnapshot>("dashboard_snapshot"),
   createProfile: (input: Record<string, unknown>) =>
     relayInvoke<MaskedProfile>("create_profile", { input }),
-  createApiServiceProfile: (input: Record<string, unknown>) =>
+  createApiServiceProfile: (input: CreateApiServiceProfileInput) =>
     relayInvoke<MaskedProfile>("create_api_service_profile", { input }),
-  updateProfile: (input: Record<string, unknown>) =>
+  updateProfile: (input: UpdateProfileInput) =>
     relayInvoke<MaskedProfile>("update_profile", { input }),
-  updateApiServiceProfile: (input: Record<string, unknown>) =>
+  updateApiServiceProfile: (input: UpdateProfileInput) =>
     relayInvoke<ApiServiceProfileUpdateResult>("update_api_service_profile", { input }),
   syncProfileAccountInfo: (id: string) =>
     relayInvoke<MaskedProfile>("sync_profile_account_info", { id }),
@@ -782,12 +901,16 @@ export const api = {
     relayInvoke<GatewayStatus>("update_gateway", { input }),
   startGateway: () => relayInvoke<GatewayStatus>("start_gateway"),
   stopGateway: () => relayInvoke<GatewayStatus>("stop_gateway"),
+  gatewayPerformance: (input: GatewayPerformanceInput = { window_minutes: 60 }) =>
+    relayInvoke<MetricsSnapshot>("gateway_performance", { input }),
+  listGatewayRequestMetrics: (input: ListGatewayRequestMetricsInput) =>
+    relayInvoke<GatewayRequestMetricPage>("list_gateway_request_metrics", { input }),
   exportGatewayCa: (destination: string) =>
     relayInvoke<void>("export_gateway_ca", { destination }),
   trustGatewayCa: () => relayInvoke<void>("trust_gateway_ca"),
   refreshProfileModels: (id: string) =>
     relayInvoke<MaskedProfile>("refresh_profile_models", { id }),
-  testApiServiceProfile: (input: Record<string, unknown>) =>
+  testApiServiceProfile: (input: TestApiServiceProfileInput) =>
     relayInvoke<ApiServiceTestReport>("test_api_service_profile", { input }),
   testExistingApiServiceProfile: (id: string) =>
     relayInvoke<ApiServiceTestReport>("test_existing_api_service_profile", { id }),

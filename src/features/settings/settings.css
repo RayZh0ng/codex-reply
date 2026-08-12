@@ -1,0 +1,270 @@
+.settings-page {
+  width: min(980px, 100%);
+}
+
+.settings-page .page-header {
+  margin-bottom: 20px;
+}
+
+.settings-page
+  :is(
+    .appearance-settings,
+    .update-settings,
+    .codex-environment-settings,
+    .workspace-history
+  ) {
+  margin-bottom: 14px;
+}
+
+.appearance-settings,
+.update-settings {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.42fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 18px;
+}
+
+.update-settings {
+  grid-template-columns: minmax(180px, 0.38fr) minmax(0, 1fr);
+  gap: 12px 18px;
+}
+
+.theme-picker label > span,
+.update-channel-picker label > span,
+.update-channel-picker label > small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-channel-picker label > small {
+  color: var(--color-text-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+}
+
+.update-settings > .inline-notice,
+.update-settings > .form-note,
+.update-settings > .update-progress-meter,
+.update-progress-panel,
+.update-actions,
+.update-toggle {
+  grid-column: 2;
+}
+
+.update-settings > .form-note {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.update-settings .update-channel-picker {
+  max-width: 540px;
+}
+
+.update-settings .update-channel-picker label {
+  min-height: 42px;
+  padding: 10px 12px;
+}
+
+.update-settings .update-toggle {
+  margin-top: 2px;
+}
+
+.update-settings .update-actions {
+  justify-content: flex-start;
+}
+
+.codex-environment-settings {
+  overflow: hidden;
+  padding: 0;
+}
+
+.environment-hero {
+  padding: 20px;
+  border-bottom: 1px solid var(--color-border);
+  background:
+    radial-gradient(circle at 88% 0%, var(--color-accent-quiet), transparent 38%),
+    color-mix(in srgb, var(--color-surface-subtle) 72%, transparent);
+}
+
+.environment-summary-panel {
+  margin: 16px;
+}
+
+.environment-check-grid {
+  margin: 0 16px 16px;
+  padding: 0;
+  list-style: none;
+}
+
+.environment-check-body {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.environment-check-body strong,
+.environment-check-body small,
+.environment-check-body p {
+  display: block;
+}
+
+.environment-actions {
+  padding: 0 16px 16px;
+}
+
+.environment-install-report {
+  margin: 0 16px 16px;
+}
+
+.environment-check-detail {
+  --environment-detail-tone: var(--color-accent);
+  --environment-detail-soft: var(--color-accent-soft);
+
+  margin-top: 2px;
+  padding: 10px;
+  border: 1px solid
+    color-mix(in srgb, var(--environment-detail-tone) 18%, var(--color-border));
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--environment-detail-soft) 58%, transparent);
+  display: grid;
+  gap: 8px;
+}
+
+.environment-check-detail.is-warning {
+  --environment-detail-tone: var(--color-warning);
+  --environment-detail-soft: var(--color-warning-soft);
+}
+
+.environment-check-detail.is-danger {
+  --environment-detail-tone: var(--color-danger);
+  --environment-detail-soft: var(--color-danger-soft);
+}
+
+.environment-check-detail-heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: color-mix(
+    in srgb,
+    var(--environment-detail-tone) 78%,
+    var(--color-text-primary)
+  );
+}
+
+.environment-check-detail-label {
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.environment-check-detail-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.environment-check-detail-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.environment-check-detail-panel p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.environment-check-detail code {
+  border-color: color-mix(
+    in srgb,
+    var(--environment-detail-tone) 16%,
+    var(--color-border)
+  );
+  background: color-mix(in srgb, var(--color-surface) 82%, transparent);
+  color: var(--color-text-primary);
+  font-size: 11px;
+}
+
+.environment-install-report ul {
+  gap: 6px;
+}
+
+.environment-install-report li {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.environment-install-report li.is-done,
+.environment-install-report li.is-success {
+  color: var(--color-success);
+}
+
+.environment-install-report li.is-failed,
+.environment-install-report li.is-error {
+  color: var(--color-danger);
+}
+
+.workspace-history {
+  display: grid;
+  gap: 14px;
+}
+
+.workspace-history > ul li > div:first-child {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.workspace-history > ul span {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+@media (max-width: 860px) {
+  .appearance-settings,
+  .update-settings {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .update-settings > .inline-notice,
+  .update-settings > .form-note,
+  .update-settings > .update-progress-meter,
+  .update-progress-panel,
+  .update-actions,
+  .update-toggle {
+    grid-column: auto;
+  }
+
+  .update-settings .update-channel-picker {
+    max-width: none;
+  }
+
+  .environment-hero {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 620px) {
+  .theme-picker,
+  .update-channel-picker,
+  .environment-summary-metrics,
+  .environment-check-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .update-actions,
+  .environment-actions,
+  .workspace-history > ul li {
+    justify-content: flex-start;
+  }
+}

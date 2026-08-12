@@ -38,6 +38,10 @@ vi.mock("../../shared/ipc", () => ({
     enableCodexGateway: vi.fn(),
     disableCodexGateway: vi.fn(),
     setCodexGatewayOAuthProfile: vi.fn(),
+    listGatewayRequestMetrics: vi.fn().mockResolvedValue({
+      items: [],
+      next_cursor: null,
+    }),
   },
 }));
 
@@ -109,6 +113,61 @@ describe("Gateway", () => {
     expect(
       screen.queryByRole("button", { name: "去档案加入网关" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows direct route health and paged redacted request metrics", async () => {
+    vi.mocked(api.listGatewayRequestMetrics).mockResolvedValueOnce({
+      items: [
+        {
+          sequence: 8,
+          request_id: "request-redacted",
+          started_at_ms: 1_700_000_000_000,
+          route: "v1/responses",
+          provider: "openai_compatible",
+          profile_id: "api-direct",
+          auth_mode: "oauth",
+          stream: true,
+          auth_latency_ms: 1,
+          queue_latency_ms: 2,
+          ttfb_ms: 35,
+          total_latency_ms: 140,
+          request_bytes: 1024,
+          response_bytes: 2048,
+          http_status: 200,
+          outcome: "success",
+          error_category: null,
+          upstream_attempts: 1,
+          retry_count: 0,
+          input_tokens: 10,
+          output_tokens: 5,
+          total_tokens: 15,
+          upstream_response_id: null,
+        },
+      ],
+      next_cursor: 8,
+    });
+
+    renderGateway({
+      pool_status: "unavailable",
+      direct_route: {
+        status: "ok",
+        profile_id: "api-direct",
+        profile_alias: "Zeron",
+        route_mode: "relay_bridge",
+        oauth_ready: true,
+        credential_ready: true,
+        model_count: 1,
+      },
+      active_requests: 2,
+      queued_requests: 1,
+    });
+
+    expect(screen.queryByText("当前没有网关账号成员")).not.toBeInTheDocument();
+    expect(screen.getByText("Direct ok · Zeron")).toBeInTheDocument();
+    expect(screen.getByText("2 活动 · 1 排队")).toBeInTheDocument();
+    expect(await screen.findByText("v1/responses")).toBeInTheDocument();
+    expect(screen.getByText("35 ms / 140 ms")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "加载更多" })).toBeInTheDocument();
   });
 
   it("marks codex-managed keys and hides their revoke action", async () => {
@@ -253,12 +312,16 @@ describe("Gateway", () => {
       oauth_profile_id: "oauth-b",
       oauth_profile_alias: "账号 B",
       message:
-        "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
+        "Codex 已切换到第三方模型提供商“第三方供应商”；OAuth 已应用，模型请求通过 codex_relay_direct 经本机 Relay 固定转发到该提供商。已同步会话并重启 ChatGPT.app。",
     });
     const { onNotice } = renderGateway({ available_profiles: 1 });
 
     const trigger = await screen.findByRole("combobox", { name: "OAuth 登录档案" });
     expect(trigger).toHaveTextContent("账号 A");
+    expect(
+      screen.getByText(/codex_relay_direct 经本机 Relay 固定转发/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/OAuth Token 不会发送给第三方/)).toBeInTheDocument();
     fireEvent.click(trigger);
     fireEvent.click(screen.getByRole("option", { name: "账号 B" }));
 
@@ -266,7 +329,7 @@ describe("Gateway", () => {
       expect(api.setCodexGatewayOAuthProfile).toHaveBeenCalledWith("oauth-b"),
     );
     expect(onNotice).toHaveBeenCalledWith(
-      "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
+      "Codex 已切换到第三方模型提供商“第三方供应商”；OAuth 已应用，模型请求通过 codex_relay_direct 经本机 Relay 固定转发到该提供商。已同步会话并重启 ChatGPT.app。",
     );
     expect(trigger).toHaveTextContent("账号 B");
   });

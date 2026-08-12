@@ -15,7 +15,8 @@ use crate::{
     domain::{
         CodexAuthMode, CreateApiServiceProfileInput, CreateProfileInput, GatewayModelMapping,
         GatewayProvider, GatewayWireApi, MaskedProfile, ProfileAccountSummary, ProfileKind,
-        ProfileQuota, ProfileSubscription, UpdateProfileInput,
+        ProfileQuota, ProfileSubscription, UpdateProfileInput, DEFAULT_PROFILE_MAX_CONCURRENCY,
+        DEFAULT_PROFILE_MAX_QUEUE_DEPTH, DEFAULT_PROFILE_QUEUE_TIMEOUT_MS,
     },
     error::{AppError, AppResult},
     gateway::normalize_base_url,
@@ -141,6 +142,9 @@ pub async fn create_profile(
         in_pool: input.in_pool,
         priority: input.priority,
         weight: input.weight,
+        max_concurrency: input.max_concurrency,
+        max_queue_depth: input.max_queue_depth,
+        queue_timeout_ms: input.queue_timeout_ms,
         models,
         model_mappings,
         health: "unknown".to_owned(),
@@ -175,9 +179,6 @@ pub async fn create_api_service_profile(
     discovered_models: Vec<String>,
 ) -> AppResult<MaskedProfile> {
     let models = normalized_models(discovered_models);
-    if models.is_empty() {
-        return Err(AppError::UpstreamUnavailable);
-    }
     create_profile(
         repository,
         secrets,
@@ -194,6 +195,9 @@ pub async fn create_api_service_profile(
             in_pool: input.in_pool,
             priority: input.priority,
             weight: input.weight,
+            max_concurrency: input.max_concurrency,
+            max_queue_depth: input.max_queue_depth,
+            queue_timeout_ms: input.queue_timeout_ms,
         },
     )
     .await
@@ -207,12 +211,36 @@ pub async fn update_profile(
     if input.alias.trim().is_empty() || input.weight < 1 || input.priority < 0 {
         return Err(AppError::ValidationFailed);
     }
+    for value in [
+        input.max_concurrency,
+        input.max_queue_depth,
+        input.queue_timeout_ms,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value < 0 {
+            return Err(AppError::ValidationFailed);
+        }
+    }
+    if input.max_concurrency == Some(0) || input.queue_timeout_ms == Some(0) {
+        return Err(AppError::ValidationFailed);
+    }
     let mut stored = repository.profile(&input.id)?;
     stored.profile.alias = input.alias.trim().to_owned();
     stored.profile.enabled = input.enabled;
     stored.profile.in_pool = input.in_pool;
     stored.profile.priority = input.priority;
     stored.profile.weight = input.weight;
+    if let Some(value) = input.max_concurrency {
+        stored.profile.max_concurrency = value;
+    }
+    if let Some(value) = input.max_queue_depth {
+        stored.profile.max_queue_depth = value;
+    }
+    if let Some(value) = input.queue_timeout_ms {
+        stored.profile.queue_timeout_ms = value;
+    }
     if stored.profile.kind == ProfileKind::ApiKey {
         if let Some(provider) = input.provider {
             stored.profile.provider = provider;
@@ -262,6 +290,7 @@ pub async fn update_profile(
         .map(|mapping| mapping.model.clone())
         .collect();
     stored.profile.model_mappings = model_mappings;
+    let mut updated_secret = None;
     if let Some(api_key) = input.api_key.filter(|key| !key.trim().is_empty()) {
         if stored.profile.kind != ProfileKind::ApiKey {
             return Err(AppError::ValidationFailed);
@@ -270,11 +299,29 @@ pub async fn update_profile(
             .secret_ref
             .clone()
             .unwrap_or_else(|| format!("profile:{}:api_key", stored.profile.id));
+        let previous = match secrets.get(&reference).await {
+            Ok(secret) => Some(secret),
+            Err(AppError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
         secrets.set(&reference, &api_key).await?;
+        updated_secret = Some((reference.clone(), previous));
         stored.secret_ref = Some(reference);
         stored.profile.credential_configured = true;
     }
-    repository.update_profile(&stored)?;
+    if let Err(error) = repository.update_profile(&stored) {
+        if let Some((reference, previous)) = updated_secret {
+            match previous {
+                Some(previous) => {
+                    let _ = secrets.set(&reference, &previous).await;
+                }
+                None => {
+                    let _ = secrets.delete(&reference).await;
+                }
+            }
+        }
+        return Err(error);
+    }
     Ok(stored.profile)
 }
 
@@ -575,6 +622,9 @@ pub async fn create_oauth_profile(
         in_pool: false,
         priority: 0,
         weight: 1,
+        max_concurrency: DEFAULT_PROFILE_MAX_CONCURRENCY,
+        max_queue_depth: DEFAULT_PROFILE_MAX_QUEUE_DEPTH,
+        queue_timeout_ms: DEFAULT_PROFILE_QUEUE_TIMEOUT_MS,
         models: Vec::new(),
         model_mappings: Vec::new(),
         health: "unknown".to_owned(),
@@ -625,6 +675,9 @@ pub async fn create_imported_profile(
         in_pool: false,
         priority: 0,
         weight: 1,
+        max_concurrency: DEFAULT_PROFILE_MAX_CONCURRENCY,
+        max_queue_depth: DEFAULT_PROFILE_MAX_QUEUE_DEPTH,
+        queue_timeout_ms: DEFAULT_PROFILE_QUEUE_TIMEOUT_MS,
         models: Vec::new(),
         model_mappings: Vec::new(),
         health: "unknown".to_owned(),
@@ -951,7 +1004,13 @@ pub fn timestamp_ms() -> i64 {
 }
 
 fn validate_profile_input(input: &CreateProfileInput) -> AppResult<()> {
-    if input.alias.trim().is_empty() || input.weight < 1 || input.priority < 0 {
+    if input.alias.trim().is_empty()
+        || input.weight < 1
+        || input.priority < 0
+        || input.max_concurrency < 1
+        || input.max_queue_depth < 0
+        || input.queue_timeout_ms < 1
+    {
         return Err(AppError::ValidationFailed);
     }
     match input.kind {
@@ -1078,8 +1137,9 @@ fn normalized_models(models: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidates_for_model, create_imported_profile, create_oauth_profile, create_profile,
-        imported_account_summary, mark_profile_validation_invalid, mark_profile_validation_unknown,
+        candidates_for_model, create_api_service_profile, create_imported_profile,
+        create_oauth_profile, create_profile, imported_account_summary,
+        mark_profile_validation_invalid, mark_profile_validation_unknown,
         migrate_oauth_credentials, save_oauth_credential, sync_oauth_account_info,
         sync_oauth_account_info_with_snapshot, unavailable_quota, update_profile,
         CodexOAuthCredential, ImportedAuthFileCredential, KEYCHAIN_SIGNING_MIGRATION_SETTING,
@@ -1087,10 +1147,10 @@ mod tests {
     use crate::{
         database::Repository,
         domain::{
-            CodexAuthMode, CreateProfileInput, GatewayProvider, GatewayWireApi, ProfileKind,
-            ProfileSubscription, UpdateProfileInput,
+            CodexAuthMode, CreateApiServiceProfileInput, CreateProfileInput, GatewayModelMapping,
+            GatewayProvider, GatewayWireApi, ProfileKind, ProfileSubscription, UpdateProfileInput,
         },
-        secrets::MemorySecretStore,
+        secrets::{MemorySecretStore, SecretStore},
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use std::sync::Arc;
@@ -1156,6 +1216,9 @@ mod tests {
                 in_pool: true,
                 priority: 0,
                 weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
         )
         .await;
@@ -1182,6 +1245,9 @@ mod tests {
                 in_pool: true,
                 priority: 0,
                 weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
         )
         .await
@@ -1189,6 +1255,157 @@ mod tests {
         let profile = repository.list_profiles().unwrap().remove(0);
         assert!(profile.secret_ref.unwrap().starts_with("profile:"));
         assert!(profile.profile.credential_configured);
+    }
+
+    #[tokio::test]
+    async fn profile_update_restores_the_previous_secret_when_database_write_fails() {
+        let repository = Repository::memory();
+        let secrets = Arc::new(MemorySecretStore::new());
+        let primary = create_profile(
+            &repository,
+            secrets.clone(),
+            CreateProfileInput {
+                alias: "Primary".into(),
+                kind: ProfileKind::ApiKey,
+                base_url: Some("https://api.example.com/v1".into()),
+                provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
+                api_key: Some("old-secret".into()),
+                models: vec!["codex-visible".into()],
+                model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
+            },
+        )
+        .await
+        .unwrap();
+        create_profile(
+            &repository,
+            secrets.clone(),
+            CreateProfileInput {
+                alias: "Existing".into(),
+                kind: ProfileKind::ApiKey,
+                base_url: Some("https://other.example.com/v1".into()),
+                provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
+                api_key: Some("other-secret".into()),
+                models: vec!["other-model".into()],
+                model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
+            },
+        )
+        .await
+        .unwrap();
+        let secret_ref = repository.profile(&primary.id).unwrap().secret_ref.unwrap();
+
+        let result = update_profile(
+            &repository,
+            secrets.clone(),
+            UpdateProfileInput {
+                id: primary.id.clone(),
+                alias: "Existing".into(),
+                provider: Some(GatewayProvider::OpenAiCompatible),
+                wire_api: Some(GatewayWireApi::Responses),
+                base_url: Some("https://api.example.com/v1".into()),
+                enabled: true,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+                models: vec!["codex-visible".into()],
+                model_mappings: None,
+                codex_oauth_profile_id: None,
+                api_key: Some("new-secret".into()),
+                max_concurrency: None,
+                max_queue_depth: None,
+                queue_timeout_ms: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            repository.profile(&primary.id).unwrap().profile.alias,
+            "Primary"
+        );
+        assert_eq!(secrets.get(&secret_ref).await.unwrap(), "old-secret");
+    }
+
+    #[tokio::test]
+    async fn api_profile_creation_accepts_manual_mappings_when_discovery_is_empty() {
+        let repository = Repository::memory();
+        let created = create_api_service_profile(
+            &repository,
+            Arc::new(MemorySecretStore::new()),
+            CreateApiServiceProfileInput {
+                alias: "Manual provider".into(),
+                provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
+                base_url: "https://api.example.com/v1".into(),
+                api_key: "sk-test".into(),
+                model_mappings: vec![GatewayModelMapping {
+                    model: "codex-visible".into(),
+                    upstream_model: "provider-real".into(),
+                    display_name: None,
+                    context_window: None,
+                }],
+                codex_oauth_profile_id: None,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(created.models, vec!["codex-visible"]);
+        assert_eq!(created.model_mappings[0].upstream_model, "provider-real");
+    }
+
+    #[tokio::test]
+    async fn api_profile_creation_rejects_empty_discovery_and_mappings() {
+        let repository = Repository::memory();
+        let result = create_api_service_profile(
+            &repository,
+            Arc::new(MemorySecretStore::new()),
+            CreateApiServiceProfileInput {
+                alias: "Empty provider".into(),
+                provider: GatewayProvider::OpenAiCompatible,
+                wire_api: GatewayWireApi::Responses,
+                base_url: "https://api.example.com/v1".into(),
+                api_key: "sk-test".into(),
+                model_mappings: Vec::new(),
+                codex_oauth_profile_id: None,
+                in_pool: false,
+                priority: 0,
+                weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
+            },
+            Vec::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::AppError::ValidationFailed)
+        ));
+        assert!(repository.list_profiles().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1257,6 +1474,9 @@ mod tests {
                 in_pool: false,
                 priority: 0,
                 weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
         )
         .await
@@ -1283,6 +1503,9 @@ mod tests {
                 model_mappings: None,
                 codex_oauth_profile_id: Some(None),
                 api_key: None,
+                max_concurrency: None,
+                max_queue_depth: None,
+                queue_timeout_ms: None,
             },
         )
         .await
@@ -1335,6 +1558,9 @@ mod tests {
                 in_pool: false,
                 priority: 0,
                 weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
         )
         .await;
@@ -1370,6 +1596,9 @@ mod tests {
                 in_pool: true,
                 priority: 0,
                 weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
         )
         .await
@@ -1460,6 +1689,9 @@ mod tests {
                 in_pool: true,
                 priority: 0,
                 weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
         )
         .await
@@ -1766,6 +1998,9 @@ mod tests {
                 in_pool: false,
                 priority: 0,
                 weight: 1,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
         )
         .await;

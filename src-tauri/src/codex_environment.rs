@@ -350,7 +350,7 @@ fn environment_checks(
                 args: &["--version"],
                 install_command: install_command_display(platform, inventory, STEP_CODEX_CLI),
                 description: Some("协作任务、模型刷新和部分本机 Codex 能力需要 CLI 可执行文件。"),
-                validator: None,
+                validator: Some(validate_codex_version),
             },
         ),
         command_check(
@@ -546,6 +546,39 @@ fn validate_node_version(detail: &str) -> Option<(String, String)> {
                 .to_owned(),
         )
     })
+}
+
+fn validate_codex_version(detail: &str) -> Option<(String, String)> {
+    let version = detail
+        .split_whitespace()
+        .find_map(|part| parse_version_triplet(part.trim_start_matches('v')))?;
+    if matches!(version, (0, 144, 6) | (0, 147, 0)) {
+        return None;
+    }
+    if version < (0, 144, 6) {
+        return Some((
+            "warning".to_owned(),
+            "当前 Codex CLI 低于已验证的 0.144.6；请升级到 0.147.0 后重新检查。".to_owned(),
+        ));
+    }
+    Some((
+        "warning".to_owned(),
+        format!(
+            "Codex CLI {}.{}.{} 尚未完成 Relay 自动化兼容验证；可继续运行，但建议保留回退版本。",
+            version.0, version.1, version.2
+        ),
+    ))
+}
+
+fn parse_version_triplet(value: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = value.split(|character: char| !character.is_ascii_digit() && character != '.');
+    let candidate = parts.find(|part| part.matches('.').count() >= 2)?;
+    let mut numbers = candidate.split('.');
+    Some((
+        numbers.next()?.parse().ok()?,
+        numbers.next()?.parse().ok()?,
+        numbers.next()?.parse().ok()?,
+    ))
 }
 
 fn next_action_for_missing(command: &str, install_command: Option<&str>) -> String {
@@ -1469,5 +1502,15 @@ mod tests {
             .iter()
             .any(|log| log.status == "needs_privilege"));
         assert!(report.logs.iter().any(|log| log.status == "completed"));
+    }
+
+    #[test]
+    fn codex_version_validator_accepts_verified_versions_and_warns_other_versions() {
+        assert!(validate_codex_version("codex-cli 0.144.6").is_none());
+        assert!(validate_codex_version("codex-cli 0.147.0").is_none());
+        assert!(validate_codex_version("codex-cli 0.140.0")
+            .is_some_and(|(_, action)| action.contains("升级")));
+        assert!(validate_codex_version("codex-cli 0.148.0")
+            .is_some_and(|(_, action)| action.contains("尚未完成")));
     }
 }

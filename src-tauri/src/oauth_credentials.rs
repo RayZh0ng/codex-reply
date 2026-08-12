@@ -221,8 +221,11 @@ fn map_missing_credential(error: AppError) -> AppError {
 }
 
 pub(crate) fn credential_needs_refresh(credential: &CodexOAuthCredential) -> bool {
-    let payload = credential
-        .access_token
+    token_needs_refresh(&credential.access_token) || token_needs_refresh(&credential.id_token)
+}
+
+fn token_needs_refresh(token: &str) -> bool {
+    let payload = token
         .split('.')
         .nth(1)
         .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
@@ -280,13 +283,21 @@ pub(crate) async fn refresh_credential(
 mod tests {
     use std::sync::Arc;
 
-    use super::{CredentialAccess, OAuthCredentialStore};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    use super::{credential_needs_refresh, CredentialAccess, OAuthCredentialStore};
     use crate::{
         database::StoredProfile,
         domain::{GatewayProvider, GatewayWireApi, MaskedProfile, ProfileKind},
-        profiles::{CodexOAuthCredential, ImportedAuthFileCredential},
+        profiles::{timestamp_ms, CodexOAuthCredential, ImportedAuthFileCredential},
         secrets::{MemorySecretStore, SecretStore},
     };
+
+    fn jwt_with_expiry(expiry_ms: i64) -> String {
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&serde_json::json!({"exp": expiry_ms / 1000})).unwrap());
+        format!("header.{payload}.signature")
+    }
 
     fn profile() -> StoredProfile {
         StoredProfile {
@@ -313,6 +324,9 @@ mod tests {
                 validation_status: "unknown".to_owned(),
                 validated_at_ms: None,
                 validation_message: None,
+                max_concurrency: 4,
+                max_queue_depth: 8,
+                queue_timeout_ms: 15_000,
             },
             secret_ref: Some("profile:oauth:oauth".into()),
             credential_fingerprint: None,
@@ -356,5 +370,33 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.access_token, "access");
         assert_eq!(loaded.account_id.as_deref(), Some("account"));
+    }
+
+    #[test]
+    fn refreshes_when_id_token_is_expiring_even_if_access_token_is_fresh() {
+        let now = timestamp_ms();
+        let credential = CodexOAuthCredential {
+            id_token: jwt_with_expiry(now + 60_000),
+            access_token: jwt_with_expiry(now + 86_400_000),
+            refresh_token: Some("refresh".into()),
+            account_id: Some("account".into()),
+            last_refresh_ms: now,
+        };
+
+        assert!(credential_needs_refresh(&credential));
+    }
+
+    #[test]
+    fn keeps_credential_when_access_and_id_tokens_are_fresh() {
+        let now = timestamp_ms();
+        let credential = CodexOAuthCredential {
+            id_token: jwt_with_expiry(now + 86_400_000),
+            access_token: jwt_with_expiry(now + 86_400_000),
+            refresh_token: Some("refresh".into()),
+            account_id: Some("account".into()),
+            last_refresh_ms: now,
+        };
+
+        assert!(!credential_needs_refresh(&credential));
     }
 }

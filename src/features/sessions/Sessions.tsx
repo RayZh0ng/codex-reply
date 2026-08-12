@@ -17,7 +17,15 @@ import {
   type CodexHistorySyncReport,
   type CodexHistoryTransitionStatus,
 } from "../../shared/ipc";
-import { Button, Dialog } from "../../shared/ui";
+import {
+  Button,
+  Dialog,
+  EmptyState,
+  InlineNotice,
+  PageHeader,
+  StatusPill,
+} from "../../shared/ui";
+import "./sessions.css";
 
 interface SessionsProps {
   busy: boolean;
@@ -240,80 +248,74 @@ export function Sessions({ busy, historySyncStatus = null, onNotice }: SessionsP
 
   return (
     <div className="page sessions-page">
-      <header className="page-heading" data-animate="heading">
-        <div>
-          <p className="section-kicker">Sessions</p>
-          <h1>Codex 会话管理</h1>
-          <p className="page-subtitle">
-            按项目管理默认客户端、档案运行时与协作上下文里的 Codex 历史。
-          </p>
-        </div>
-        <div className="session-page-actions">
-          <button
-            className="quiet-button"
-            disabled={disabled}
-            type="button"
-            onClick={() => void load(selectedProjectId)}
-          >
-            <ArrowsClockwise size={17} /> 刷新
-          </button>
-          <button
-            className="quiet-button"
-            disabled={disabled}
-            type="button"
-            onClick={() => void importHistory()}
-          >
-            导入
-          </button>
-          <button
-            className="quiet-button"
-            disabled={disabled}
-            type="button"
-            onClick={() => void exportHistory("all")}
-          >
-            导出全部
-          </button>
-          <button
-            className="primary-button"
-            disabled={disabled}
-            type="button"
-            onClick={() => void sync()}
-          >
-            <ClockCounterClockwise size={17} weight="bold" /> 同步/修复
-          </button>
-        </div>
-      </header>
+      <PageHeader
+        actions={
+          <div className="session-page-actions">
+            <Button
+              disabled={disabled}
+              leadingIcon={<ArrowsClockwise size={17} />}
+              size="sm"
+              variant="quiet"
+              onClick={() => void load(selectedProjectId)}
+            >
+              刷新
+            </Button>
+            <Button
+              disabled={disabled}
+              size="sm"
+              variant="secondary"
+              onClick={() => void importHistory()}
+            >
+              导入
+            </Button>
+            <Button
+              disabled={disabled}
+              size="sm"
+              variant="secondary"
+              onClick={() => void exportHistory("all")}
+            >
+              导出全部
+            </Button>
+            <Button
+              disabled={disabled}
+              leadingIcon={<ClockCounterClockwise size={17} weight="bold" />}
+              loading={working}
+              loadingLabel="正在同步"
+              size="sm"
+              variant="primary"
+              onClick={() => void sync()}
+            >
+              同步/修复
+            </Button>
+          </div>
+        }
+        description="按项目管理默认客户端、档案运行时与协作上下文里的 Codex 历史。"
+        title="Codex 会话管理"
+      />
 
       {error && (
-        <section className="gateway-warning" role="alert">
-          <div className="gateway-warning-row">
-            <div>
-              <strong>会话历史操作未完成</strong>
-              <p>{error}</p>
-            </div>
-          </div>
-        </section>
+        <InlineNotice tone="danger" title="会话历史操作未完成">
+          {error}
+        </InlineNotice>
       )}
 
       {syncReport && (
-        <section className="history-sync-result" aria-label="最近一次同步结果">
-          <strong>{syncReport.message}</strong>
+        <InlineNotice title={syncReport.message} aria-label="最近一次同步结果">
           <span>
             扫描 {syncReport.homes_scanned} 个 home · 看到 {syncReport.sessions_seen}{" "}
             个会话 · 备份 {syncReport.files_backed_up} 项
           </span>
-        </section>
+        </InlineNotice>
       )}
 
       {transitionStatus && (
-        <section className="history-sync-result" aria-label="后台同步状态">
-          <strong>{transitionStatus.message}</strong>
+        <InlineNotice title={transitionStatus.message} aria-label="后台同步状态">
           <span>
             {transitionStatus.completed_at_ms
               ? `完成于 ${formatDate(transitionStatus.completed_at_ms)}`
               : "账号/网关切换后的历史恢复正在后台执行"}
           </span>
-        </section>
+        </InlineNotice>
       )}
 
       <section className="history-summary-grid" aria-label="Codex 会话历史摘要">
@@ -357,7 +359,7 @@ export function Sessions({ busy, historySyncStatus = null, onNotice }: SessionsP
         <aside className="history-home-panel">
           <div className="card-heading">
             <div>
-              <p className="section-kicker">Projects</p>
+              <p className="section-kicker">项目</p>
               <h2>项目</h2>
             </div>
             <FolderOpen size={22} />
@@ -381,7 +383,7 @@ export function Sessions({ busy, historySyncStatus = null, onNotice }: SessionsP
           <div className="history-home-compact" aria-label="来源 home">
             <div className="card-heading compact">
               <div>
-                <p className="section-kicker">Homes</p>
+                <p className="section-kicker">来源</p>
                 <h2>来源</h2>
               </div>
               <Database size={18} />
@@ -401,7 +403,7 @@ export function Sessions({ busy, historySyncStatus = null, onNotice }: SessionsP
         <section className="history-session-panel">
           <div className="card-heading">
             <div>
-              <p className="section-kicker">History</p>
+              <p className="section-kicker">会话历史</p>
               <h2>{selectedProject?.name ?? "官方历史"}</h2>
               {selectedProject?.cwd && <code>{selectedProject.cwd}</code>}
             </div>
@@ -476,7 +478,12 @@ export function Sessions({ busy, historySyncStatus = null, onNotice }: SessionsP
               />
             ))}
             {!loading && !report?.sessions.length && (
-              <p className="muted-copy">这个项目下还没有 Codex 官方会话历史。</p>
+              <EmptyState
+                compact
+                description="完成一次 Codex 任务或导入历史后，会话会按项目显示在这里。"
+                icon={<Database size={20} />}
+                title="这个项目还没有会话历史"
+              />
             )}
             {loading && <p className="muted-copy">正在读取会话历史…</p>}
           </div>
@@ -484,6 +491,7 @@ export function Sessions({ busy, historySyncStatus = null, onNotice }: SessionsP
       </section>
 
       <Dialog
+        busy={working}
         description={`将 ${deleteIntent?.count ?? 0} 个会话从 Codex 可见历史中移除，并先备份到 Relay 回收站。`}
         footer={
           <>
@@ -495,7 +503,8 @@ export function Sessions({ busy, historySyncStatus = null, onNotice }: SessionsP
               取消
             </Button>
             <Button
-              disabled={working}
+              loading={working}
+              loadingLabel="正在移入回收站"
               leadingIcon={<Trash size={16} />}
               variant="danger"
               onClick={() => void confirmDelete()}
@@ -592,9 +601,9 @@ function HistorySessionRow({
       <div className="history-session-main">
         <div className="history-session-title">
           <h2>{session.title ?? "未命名 Codex 会话"}</h2>
-          <span className={`status-pill compact ${historyStatusClass(session.status)}`}>
-            <i /> {historyStatusLabel(session.status)}
-          </span>
+          <StatusPill compact tone={historyStatusTone(session.status)}>
+            {historyStatusLabel(session.status)}
+          </StatusPill>
         </div>
         <p>
           {shortId(session.id)} · {formatDate(session.updated_at_ms)} ·{" "}
@@ -633,11 +642,11 @@ function HistorySessionRow({
   );
 }
 
-function historyStatusClass(status: string) {
-  if (status === "consistent") return "success";
-  if (status === "missing") return "warning";
-  if (status === "conflict") return "danger";
-  return "neutral";
+function historyStatusTone(status: string) {
+  if (status === "consistent") return "success" as const;
+  if (status === "missing") return "warning" as const;
+  if (status === "conflict") return "danger" as const;
+  return "neutral" as const;
 }
 
 function historyStatusLabel(status: string) {

@@ -20,11 +20,11 @@ const webview = vi.hoisted(() => ({
 import type {
   JsonProfileImportPreview,
   MaskedProfile,
+  OAuthImportStatus,
   ProfileAccountSummary,
   ProfileQuotaWindow,
 } from "../../shared/ipc";
 import { api } from "../../shared/ipc";
-import componentsCss from "../../styles/components.css?raw";
 import { Profiles } from "./Profiles";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
@@ -45,6 +45,7 @@ const status = {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.clearAllMocks();
   vi.restoreAllMocks();
   webview.dragHandler = null;
@@ -204,31 +205,59 @@ function chooseMenuOption(label: string, currentValue: string, optionLabel: stri
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
 describe("Profiles OAuth import", () => {
-  it("keeps profile cards in a regular grid with bottom-aligned actions", () => {
-    expect(componentsCss).toMatch(
-      /\.profile-grid\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);[^}]*align-items:\s*stretch;/s,
-    );
-    expect(componentsCss).toMatch(
-      /@media\s*\(min-width:\s*1600px\)\s*\{[^}]*\.profile-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\);/s,
-    );
-    expect(componentsCss).toMatch(
-      /@media\s*\(max-width:\s*980px\)\s*\{[^}]*\.profile-grid\s*\{[^}]*grid-template-columns:\s*1fr;/s,
-    );
-    expect(componentsCss).toMatch(
-      /\.profile-card\s*\{[^}]*display:\s*flex;[^}]*height:\s*100%;/s,
-    );
-    expect(componentsCss).toMatch(/\.profile-actions\s*\{[^}]*margin-top:\s*auto;/s);
+  it("keeps profiles in a responsive, unified list surface", () => {
+    const view = renderProfiles([
+      profileFixture({ id: "work", alias: "Work OAuth" }),
+      profileFixture({ id: "personal", alias: "Personal OAuth" }),
+    ]);
+
+    const grid = view.container.querySelector(".profiles-page .profile-grid");
+    const cards = view.container.querySelectorAll(".profiles-page .profile-card");
+
+    expect(grid).toBeInTheDocument();
+    expect(cards).toHaveLength(2);
+    expect(cards[0]).toContainElement(screen.getByText("Work OAuth"));
+    expect(cards[1]).toContainElement(screen.getByText("Personal OAuth"));
+    expect(view.container.querySelectorAll(".profile-actions")).toHaveLength(2);
   });
 
-  it("keeps the empty profile state spanning the full profile grid", () => {
+  it("keeps the current profile badge as a single card label", () => {
+    const view = renderProfiles([
+      {
+        ...profileFixture({
+          id: "current",
+          alias: "Current OAuth",
+          account: accountSummary({
+            email: "very-long-current-profile-address@example.com",
+            planType: "plus",
+          }),
+        }),
+        is_current: true,
+      },
+    ]);
+
+    const badges = view.container.querySelectorAll(".current-badge");
+    expect(badges).toHaveLength(1);
+    expect(badges[0].textContent?.trim()).toBe("当前");
+  });
+
+  it("keeps the empty profile state in the profile list surface", () => {
     const view = renderProfiles();
     const emptyState = view.container.querySelector(".profile-grid > .empty-state");
 
     expect(emptyState).toBeInTheDocument();
-    expect(componentsCss).toMatch(
-      /\.profile-grid\s*>\s*\.empty-state\s*\{[^}]*display:\s*grid;[^}]*grid-column:\s*1\s*\/\s*-1;[^}]*width:\s*100%;/s,
-    );
+    expect(emptyState).toHaveTextContent("从一个已获授权的连接开始");
   });
 
   it("shows invalid profile details and starts reauthorization from the status card", async () => {
@@ -249,6 +278,69 @@ describe("Profiles OAuth import", () => {
 
     fireEvent.click(within(validation).getByRole("button", { name: "重新授权" }));
     await waitFor(() => expect(view.onStartOAuth).toHaveBeenCalledWith("invalid"));
+  });
+
+  it("does not keep polling and show a stale status error after successful reauthorization", async () => {
+    vi.useFakeTimers();
+    const authorizingStatus: OAuthImportStatus = {
+      ...status,
+      profile_id: "oauth-profile",
+    };
+    const authenticatedStatus: OAuthImportStatus = {
+      ...authorizingStatus,
+      phase: "authenticated",
+      message: "授权完成，凭据将在创建档案时保存。",
+    };
+    const completion = deferred<void>();
+    const onStartOAuth = vi.fn().mockResolvedValue(authorizingStatus);
+    const onOAuthStatus = vi.fn().mockResolvedValue(authenticatedStatus);
+    const onCompleteOAuth = vi.fn().mockReturnValue(completion.promise);
+
+    render(
+      <Profiles
+        profiles={[profileFixture({ id: "oauth-profile", alias: "Personal OAuth" })]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={onStartOAuth}
+        onOAuthStatus={onOAuthStatus}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={onCompleteOAuth}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "更新凭据：Personal OAuth" }));
+    await act(async () => undefined);
+
+    expect(screen.getByText("等待默认浏览器授权完成")).toBeInTheDocument();
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+
+    expect(onOAuthStatus).toHaveBeenCalledTimes(1);
+    expect(onCompleteOAuth).toHaveBeenCalledWith("attempt-1");
+
+    onOAuthStatus.mockRejectedValue(new Error("attempt already completed"));
+
+    await act(async () => {
+      vi.advanceTimersByTime(3_000);
+    });
+
+    expect(onOAuthStatus).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByText("无法读取授权状态；请取消后重试。"),
+    ).not.toBeInTheDocument();
+
+    completion.resolve();
+    await act(async () => {
+      await completion.promise;
+    });
+
+    expect(
+      screen.queryByRole("dialog", { name: "选择导入方式" }),
+    ).not.toBeInTheDocument();
   });
 
   it("states that profile switching uses saved credentials without reauthorization", () => {
@@ -424,9 +516,11 @@ describe("Profiles OAuth import", () => {
     expect(syncImported).toHaveBeenCalledWith("profile-valid");
     expect(refreshImportedModels).toHaveBeenCalledWith("profile-valid");
     expect(onJsonImportComplete).toHaveBeenCalledOnce();
-    expect(
-      screen.getByText("导入完成：创建 1，更新 0，跳过 1，失败 0。"),
-    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "选择要导入的账号" }),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("retries unverified JSON preview items without reopening the file chooser", async () => {
@@ -535,9 +629,17 @@ describe("Profiles OAuth import", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: "添加档案" })[0]);
     fireEvent.click(screen.getByRole("button", { name: "添加提供商" }));
-    const sheet = screen
-      .getByRole("heading", { name: "添加第三方模型提供商" })
-      .closest("section") as HTMLElement;
+    expect(
+      screen.getByRole("dialog", { name: "添加第三方模型提供商" }),
+    ).toBeInTheDocument();
+    const providerDialog = screen.getByRole("dialog", {
+      name: "添加第三方模型提供商",
+    });
+    const dialogContent = providerDialog.querySelector(
+      ".dialog-content",
+    ) as HTMLElement;
+    const sheet = dialogContent.querySelector(".profile-dialog-sheet") as HTMLElement;
+    expect(dialogContent).toContainElement(sheet);
     const form = within(sheet);
     expect(form.getByText(/OpenAI 兼容 Relay/)).toBeInTheDocument();
     expect(
@@ -551,7 +653,11 @@ describe("Profiles OAuth import", () => {
     });
     expect(oauthSelector).toHaveTextContent("不绑定登录档案");
     fireEvent.click(oauthSelector);
-    fireEvent.click(await screen.findByRole("option", { name: /Work Login/ }));
+    const oauthOption = await screen.findByRole("option", { name: /Work Login/ });
+    expect(providerDialog.querySelector(".dialog-portal-root")).toContainElement(
+      oauthOption,
+    );
+    fireEvent.click(oauthOption);
     expect(oauthSelector).toHaveTextContent("Work Login");
     fireEvent.change(form.getByLabelText("档案名称"), {
       target: { value: "Third Party" },
@@ -591,6 +697,9 @@ describe("Profiles OAuth import", () => {
           base_url: "https://api.example.test/v1",
           api_key: "sk-test",
           codex_oauth_profile_id: "oauth-work",
+          max_concurrency: 4,
+          max_queue_depth: 8,
+          queue_timeout_ms: 15_000,
           model_mappings: [
             {
               model: "codex-visible-coder",
@@ -602,9 +711,14 @@ describe("Profiles OAuth import", () => {
         }),
       ),
     );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "添加第三方模型提供商" }),
+      ).not.toBeInTheDocument(),
+    );
   });
 
-  it("saves the selected OAuth account when editing a third-party provider", async () => {
+  it("clears the OAuth account when editing a third-party provider", async () => {
     const onUpdateApiProfile = vi.fn().mockResolvedValue(undefined);
     vi.spyOn(api, "codexGatewayConfigStatus").mockResolvedValue({
       enabled: true,
@@ -683,6 +797,9 @@ describe("Profiles OAuth import", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "编辑 API 服务：Third Party" }));
+    expect(
+      screen.getByRole("dialog", { name: "编辑第三方模型提供商" }),
+    ).toBeInTheDocument();
     const sheet = screen
       .getByRole("heading", { name: "编辑第三方模型提供商" })
       .closest("section") as HTMLElement;
@@ -692,14 +809,15 @@ describe("Profiles OAuth import", () => {
     });
     await waitFor(() => expect(oauthSelector).toHaveTextContent("Work A"));
     fireEvent.click(oauthSelector);
-    fireEvent.click(await screen.findByRole("option", { name: /Work B/ }));
+    fireEvent.click(await screen.findByRole("option", { name: /不绑定登录档案/ }));
     fireEvent.click(form.getByRole("button", { name: "保存修改" }));
 
     await waitFor(() =>
       expect(onUpdateApiProfile).toHaveBeenCalledWith(
         expect.objectContaining({
           id: "api-active",
-          codex_oauth_profile_id: "oauth-b",
+          api_key: null,
+          codex_oauth_profile_id: null,
           provider: "openai_compatible",
           wire_api: "responses",
           base_url: "https://api.example.test/v1",
@@ -713,6 +831,120 @@ describe("Profiles OAuth import", () => {
           ],
         }),
       ),
+    );
+  });
+
+  it("keeps the API edit dialog and values after a save failure", async () => {
+    const onUpdateApiProfile = vi.fn().mockRejectedValue(new Error("数据库写入失败"));
+    render(
+      <Profiles
+        profiles={[
+          {
+            ...profileFixture({
+              id: "api-failure",
+              alias: "Original Provider",
+              kind: "api_key",
+            }),
+            base_url: "https://api.example.test/v1",
+            provider: "openai_compatible",
+            wire_api: "responses",
+            models: ["provider-model"],
+            model_mappings: [
+              {
+                model: "provider-model",
+                upstream_model: "provider-model",
+                display_name: "Provider Model",
+                context_window: null,
+              },
+            ],
+          },
+        ]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onUpdateApiProfile={onUpdateApiProfile}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "编辑 API 服务：Original Provider" }),
+    );
+    const dialog = screen.getByRole("dialog", {
+      name: "编辑第三方模型提供商",
+    });
+    fireEvent.change(within(dialog).getByLabelText("档案名称"), {
+      target: { value: "Retained Provider" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存修改" }));
+
+    expect(await within(dialog).findByText("数据库写入失败")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("档案名称")).toHaveValue("Retained Provider");
+    expect(dialog).toBeInTheDocument();
+  });
+
+  it("blocks closing an API dialog while the save is pending", async () => {
+    const pendingUpdate = deferred<void>();
+    render(
+      <Profiles
+        profiles={[
+          {
+            ...profileFixture({
+              id: "api-pending",
+              alias: "Pending Provider",
+              kind: "api_key",
+            }),
+            base_url: "https://api.example.test/v1",
+            provider: "openai_compatible",
+            wire_api: "responses",
+            models: ["provider-model"],
+            model_mappings: [
+              {
+                model: "provider-model",
+                upstream_model: "provider-model",
+                display_name: "Provider Model",
+                context_window: null,
+              },
+            ],
+          },
+        ]}
+        busy={false}
+        onSelect={vi.fn().mockResolvedValue(undefined)}
+        onStartOAuth={vi.fn().mockResolvedValue(status)}
+        onOAuthStatus={vi.fn().mockResolvedValue(status)}
+        onCancelOAuth={vi.fn().mockResolvedValue(undefined)}
+        onCompleteOAuth={vi.fn().mockResolvedValue(undefined)}
+        onSyncAccount={vi.fn().mockResolvedValue(undefined)}
+        onUpdateApiProfile={() => pendingUpdate.promise}
+        onDelete={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "编辑 API 服务：Pending Provider" }),
+    );
+    const dialog = screen.getByRole("dialog", {
+      name: "编辑第三方模型提供商",
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存修改" }));
+
+    expect(
+      await within(dialog).findByRole("button", { name: "正在保存提供商" }),
+    ).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "取消" })).toBeDisabled();
+    fireEvent(dialog, new Event("cancel", { cancelable: true }));
+    fireEvent.click(dialog);
+    expect(dialog).toBeInTheDocument();
+
+    pendingUpdate.resolve(undefined);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "编辑第三方模型提供商" }),
+      ).not.toBeInTheDocument(),
     );
   });
 
@@ -816,8 +1048,19 @@ describe("Profiles OAuth import", () => {
     fireEvent.click(form.getByRole("button", { name: "测试连接并发现模型" }));
 
     expect(await screen.findByText("连接已验证")).toBeInTheDocument();
-    fireEvent.click(form.getByRole("button", { name: /发现的上游模型，已选择 0\/3/ }));
-    expect(form.getAllByTitle(longModel).length).toBeGreaterThan(0);
+    const discoveryTrigger = form.getByRole("button", {
+      name: /发现的上游模型，已选择 0\/3/,
+    });
+    fireEvent.click(discoveryTrigger);
+    expect(discoveryTrigger.closest(".model-discovery-select")).toHaveClass("is-open");
+    const longModelOption = form
+      .getByRole("checkbox", { name: longModel })
+      .closest(".model-discovery-select-option") as HTMLElement;
+    expect(longModelOption).toHaveAttribute("title", longModel);
+    expect(longModelOption).toHaveAttribute("data-selected", "false");
+    expect(
+      longModelOption.querySelector(".model-discovery-select-option-copy"),
+    ).toBeInTheDocument();
 
     fireEvent.change(form.getByLabelText("搜索上游模型"), {
       target: { value: "spark" },
@@ -836,6 +1079,11 @@ describe("Profiles OAuth import", () => {
       target: { value: "" },
     });
     fireEvent.click(form.getByRole("button", { name: "全选" }));
+    expect(
+      form
+        .getByRole("checkbox", { name: longModel })
+        .closest(".model-discovery-select-option"),
+    ).toHaveAttribute("data-selected", "true");
     const modelInputs = form.getAllByLabelText("Model ID");
     expect(modelInputs).toHaveLength(3);
     expect(modelInputs[0]).toHaveValue("alpha-model");
@@ -1043,8 +1291,9 @@ describe("Profiles OAuth import", () => {
     );
   });
 
-  it("lets personal OAuth profiles refresh models and join the weighted gateway pool", () => {
-    const onTogglePool = vi.fn().mockResolvedValue(undefined);
+  it("keeps unrelated profile actions enabled while one profile joins the pool", async () => {
+    const pendingToggle = deferred<void>();
+    const onTogglePool = vi.fn().mockReturnValue(pendingToggle.promise);
     render(
       <Profiles
         profiles={[
@@ -1089,6 +1338,10 @@ describe("Profiles OAuth import", () => {
     expect(
       screen.getByRole("button", { name: "加入网关账号池：Verified API" }),
     ).toBeEnabled();
+    expect(screen.getByText("正在加入")).toBeInTheDocument();
+
+    pendingToggle.resolve(undefined);
+    await waitFor(() => expect(screen.queryByText("正在加入")).not.toBeInTheDocument());
   });
 
   it("shows a bottom gateway join button even before OAuth models are refreshed", () => {
@@ -1326,7 +1579,7 @@ describe("Profiles OAuth import", () => {
     expect(onStartOAuth).toHaveBeenCalledWith("oauth-profile");
   });
 
-  it("shows refreshable quota cards for PAT and Agent Identity", () => {
+  it("shows quota only when account data exists and keeps unsynced profiles compact", () => {
     const view = renderProfiles([
       profileFixture({
         id: "pat-profile",
@@ -1342,10 +1595,11 @@ describe("Profiles OAuth import", () => {
     ]);
 
     expect(screen.getByText("pat@example.com")).toBeInTheDocument();
-    expect(screen.getAllByText("个人访问令牌")).not.toHaveLength(0);
-    expect(screen.getAllByText("Agent Identity")).not.toHaveLength(0);
+    expect(screen.queryByText("个人访问令牌")).not.toBeInTheDocument();
+    expect(screen.queryByText("Agent Identity")).not.toBeInTheDocument();
     expect(screen.getByText("ChatGPT Pro")).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "刷新资料" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "刷新资料" })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "同步资料" })).toBeInTheDocument();
     expect(view.container.querySelectorAll(".profile-card")).toHaveLength(2);
   });
 

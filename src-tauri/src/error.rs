@@ -53,7 +53,7 @@ pub enum AppError {
     ProfileRuntimeUnavailable,
     #[error("Codex 当前登录账号与所选 OAuth 档案不一致，请重新授权后重试")]
     OAuthIdentityMismatch,
-    #[error("Codex 凭据已切换，但 ChatGPT/Codex 桌面端未能重启；请手动打开它")]
+    #[error("Codex 凭据已切换，但 ChatGPT.app 未能重启；请手动打开它")]
     DesktopUnavailable,
     #[error("请先选择一个已授权的 OAuth 档案，再启动受管 Codex 任务")]
     CurrentProfileRequired,

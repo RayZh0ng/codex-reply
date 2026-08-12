@@ -27,7 +27,8 @@
     "rust:lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
     "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm rust:format && pnpm rust:lint && pnpm rust:test",
-    "prepare": "husky"
+    "prepare": "husky",
+    "codex:compat": "node scripts/verify-codex-compat.mjs"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",

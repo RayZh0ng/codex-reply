@@ -175,7 +175,7 @@ pub fn sync_codex_history(
     repository: &Repository,
     data_dir: &Path,
 ) -> AppResult<CodexHistorySyncReport> {
-    sync_codex_history_with_options(repository, data_dir, None, None, None)
+    sync_codex_history_with_options(repository, data_dir, None, None, None, None)
 }
 
 pub fn sync_codex_history_prioritized_home(
@@ -183,7 +183,22 @@ pub fn sync_codex_history_prioritized_home(
     data_dir: &Path,
     priority_home: Option<&Path>,
 ) -> AppResult<CodexHistorySyncReport> {
-    sync_codex_history_with_options(repository, data_dir, None, None, priority_home)
+    sync_codex_history_with_options(repository, data_dir, None, None, priority_home, None)
+}
+
+pub fn sync_codex_history_for_launch_home(
+    repository: &Repository,
+    data_dir: &Path,
+    launch_home: &Path,
+) -> AppResult<CodexHistorySyncReport> {
+    sync_codex_history_with_options(
+        repository,
+        data_dir,
+        None,
+        None,
+        Some(launch_home),
+        Some(launch_home),
+    )
 }
 
 pub fn restore_codex_session_to_home(
@@ -204,6 +219,7 @@ pub fn restore_codex_session_to_home(
             sync_target: true,
         }),
         Some(&HashSet::from([session_id.to_owned()])),
+        None,
         None,
     )
 }
@@ -392,6 +408,7 @@ pub fn import_codex_history(
         }),
         Some(&imported_session_ids),
         None,
+        None,
     )?;
     warnings.extend(sync_report.warnings);
     if let Err(error) = fs::remove_dir_all(import_home.parent().unwrap_or(&import_home)) {
@@ -420,6 +437,7 @@ fn sync_codex_history_with_options(
     extra_target: Option<ExtraTargetHome>,
     only_session_ids: Option<&HashSet<String>>,
     priority_home: Option<&Path>,
+    force_metadata_home: Option<&Path>,
 ) -> AppResult<CodexHistorySyncReport> {
     let mut scan = scan_history(repository, data_dir, extra_target)?;
     let scanned_at_ms = timestamp_ms();
@@ -440,6 +458,7 @@ fn sync_codex_history_with_options(
             return Err(AppError::NotFound);
         }
     }
+    let expected_session_ids = groups.keys().cloned().collect::<HashSet<_>>();
 
     let mut stats = SyncStats::default();
     let mut cwd_by_home = HashMap::<String, Vec<String>>::new();
@@ -505,9 +524,19 @@ fn sync_codex_history_with_options(
         }
     }
 
+    let force_metadata_home_ids = force_metadata_home
+        .map(|home| {
+            target_homes
+                .iter()
+                .filter(|target| same_codex_home(&target.path, home))
+                .map(|target| target.id.clone())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
     let mut metadata_rebuilt = 0;
     for home in &target_homes {
-        if !stats.changed_home_ids.contains(&home.id) {
+        if !stats.changed_home_ids.contains(&home.id) && !force_metadata_home_ids.contains(&home.id)
+        {
             continue;
         }
         match rebuild_thread_metadata(&home.path) {
@@ -516,6 +545,14 @@ fn sync_codex_history_with_options(
                 warnings.push(format!("{} metadata rebuild 未完成：{}", home.label, error))
             }
         }
+    }
+    if let Some(launch_home) = force_metadata_home {
+        verify_launch_home_history_visible(
+            &target_homes,
+            launch_home,
+            &expected_session_ids,
+            &mut warnings,
+        );
     }
 
     let sessions_seen = if let Some(session_ids) = only_session_ids {
@@ -528,7 +565,9 @@ fn sync_codex_history_with_options(
     } else {
         "warning"
     };
-    let message = if stats.files_written == 0 {
+    let message = if stats.files_written == 0 && metadata_rebuilt > 0 {
+        "Codex 会话历史已刷新，未发现需要复制的差异。".to_owned()
+    } else if stats.files_written == 0 {
         "Codex 会话历史已检查，未发现需要同步的差异。".to_owned()
     } else {
         format!(
@@ -1173,9 +1212,9 @@ fn prioritize_target_homes(homes: &mut [CodexHome], priority_home: Option<&Path>
     };
     let priority_key = canonical_path_key(priority_home);
     homes.sort_by_key(|home| {
-        if home.id == "default" {
+        if canonical_path_key(&home.path) == priority_key {
             0
-        } else if canonical_path_key(&home.path) == priority_key {
+        } else if home.id == "default" {
             1
         } else {
             2
@@ -1188,6 +1227,49 @@ fn canonical_path_key(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string()
+}
+
+fn same_codex_home(left: &Path, right: &Path) -> bool {
+    canonical_path_key(left) == canonical_path_key(right)
+}
+
+fn verify_launch_home_history_visible(
+    target_homes: &[CodexHome],
+    launch_home: &Path,
+    expected_session_ids: &HashSet<String>,
+    warnings: &mut Vec<String>,
+) {
+    if expected_session_ids.is_empty() {
+        return;
+    }
+    let Some(home) = target_homes
+        .iter()
+        .find(|target| same_codex_home(&target.path, launch_home))
+    else {
+        warnings.push(format!(
+            "{} 未包含在历史同步目标中，无法确认启动前会话 metadata。",
+            launch_home.display()
+        ));
+        return;
+    };
+    let index = read_session_index(&home.path, warnings);
+    if expected_session_ids
+        .iter()
+        .any(|session_id| index.contains_key(session_id))
+    {
+        return;
+    }
+    let sqlite = read_sqlite_thread_index(&home.path, warnings);
+    if expected_session_ids
+        .iter()
+        .any(|session_id| sqlite.contains_key(session_id))
+    {
+        return;
+    }
+    warnings.push(format!(
+        "{} metadata 刷新后仍未能在 session_index.jsonl 或 state_5.sqlite 中看到同步会话；首次启动可能需要在会话页手动同步/修复。",
+        home.label
+    ));
 }
 
 fn rollout_paths(home: &Path, warnings: &mut Vec<String>) -> Vec<PathBuf> {
@@ -2202,6 +2284,27 @@ fn model_provider_for_home(home: &Path) -> String {
         .unwrap_or_else(|| DEFAULT_MODEL_PROVIDER.to_owned())
 }
 
+fn thread_list_request() -> Value {
+    json!({
+        "method": "thread/list",
+        "id": 2,
+        "params": {
+            "sourceKinds": [
+                "cli",
+                "vscode",
+                "exec",
+                "appServer",
+                "subAgent",
+                "subAgentReview",
+                "subAgentCompact",
+                "subAgentThreadSpawn",
+                "subAgentOther",
+                "unknown"
+            ]
+        }
+    })
+}
+
 fn rebuild_thread_metadata(home: &Path) -> AppResult<()> {
     let mut command = Command::new("codex");
     command
@@ -2234,7 +2337,7 @@ fn rebuild_thread_metadata(home: &Path) -> AppResult<()> {
                 }
             }),
             json!({"method": "initialized", "params": {}}),
-            json!({"method": "thread/list", "id": 2, "params": {}}),
+            thread_list_request(),
         ] {
             serde_json::to_writer(&mut stdin, &request)
                 .map_err(|_| AppError::RuntimeUnavailable)?;
@@ -2455,11 +2558,17 @@ fn sanitize_path_segment(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex as TestMutex, OnceLock};
+    use std::{
+        ffi::OsString,
+        sync::{Mutex as TestMutex, OnceLock},
+    };
 
     use crate::{
         database::{Repository, StoredProfile},
-        domain::{CodexAuthMode, GatewayProvider, GatewayWireApi, MaskedProfile, ProfileKind},
+        domain::{
+            CodexAuthMode, GatewayProvider, GatewayWireApi, ListCodexHistoryInput, MaskedProfile,
+            ProfileKind,
+        },
     };
 
     fn env_lock() -> &'static TestMutex<()> {
@@ -2471,6 +2580,79 @@ mod tests {
         let root = std::env::temp_dir().join(format!("codex-history-{name}-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn install_fake_codex(root: &Path) -> Option<OsString> {
+        let bin = root.join("fake-bin");
+        fs::create_dir_all(&bin).unwrap();
+        #[cfg(windows)]
+        let codex = bin.join("codex.cmd");
+        #[cfg(not(windows))]
+        let codex = bin.join("codex");
+        #[cfg(windows)]
+        fs::write(
+            &codex,
+            r#"@echo off
+if not "%CODEX_HOME%"=="" (
+  if not exist "%CODEX_HOME%" mkdir "%CODEX_HOME%"
+  set marker=%CODEX_HOME%\.fake-codex-metadata-refresh-count
+  set /a count=0
+  if exist "%marker%" set /p count=<"%marker%"
+  set /a count=count+1
+  echo %count%>"%marker%"
+)
+more > nul
+echo {"id":2,"result":{"threads":[]}}
+"#,
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        {
+            fs::write(
+                &codex,
+                r#"#!/bin/sh
+if [ -n "$CODEX_HOME" ]; then
+  mkdir -p "$CODEX_HOME"
+  marker="$CODEX_HOME/.fake-codex-metadata-refresh-count"
+  count=0
+  if [ -f "$marker" ]; then
+    count=$(cat "$marker" 2>/dev/null || echo 0)
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$marker"
+fi
+while IFS= read -r _line; do :; done
+printf '{"id":2,"result":{"threads":[]}}\n'
+"#,
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&codex).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&codex, permissions).unwrap();
+        }
+        let previous = std::env::var_os("PATH");
+        let mut paths = vec![bin];
+        if let Some(previous) = previous.as_ref() {
+            paths.extend(std::env::split_paths(previous));
+        }
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        previous
+    }
+
+    fn restore_path(previous: Option<OsString>) {
+        if let Some(previous) = previous {
+            std::env::set_var("PATH", previous);
+        } else {
+            std::env::remove_var("PATH");
+        }
+    }
+
+    fn fake_metadata_refresh_count(home: &Path) -> usize {
+        fs::read_to_string(home.join(".fake-codex-metadata-refresh-count"))
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or_default()
     }
 
     fn repository(root: &Path) -> Repository {
@@ -2501,6 +2683,9 @@ mod tests {
             validation_status: "unknown".to_owned(),
             validated_at_ms: None,
             validation_message: None,
+            max_concurrency: 4,
+            max_queue_depth: 8,
+            queue_timeout_ms: 15_000,
         };
         repository
             .insert_profile(&StoredProfile {
@@ -3073,6 +3258,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider, "codex_relay");
+    }
+
+    #[test]
+    fn thread_list_metadata_refresh_includes_all_supported_source_kinds() {
+        let request = thread_list_request();
+        let kinds = request["params"]["sourceKinds"].as_array().unwrap();
+        for expected in ["cli", "exec", "appServer", "subAgent", "unknown"] {
+            assert!(kinds.iter().any(|kind| kind == expected));
+        }
+    }
+    #[test]
+    fn launch_home_sync_refreshes_metadata_even_without_file_changes() {
+        let _guard = env_lock().lock().unwrap();
+        let root = temp_root("launch-refresh");
+        let previous_path = install_fake_codex(&root);
+        let repository = repository(&root);
+        insert_profile(&repository, "profile-a", "工作号");
+        std::env::set_var("HOME", root.join("home"));
+        let default_home = root.join("home/.codex");
+        let profile_home = root.join("runtimes/profile-a");
+        let session_id = Uuid::new_v4().to_string();
+        rollout(&default_home, &session_id, "测试会话", "from-default");
+
+        sync_codex_history(&repository, &root).unwrap();
+        sync_codex_history_for_launch_home(&repository, &root, &profile_home).unwrap();
+        let before = fake_metadata_refresh_count(&profile_home);
+        let report = sync_codex_history_for_launch_home(&repository, &root, &profile_home).unwrap();
+
+        assert_eq!(report.status, "completed");
+        assert_eq!(report.files_written, 0);
+        assert!(report.metadata_rebuilt >= 1);
+        assert_eq!(fake_metadata_refresh_count(&profile_home), before + 1);
+        restore_path(previous_path);
+    }
+
+    #[test]
+    fn launch_home_sync_makes_default_home_history_visible_to_list() {
+        let _guard = env_lock().lock().unwrap();
+        let root = temp_root("launch-visible");
+        let previous_path = install_fake_codex(&root);
+        let repository = repository(&root);
+        insert_profile(&repository, "profile-a", "工作号");
+        std::env::set_var("HOME", root.join("home"));
+        let default_home = root.join("home/.codex");
+        let profile_home = root.join("runtimes/profile-a");
+        let session_id = Uuid::new_v4().to_string();
+        rollout(&profile_home, &session_id, "测试会话", "from-profile");
+
+        let report = sync_codex_history_for_launch_home(&repository, &root, &default_home).unwrap();
+
+        assert_eq!(report.status, "completed");
+        assert!(
+            report.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            report.warnings
+        );
+        assert!(report.metadata_rebuilt >= 1);
+        assert_eq!(fake_metadata_refresh_count(&default_home), 1);
+
+        let history = list_codex_history(
+            &repository,
+            &root,
+            ListCodexHistoryInput {
+                limit: Some(100),
+                offset: None,
+                project_id: None,
+            },
+        )
+        .unwrap();
+        let session = history
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("synced session should be listed");
+        assert!(session
+            .sources
+            .iter()
+            .any(|source| source.home_id == "default"));
+        restore_path(previous_path);
     }
 
     #[test]

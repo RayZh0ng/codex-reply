@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const GATEWAY_CODEX_CLIENT_KEY_REF_SETTING: &str = "gateway_codex_client_key_ref";
 pub const GATEWAY_CODEX_DIRECT_PROFILE_ID_SETTING: &str = "gateway_codex_direct_profile_id";
@@ -167,6 +167,9 @@ pub struct MaskedProfile {
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
+    pub max_concurrency: i64,
+    pub max_queue_depth: i64,
+    pub queue_timeout_ms: i64,
     pub models: Vec<String>,
     #[serde(default)]
     pub model_mappings: Vec<GatewayModelMapping>,
@@ -322,6 +325,12 @@ pub struct CreateProfileInput {
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
+    #[serde(default = "default_profile_max_concurrency")]
+    pub max_concurrency: i64,
+    #[serde(default = "default_profile_max_queue_depth")]
+    pub max_queue_depth: i64,
+    #[serde(default = "default_profile_queue_timeout_ms")]
+    pub queue_timeout_ms: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -343,10 +352,32 @@ pub struct CreateApiServiceProfileInput {
     pub priority: i64,
     #[serde(default = "default_profile_weight")]
     pub weight: i64,
+    #[serde(default = "default_profile_max_concurrency")]
+    pub max_concurrency: i64,
+    #[serde(default = "default_profile_max_queue_depth")]
+    pub max_queue_depth: i64,
+    #[serde(default = "default_profile_queue_timeout_ms")]
+    pub queue_timeout_ms: i64,
 }
 
 fn default_profile_weight() -> i64 {
     1
+}
+
+pub const DEFAULT_PROFILE_MAX_CONCURRENCY: i64 = 4;
+pub const DEFAULT_PROFILE_MAX_QUEUE_DEPTH: i64 = 8;
+pub const DEFAULT_PROFILE_QUEUE_TIMEOUT_MS: i64 = 15_000;
+
+fn default_profile_max_concurrency() -> i64 {
+    DEFAULT_PROFILE_MAX_CONCURRENCY
+}
+
+fn default_profile_max_queue_depth() -> i64 {
+    DEFAULT_PROFILE_MAX_QUEUE_DEPTH
+}
+
+fn default_profile_queue_timeout_ms() -> i64 {
+    DEFAULT_PROFILE_QUEUE_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -439,6 +470,15 @@ pub struct CodexEnvironmentInstallLog {
     pub next_action: Option<String>,
 }
 
+fn deserialize_present_optional_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateProfileInput {
     pub id: String,
@@ -453,10 +493,16 @@ pub struct UpdateProfileInput {
     pub in_pool: bool,
     pub priority: i64,
     pub weight: i64,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
+    #[serde(default)]
+    pub max_queue_depth: Option<i64>,
+    #[serde(default)]
+    pub queue_timeout_ms: Option<i64>,
     pub models: Vec<String>,
     #[serde(default)]
     pub model_mappings: Option<Vec<GatewayModelMapping>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_optional_string")]
     pub codex_oauth_profile_id: Option<Option<String>>,
     pub api_key: Option<String>,
 }
@@ -483,13 +529,40 @@ pub struct CollaborationSummary {
     pub active_sessions: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub total_requests: i64,
     pub successful_requests: i64,
     pub failed_requests: i64,
     pub average_latency_ms: Option<i64>,
     pub estimated_tokens: i64,
+    pub window_minutes: i64,
+    pub window_requests: i64,
+    pub window_success_rate: Option<f64>,
+    pub requests_per_minute: f64,
+    pub latency_p50_ms: Option<i64>,
+    pub latency_p95_ms: Option<i64>,
+    pub latency_p99_ms: Option<i64>,
+    pub ttfb_p50_ms: Option<i64>,
+    pub ttfb_p95_ms: Option<i64>,
+    pub ttfb_p99_ms: Option<i64>,
+    pub request_bytes: i64,
+    pub response_bytes: i64,
+    pub retry_count: i64,
+    pub active_requests: i64,
+    pub queued_requests: i64,
+    pub telemetry_dropped: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GatewayDirectRouteHealth {
+    pub status: String,
+    pub profile_id: String,
+    pub profile_alias: String,
+    pub route_mode: String,
+    pub oauth_ready: bool,
+    pub credential_ready: bool,
+    pub model_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,6 +575,10 @@ pub struct GatewayStatus {
     pub cidrs: Vec<String>,
     pub available_profiles: usize,
     pub cooling_profiles: usize,
+    pub pool_status: String,
+    pub direct_route: Option<GatewayDirectRouteHealth>,
+    pub active_requests: usize,
+    pub queued_requests: usize,
     pub client_key_count: usize,
     pub certificate_ready: bool,
     pub service_url: String,
@@ -526,10 +603,75 @@ pub struct GatewayHealthSummary {
     pub service_url: String,
     pub available_profiles: usize,
     pub cooling_profiles: usize,
+    pub pool_status: String,
+    pub direct_route: Option<GatewayDirectRouteHealth>,
+    pub active_requests: usize,
+    pub queued_requests: usize,
     pub certificate_ready: bool,
     pub client_key_count: usize,
     pub upstream_last_error: Option<String>,
     pub providers: Vec<GatewayHealthProviderSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayPerformanceInput {
+    #[serde(default = "default_gateway_performance_window_minutes")]
+    pub window_minutes: i64,
+}
+
+fn default_gateway_performance_window_minutes() -> i64 {
+    60
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListGatewayRequestMetricsInput {
+    #[serde(default = "default_gateway_request_metric_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub cursor: Option<i64>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+fn default_gateway_request_metric_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayRequestMetricSummary {
+    pub sequence: i64,
+    pub request_id: String,
+    pub started_at_ms: i64,
+    pub route: String,
+    pub provider: String,
+    pub profile_id: Option<String>,
+    pub auth_mode: String,
+    pub stream: bool,
+    pub auth_latency_ms: i64,
+    pub queue_latency_ms: i64,
+    pub ttfb_ms: Option<i64>,
+    pub total_latency_ms: i64,
+    pub request_bytes: i64,
+    pub response_bytes: i64,
+    pub http_status: u16,
+    pub outcome: String,
+    pub error_category: Option<String>,
+    pub upstream_attempts: i64,
+    pub retry_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub upstream_response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayRequestMetricPage {
+    pub items: Vec<GatewayRequestMetricSummary>,
+    pub next_cursor: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -965,8 +1107,6 @@ pub struct CodexHistorySyncReport {
     pub warnings: Vec<String>,
 }
 
-pub const CODEX_HISTORY_SYNC_FINISHED_EVENT: &str = "codex-history-sync-finished";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexHistoryTransitionStatus {
     pub status: String,
@@ -1172,7 +1312,8 @@ pub struct ManagedTaskStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppUpdateChannel, GatewayProvider, APP_UPDATE_BETA_ENDPOINT, APP_UPDATE_STABLE_ENDPOINT,
+        AppUpdateChannel, GatewayProvider, UpdateProfileInput, APP_UPDATE_BETA_ENDPOINT,
+        APP_UPDATE_STABLE_ENDPOINT,
     };
 
     #[test]
@@ -1189,6 +1330,42 @@ mod tests {
             serde_json::to_string(&GatewayProvider::OpenAiCompatible).unwrap(),
             "\"openai_compatible\""
         );
+    }
+
+    #[test]
+    fn update_profile_input_distinguishes_omitted_selected_and_cleared_oauth_profile() {
+        let base = serde_json::json!({
+            "id": "profile-1",
+            "alias": "Profile 1",
+            "enabled": true,
+            "in_pool": false,
+            "priority": 0,
+            "weight": 1,
+            "models": [],
+            "api_key": null
+        });
+
+        let omitted: UpdateProfileInput = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(omitted.codex_oauth_profile_id, None);
+
+        let mut selected_value = base.clone();
+        selected_value.as_object_mut().unwrap().insert(
+            "codex_oauth_profile_id".to_string(),
+            serde_json::json!("oauth-profile-1"),
+        );
+        let selected: UpdateProfileInput = serde_json::from_value(selected_value).unwrap();
+        assert_eq!(
+            selected.codex_oauth_profile_id,
+            Some(Some("oauth-profile-1".to_string()))
+        );
+
+        let mut cleared_value = base;
+        cleared_value.as_object_mut().unwrap().insert(
+            "codex_oauth_profile_id".to_string(),
+            serde_json::Value::Null,
+        );
+        let cleared: UpdateProfileInput = serde_json::from_value(cleared_value).unwrap();
+        assert_eq!(cleared.codex_oauth_profile_id, Some(None));
     }
 
     #[test]

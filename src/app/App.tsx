@@ -1,12 +1,14 @@
 import { ArrowsClockwise } from "@phosphor-icons/react/ArrowsClockwise";
 import { ChartPieSlice } from "@phosphor-icons/react/ChartPieSlice";
 import { ChatCircleDots } from "@phosphor-icons/react/ChatCircleDots";
+import { CheckCircle } from "@phosphor-icons/react/CheckCircle";
 import { ClockCounterClockwise } from "@phosphor-icons/react/ClockCounterClockwise";
 import { GearSix } from "@phosphor-icons/react/GearSix";
 import { Lightning } from "@phosphor-icons/react/Lightning";
 import { List } from "@phosphor-icons/react/List";
 import { ShieldWarning } from "@phosphor-icons/react/ShieldWarning";
 import { UsersThree } from "@phosphor-icons/react/UsersThree";
+import { WarningCircle } from "@phosphor-icons/react/WarningCircle";
 import {
   lazy,
   Suspense,
@@ -43,7 +45,7 @@ import {
   type StartManagedTaskInput,
   RelayError,
 } from "../shared/ipc";
-import { Button, Dialog, StatusPill } from "../shared/ui";
+import { Button, Dialog, InlineNotice, StatusPill } from "../shared/ui";
 import { useTheme } from "../shared/theme";
 import type { ThemePreference } from "../shared/theme";
 import logo from "../../src-tauri/icons/icon.png";
@@ -80,6 +82,10 @@ type Confirmation = {
   action: () => Promise<void>;
   refresh?: () => Promise<void>;
 } | null;
+type Feedback = {
+  tone: "success" | "error";
+  message: string;
+};
 
 const idleTaskStatus: ManagedTaskStatus = {
   phase: "idle",
@@ -125,7 +131,7 @@ function App() {
   const [gatewayModelOptions, setGatewayModelOptions] = useState<string[]>([]);
   const [taskStatus, setTaskStatus] = useState<ManagedTaskStatus>(idleTaskStatus);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
   const [profileActivation, setProfileActivation] =
@@ -158,6 +164,14 @@ function App() {
   );
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
+  const notifySuccess = useCallback(
+    (message: string) => setFeedback({ tone: "success", message }),
+    [],
+  );
+  const notifyError = useCallback(
+    (reason: unknown) => setFeedback({ tone: "error", message: errorMessage(reason) }),
+    [],
+  );
 
   const busy = actionBusy || profileActivation?.status === "switching";
   const refresh = useCallback(async () => {
@@ -209,64 +223,67 @@ function App() {
       const report = await api.installCodexEnvironment();
       setCodexEnvironmentInstall(report);
       setCodexEnvironment(report.environment);
-      setNotice(report.message);
+      notifySuccess(report.message);
     } catch (reason) {
-      setError(errorMessage(reason));
+      notifyError(reason);
     } finally {
       setCodexEnvironmentBusy(false);
     }
-  }, []);
-  const installAppUpdate = useCallback(async (update: AppUpdateInfo) => {
-    setAppUpdateBusy(true);
-    setAppUpdateStatus(null);
-    setAppUpdateProgress({
-      phase: "checking",
-      channel: update.channel,
-      version: update.version,
-      current_version: update.current_version,
-      downloaded_bytes: 0,
-      content_length: null,
-      progress_percent: null,
-      message: "正在准备下载更新。",
-      updated_at_ms: Date.now(),
-    });
-    try {
-      await api.installAppUpdate(update.channel);
-      setAppUpdateProgress((current) =>
-        current?.phase === "restarting"
-          ? current
-          : {
-              phase: "restarting",
-              channel: update.channel,
-              version: update.version,
-              current_version: update.current_version,
-              downloaded_bytes: current?.downloaded_bytes ?? 0,
-              content_length: current?.content_length ?? null,
-              progress_percent: 100,
-              message: "更新已安装，应用即将重启。",
-              updated_at_ms: Date.now(),
-            },
-      );
-      setNotice("更新已安装，应用将重启。");
-    } catch (reason) {
-      const message = errorMessage(reason);
-      setAppUpdateStatus(message);
-      setAppUpdateProgress((current) => ({
-        phase: "failed",
+  }, [notifyError, notifySuccess]);
+  const installAppUpdate = useCallback(
+    async (update: AppUpdateInfo) => {
+      setAppUpdateBusy(true);
+      setAppUpdateStatus(null);
+      setAppUpdateProgress({
+        phase: "checking",
         channel: update.channel,
         version: update.version,
         current_version: update.current_version,
-        downloaded_bytes: current?.downloaded_bytes ?? 0,
-        content_length: current?.content_length ?? null,
-        progress_percent: current?.progress_percent ?? null,
-        message,
+        downloaded_bytes: 0,
+        content_length: null,
+        progress_percent: null,
+        message: "正在准备下载更新。",
         updated_at_ms: Date.now(),
-      }));
-      throw reason;
-    } finally {
-      setAppUpdateBusy(false);
-    }
-  }, []);
+      });
+      try {
+        await api.installAppUpdate(update.channel);
+        setAppUpdateProgress((current) =>
+          current?.phase === "restarting"
+            ? current
+            : {
+                phase: "restarting",
+                channel: update.channel,
+                version: update.version,
+                current_version: update.current_version,
+                downloaded_bytes: current?.downloaded_bytes ?? 0,
+                content_length: current?.content_length ?? null,
+                progress_percent: 100,
+                message: "更新已安装，应用即将重启。",
+                updated_at_ms: Date.now(),
+              },
+        );
+        notifySuccess("更新已安装，应用将重启。");
+      } catch (reason) {
+        const message = errorMessage(reason);
+        setAppUpdateStatus(message);
+        setAppUpdateProgress((current) => ({
+          phase: "failed",
+          channel: update.channel,
+          version: update.version,
+          current_version: update.current_version,
+          downloaded_bytes: current?.downloaded_bytes ?? 0,
+          content_length: current?.content_length ?? null,
+          progress_percent: current?.progress_percent ?? null,
+          message,
+          updated_at_ms: Date.now(),
+        }));
+        throw reason;
+      } finally {
+        setAppUpdateBusy(false);
+      }
+    },
+    [notifySuccess],
+  );
   const requestAppUpdateInstall = useCallback(
     (update: AppUpdateInfo) => {
       setConfirmation({
@@ -365,7 +382,7 @@ function App() {
             notifiedInvalidProfileIds.current.add(profile.id);
           }
           const aliases = newlyInvalid.map((profile) => profile.alias).join("、");
-          setNotice(`档案 ${aliases} 已失效，请重新授权后再使用。`);
+          notifyError(`档案 ${aliases} 已失效，请重新授权后再使用。`);
         }
         await refresh();
       } catch {
@@ -374,7 +391,7 @@ function App() {
         quotaRefreshInFlight.current = false;
       }
     },
-    [page, refresh],
+    [notifyError, page, refresh],
   );
   useEffect(() => {
     void refresh();
@@ -430,7 +447,7 @@ function App() {
       (event) => {
         if (!mounted) return;
         setHistorySyncStatus(event.payload);
-        setNotice(event.payload.message);
+        notifySuccess(event.payload.message);
       },
     )
       .then((nextUnlisten) => {
@@ -444,7 +461,7 @@ function App() {
       mounted = false;
       unlisten?.();
     };
-  }, []);
+  }, [notifySuccess]);
   useEffect(() => {
     const media = window.matchMedia(COMPACT_SIDEBAR_QUERY);
     const update = (event: MediaQueryListEvent | MediaQueryList) => {
@@ -504,22 +521,24 @@ function App() {
     }
   }, [refreshQuotaSummaries, taskStatus.phase]);
   useEffect(() => {
-    if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(null), 4000);
+    if (!feedback) return;
+    const timer = window.setTimeout(() => setFeedback(null), 4000);
     return () => window.clearTimeout(timer);
-  }, [notice]);
+  }, [feedback]);
   const execute = async (
     action: () => Promise<unknown>,
     message?: string,
     refreshAction?: () => Promise<void>,
+    onSuccess?: () => void,
   ) => {
     setActionBusy(true);
     try {
       await action();
       await (refreshAction ?? refreshCurrentPage)();
-      if (message) setNotice(message);
+      if (message) notifySuccess(message);
+      onSuccess?.();
     } catch (reason) {
-      setError(errorMessage(reason));
+      notifyError(reason);
     } finally {
       setActionBusy(false);
     }
@@ -529,43 +548,37 @@ function App() {
       const profile = await api.syncProfileAccountInfo(id);
       await refresh();
       const quota = profile.account?.quota;
-      setNotice(
+      notifySuccess(
         quota?.status === "available"
           ? "账号资料与额度已刷新。"
           : quota?.message || "账号资料已刷新，但上游暂未返回额度。",
       );
       return profile;
     } catch (reason) {
-      setError(errorMessage(reason));
+      notifyError(reason);
       throw reason;
     }
   };
   const selectProfileDirect = async (id: string, confirmedDesktopRestart = false) => {
-    setActionBusy(true);
-    try {
-      const activation = await api.selectProfile(id, confirmedDesktopRestart);
-      if (activation.history_sync_status) {
-        setHistorySyncStatus(activation.history_sync_status);
-      }
-      if (activation.status === "switching") {
-        setProfileActivation(activation);
-        return;
-      }
-      await refresh();
-      setNotice(activation.message);
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setActionBusy(false);
+    const activation = await api.selectProfile(id, confirmedDesktopRestart);
+    if (activation.history_sync_status) {
+      setHistorySyncStatus(activation.history_sync_status);
     }
+    if (activation.status === "switching") {
+      setProfileActivation(activation);
+      return;
+    }
+    await refresh();
+    notifySuccess(activation.message);
   };
   const selectProfile = async (id: string) => {
     setConfirmation({
       title: "关闭并切换 Codex 客户端？",
       detail:
-        "切换账号会先请求正常退出 ChatGPT/Codex，再复用原客户端数据目录启动。已保存的聊天记录、记忆、设置与状态会保留，但未发送内容可能丢失。",
+        "切换账号会先请求正常退出 ChatGPT/Codex，恢复共享会话历史，再复用原客户端数据目录启动。已保存的聊天记录、记忆、设置与状态会保留，但未发送内容可能丢失。",
       confirmLabel: "关闭并切换",
       action: () => selectProfileDirect(id, true),
+      refresh: async () => {},
     });
   };
   const startManagedTask = async (input: StartManagedTaskInput) => {
@@ -573,9 +586,9 @@ function App() {
     try {
       const status = await api.startManagedTask(input);
       await refresh();
-      setNotice(status.message);
+      notifySuccess(status.message);
     } catch (reason) {
-      setError(errorMessage(reason));
+      notifyError(reason);
     } finally {
       setActionBusy(false);
     }
@@ -594,11 +607,12 @@ function App() {
           if (next.history_sync_status) setHistorySyncStatus(next.history_sync_status);
           if (next.status !== "switching") {
             await refresh();
-            setNotice(next.message);
+            if (next.status === "activated") notifySuccess(next.message);
+            else notifyError(next.message);
           }
         })
         .catch((reason) => {
-          if (!timedOut) setError(errorMessage(reason));
+          if (!timedOut) notifyError(reason);
         });
     };
     poll();
@@ -614,13 +628,19 @@ function App() {
             }
           : current,
       );
-      setError("账号切换状态超时。请确认 ChatGPT/Codex 已退出后重试。");
+      notifyError("账号切换状态超时。请确认 ChatGPT/Codex 已退出后重试。");
     }, PROFILE_ACTIVATION_TIMEOUT_MS);
     return () => {
       window.clearInterval(timer);
       window.clearTimeout(deadline);
     };
-  }, [profileActivation?.attempt_id, profileActivation?.status, refresh]);
+  }, [
+    notifyError,
+    notifySuccess,
+    profileActivation?.attempt_id,
+    profileActivation?.status,
+    refresh,
+  ]);
   const requestCancelManagedTask = () =>
     setConfirmation({
       title: "停止正在运行的受管任务？",
@@ -629,7 +649,7 @@ function App() {
       action: async () => {
         const status = await api.cancelManagedTask();
         await refresh();
-        setNotice(status.message);
+        notifySuccess(status.message);
       },
     });
   const requestDelete = (
@@ -716,7 +736,8 @@ function App() {
       startManagedTask={startManagedTask}
       requestCancelManagedTask={requestCancelManagedTask}
       requestDelete={requestDelete}
-      notify={setNotice}
+      notify={notifySuccess}
+      notifyError={notifyError}
       appUpdateSettings={appUpdateSettings}
       availableAppUpdate={availableAppUpdate}
       appUpdateStatus={appUpdateStatus}
@@ -790,7 +811,7 @@ function App() {
           <NavItem
             active={page === "dashboard"}
             icon={<ChartPieSlice size={20} />}
-            label="总览"
+            label="工作台"
             onClick={() => navigate("dashboard")}
           />
           <NavItem
@@ -884,23 +905,26 @@ function App() {
           ref={contentScroll}
         >
           {error && (
-            <div className="error-banner" role="alert">
-              <ShieldWarning size={20} weight="fill" />
-              <div>
-                <strong>无法读取本机状态</strong>
-                <p>{error}</p>
-              </div>
-              <button
-                className="text-button"
-                type="button"
-                onClick={() => {
-                  setError(null);
-                  void refreshCurrentPage();
-                }}
-              >
-                重试
-              </button>
-            </div>
+            <InlineNotice
+              action={
+                <Button
+                  onClick={() => {
+                    setError(null);
+                    void refreshCurrentPage();
+                  }}
+                  size="sm"
+                  variant="quiet"
+                >
+                  重试
+                </Button>
+              }
+              className="error-banner"
+              icon={<ShieldWarning size={20} weight="fill" />}
+              title="无法读取本机状态"
+              tone="danger"
+            >
+              {error}
+            </InlineNotice>
           )}
           <Suspense fallback={<PageSkeleton />}>
             <div className="page-stage" key={page}>
@@ -908,9 +932,17 @@ function App() {
             </div>
           </Suspense>
         </div>
-        {notice && (
-          <div className="toast" role="status">
-            {notice}
+        {feedback && (
+          <div
+            className={`toast toast-${feedback.tone}`}
+            role={feedback.tone === "error" ? "alert" : "status"}
+          >
+            {feedback.tone === "error" ? (
+              <WarningCircle className="toast-icon" size={18} weight="fill" />
+            ) : (
+              <CheckCircle className="toast-icon" size={18} weight="fill" />
+            )}
+            <span>{feedback.message}</span>
           </div>
         )}
       </section>
@@ -948,6 +980,7 @@ function PageContent({
   requestCancelManagedTask,
   requestDelete,
   notify,
+  notifyError,
   appUpdateSettings,
   availableAppUpdate,
   appUpdateStatus,
@@ -984,6 +1017,7 @@ function PageContent({
     action: () => Promise<unknown>,
     message?: string,
     refreshAction?: () => Promise<void>,
+    onSuccess?: () => void,
   ) => Promise<void>;
   selectProfile: (id: string) => Promise<void>;
   syncProfileAccount: (id: string) => Promise<MaskedProfile>;
@@ -996,6 +1030,7 @@ function PageContent({
     refreshAction?: () => Promise<void>,
   ) => void;
   notify: (message: string) => void;
+  notifyError: (reason: unknown) => void;
   appUpdateSettings: AppUpdateSettings;
   availableAppUpdate: AppUpdateInfo | null;
   appUpdateStatus: string | null;
@@ -1063,47 +1098,54 @@ function PageContent({
         onRefreshModels={(id) =>
           execute(() => api.refreshProfileModels(id), "可用模型已从上游刷新。")
         }
-        onCreateApiProfile={(input) =>
-          api.createApiServiceProfile(input).then(async () => {
+        onCreateApiProfile={async (input) => {
+          try {
+            await api.createApiServiceProfile(input);
             await onRefresh();
             notify("第三方模型提供商已保存，已保留你选择的模型映射。");
-          })
-        }
-        onUpdateApiProfile={(input) =>
-          api.updateApiServiceProfile(input).then(async (result) => {
+          } catch (reason) {
+            notifyError(reason);
+            throw reason;
+          }
+        }}
+        onUpdateApiProfile={async (input) => {
+          try {
+            const result = await api.updateApiServiceProfile(input);
             await onRefresh();
             await onRefreshCollaboration();
             if (result.codex_config?.history_sync_status) {
               onHistorySyncStatus(result.codex_config.history_sync_status);
             }
             notify(result.codex_config?.message ?? "第三方模型提供商已更新。");
-          })
-        }
-        onTogglePool={(profile) =>
-          execute(
-            async () => {
-              const models =
-                !profile.in_pool && !profile.models.length
-                  ? (await api.refreshProfileModels(profile.id)).models
-                  : profile.models;
-              await api.updateProfile({
-                id: profile.id,
-                alias: profile.alias,
-                enabled: profile.enabled,
-                in_pool: !profile.in_pool,
-                priority: profile.priority,
-                weight: profile.weight,
-                models,
-                api_key: null,
-              });
-            },
-            profile.in_pool ? "已移出网关账号池。" : "已加入网关账号池。",
-            async () => {
-              await onRefresh();
-              await onRefreshCollaboration();
-            },
-          )
-        }
+          } catch (reason) {
+            notifyError(reason);
+            throw reason;
+          }
+        }}
+        onTogglePool={async (profile) => {
+          try {
+            const models =
+              !profile.in_pool && !profile.models.length
+                ? (await api.refreshProfileModels(profile.id)).models
+                : profile.models;
+            await api.updateProfile({
+              id: profile.id,
+              alias: profile.alias,
+              enabled: profile.enabled,
+              in_pool: !profile.in_pool,
+              priority: profile.priority,
+              weight: profile.weight,
+              models,
+              api_key: null,
+            });
+            await onRefresh();
+            await onRefreshCollaboration();
+            notify(profile.in_pool ? "已移出网关账号池。" : "已加入网关账号池。");
+          } catch (reason) {
+            notifyError(reason);
+            throw reason;
+          }
+        }}
         onConfigurePool={(profile, priority, weight, models) =>
           execute(
             () =>
@@ -1124,15 +1166,20 @@ function PageContent({
             },
           )
         }
-        onActivateApiProfile={(profile) =>
-          execute(async () => {
+        onActivateApiProfile={async (profile) => {
+          try {
             const status = await api.activateApiServiceProfile(profile.id);
             if (status.history_sync_status) {
               onHistorySyncStatus(status.history_sync_status);
             }
+            await onRefresh();
+            await onRefreshCollaboration();
             notify(status.message);
-          })
-        }
+          } catch (reason) {
+            notifyError(reason);
+            throw reason;
+          }
+        }}
         onDelete={(id, alias) =>
           requestDelete(
             `删除“${alias}”？`,
@@ -1300,7 +1347,7 @@ function PageSkeleton() {
 
 function pageLabel(page: Page) {
   return {
-    dashboard: "总览",
+    dashboard: "工作台",
     profiles: "档案",
     gateway: "网关",
     sessions: "会话",
@@ -1324,9 +1371,9 @@ function LoadingState({
       <h1>{error ? "本机核心暂不可用" : "正在连接安全本机核心…"}</h1>
       <p>{error ?? "只会读取经过掩码处理的状态与聚合指标。"}</p>
       {error && (
-        <button className="primary-button" type="button" onClick={() => void retry()}>
+        <Button onClick={() => void retry()} variant="primary">
           重新连接
-        </button>
+        </Button>
       )}
     </div>
   );
@@ -1344,25 +1391,28 @@ function ConfirmDialog({
     action: () => Promise<unknown>,
     message?: string,
     refreshAction?: () => Promise<void>,
+    onSuccess?: () => void,
   ) => Promise<void>;
 }) {
   return (
     <Dialog
+      busy={busy}
       description={confirmation.detail}
       footer={
         <>
-          <Button onClick={close} variant="quiet">
+          <Button disabled={busy} onClick={close} variant="quiet">
             取消
           </Button>
           <Button
-            disabled={busy}
+            loading={busy}
+            loadingLabel="正在处理"
             onClick={() => {
               void execute(
                 confirmation.action,
                 confirmation.successMessage,
                 confirmation.refresh,
+                close,
               );
-              close();
             }}
             variant="danger"
           >
@@ -1387,6 +1437,7 @@ function AppUpdateProgressDialog({
   const failed = progress.phase === "failed";
   return (
     <Dialog
+      busy={!failed}
       description={progress.message}
       footer={
         failed ? (
@@ -1395,7 +1446,7 @@ function AppUpdateProgressDialog({
           </Button>
         ) : undefined
       }
-      onClose={failed ? onClose : undefined}
+      onClose={onClose}
       open
       title={`正在更新到 Codex Relay ${progress.version}`}
     >
@@ -1471,7 +1522,7 @@ function ProfileActivationDialog({
   activation: CurrentProfileActivation;
 }) {
   return (
-    <Dialog description={activation.message} open title="正在切换已保存的账号">
+    <Dialog busy description={activation.message} open title="正在切换已保存的账号">
       <p>无需重新 OAuth。ChatGPT Chat/Work 的独立登录会话不会被读取、写入或切换。</p>
     </Dialog>
   );
@@ -1482,9 +1533,9 @@ function formatAppUpdateChannel(channel: AppUpdateChannel) {
 }
 
 function errorMessage(reason: unknown) {
-  return reason instanceof RelayError
-    ? reason.message
-    : "发生了安全错误，请检查本机服务后重试。";
+  if (reason instanceof RelayError || reason instanceof Error) return reason.message;
+  if (typeof reason === "string") return reason;
+  return "发生了安全错误，请检查本机服务后重试。";
 }
 
 export default App;

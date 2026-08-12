@@ -232,6 +232,9 @@ describe("Settings", () => {
     expect(screen.getByText("Relay CA 信任")).toBeInTheDocument();
     expect(screen.getByText("失败")).toBeInTheDocument();
     expect(screen.getByText(/permission denied/)).toBeInTheDocument();
+    expect(screen.queryByText("无需处理。")).not.toBeInTheDocument();
+    expect(screen.queryByText("修复详情")).not.toBeInTheDocument();
+    expect(screen.getByText("处理建议")).toBeInTheDocument();
     const deployButtons = screen.getAllByRole("button", { name: "一键部署缺失项" });
     const copyButtons = screen.getAllByRole("button", { name: "复制修复命令" });
     expect(deployButtons[deployButtons.length - 1]).toBeDisabled();

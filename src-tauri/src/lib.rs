@@ -36,6 +36,8 @@ pub fn run() {
         .setup(|app| initialise(app))
         .invoke_handler(tauri::generate_handler![
             commands::dashboard_snapshot,
+            commands::gateway_performance,
+            commands::list_gateway_request_metrics,
             commands::list_profiles,
             commands::create_profile,
             commands::create_api_service_profile,

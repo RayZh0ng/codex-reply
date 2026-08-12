@@ -4341,10 +4341,11 @@ fn write_gateway_config_to_home(
     data_dir: &Path,
 ) -> AppResult<()> {
     fs::create_dir_all(home).map_err(|_| AppError::RuntimeUnavailable)?;
+    let catalog_path = home.join(COLLABORATION_MODEL_CATALOG_FILENAME);
     let mut document = DocumentMut::new();
     document["model_provider"] = toml_value(COLLABORATION_GATEWAY_PROVIDER);
     document["model"] = toml_value(model);
-    document["model_catalog_json"] = toml_value(COLLABORATION_MODEL_CATALOG_FILENAME);
+    document["model_catalog_json"] = toml_value(catalog_path.display().to_string());
     let providers = document["model_providers"].or_insert(Item::Table(Table::new()));
     let providers = providers
         .as_table_like_mut()
@@ -5132,6 +5133,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::Arc,
     };
+    use toml_edit::DocumentMut;
     use uuid::Uuid;
 
     #[test]
@@ -5149,9 +5151,18 @@ mod tests {
         )
         .unwrap();
         let config = fs::read_to_string(root.join("config.toml")).unwrap();
+        let document = config.parse::<DocumentMut>().unwrap();
+        let expected_catalog_path = root
+            .join(COLLABORATION_MODEL_CATALOG_FILENAME)
+            .display()
+            .to_string();
         assert!(config.contains(r#"model = "third-party-coder""#));
         assert!(config.contains(r#"base_url = "https://127.0.0.1:53765/v1""#));
         assert!(config.contains("--relay-gateway-token"));
+        assert_eq!(
+            document["model_catalog_json"].as_str(),
+            Some(expected_catalog_path.as_str())
+        );
         let catalog = fs::read_to_string(root.join(COLLABORATION_MODEL_CATALOG_FILENAME)).unwrap();
         assert!(catalog.contains("third-party-coder"));
         let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
@@ -6276,6 +6287,9 @@ mod tests {
                     validation_status: "unknown".to_owned(),
                     validated_at_ms: None,
                     validation_message: None,
+                    max_concurrency: 4,
+                    max_queue_depth: 8,
+                    queue_timeout_ms: 15_000,
                 },
                 secret_ref: Some("profile:profile-1:oauth".into()),
                 credential_fingerprint: None,
@@ -6309,6 +6323,9 @@ mod tests {
                     validation_status: "unknown".to_owned(),
                     validated_at_ms: None,
                     validation_message: None,
+                    max_concurrency: 4,
+                    max_queue_depth: 8,
+                    queue_timeout_ms: 15_000,
                 },
                 secret_ref: Some(format!("profile:{id}:api-key")),
                 credential_fingerprint: None,

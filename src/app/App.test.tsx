@@ -234,7 +234,7 @@ describe("App", () => {
     });
 
     render(<App />);
-    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+    await screen.findByRole("heading", { name: "任务工作台" });
 
     act(() => {
       emitTauriEvent("app-update-progress", {
@@ -254,6 +254,7 @@ describe("App", () => {
       "正在更新到 Codex Relay 0.2.0-beta.2",
     );
     expect(screen.getByRole("dialog")).toHaveTextContent("40%");
+    expect(screen.getByRole("dialog")).toHaveAttribute("aria-busy", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(
@@ -276,6 +277,7 @@ describe("App", () => {
     });
 
     expect(screen.getByRole("dialog")).toHaveTextContent("更新下载或安装失败");
+    expect(screen.getByRole("dialog")).not.toHaveAttribute("aria-busy");
     expect(screen.getByRole("button", { name: "关闭" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "立即检查更新" })).toBeEnabled();
   });
@@ -428,7 +430,7 @@ describe("App", () => {
     });
 
     const { container } = render(<App />);
-    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+    await screen.findByRole("heading", { name: "任务工作台" });
 
     expect(native.invoke).not.toHaveBeenCalledWith(
       "list_collaboration_bots",
@@ -461,7 +463,7 @@ describe("App", () => {
       return Promise.reject(new Error(`unexpected command: ${command}`));
     });
     const { container } = render(<App />);
-    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+    await screen.findByRole("heading", { name: "任务工作台" });
 
     fireEvent.click(screen.getByRole("button", { name: "收起侧边栏" }));
     expect(container.querySelector(".app-shell")).toHaveClass("is-sidebar-collapsed");
@@ -497,7 +499,7 @@ describe("App", () => {
       return Promise.reject(new Error(`unexpected command: ${command}`));
     });
     const { container } = render(<App />);
-    await screen.findByRole("heading", { name: "今天，服务一切就绪。" });
+    await screen.findByRole("heading", { name: "任务工作台" });
 
     expect(container.querySelectorAll(".nav-icon").length).toBeGreaterThan(0);
 
@@ -611,7 +613,9 @@ describe("App", () => {
       "关闭并切换 Codex 客户端？",
     );
     fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
-    expect(await screen.findByRole("dialog")).toHaveTextContent("正在切换已保存的账号");
+    await waitFor(() =>
+      expect(screen.getByRole("dialog")).toHaveTextContent("正在切换已保存的账号"),
+    );
     expect(screen.queryByRole("button", { name: "取消登录" })).not.toBeInTheDocument();
   });
 
@@ -708,7 +712,7 @@ describe("App", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "关闭并切换" }));
     await waitFor(() =>
-      expect(screen.getByRole("status")).toHaveTextContent(
+      expect(screen.getByRole("alert")).toHaveTextContent(
         "无法更新默认 Codex auth.json；请确认文件权限后重试",
       ),
     );
@@ -885,7 +889,42 @@ describe("App", () => {
     );
   });
 
-  it("updates active direct API profile OAuth binding through the sync command", async () => {
+  it("shows profile operation failures as error feedback without a global state error", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", {
+      configurable: true,
+      value: {},
+    });
+    native.invoke.mockImplementation((command: string) => {
+      if (command === "dashboard_snapshot") return Promise.resolve(snapshot);
+      if (command === "managed_task_status")
+        return Promise.resolve(idleTaskStatusForTest());
+      if (command === "desktop_workspace_settings")
+        return Promise.resolve({ mode: "per_profile" });
+      if (command === "list_desktop_workspaces") return Promise.resolve([]);
+      if (command === "refresh_profile_quotas")
+        return Promise.resolve({ profiles: [], failed_profile_ids: [] });
+      if (command === "refresh_profile_models") {
+        return Promise.reject({
+          code: "profile_update_failed",
+          message: "保存失败",
+        });
+      }
+      return Promise.reject(new Error(`unexpected command: ${command}`));
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "档案" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "加入网关账号池：当前账号" }),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveClass("toast-error");
+    expect(alert).toHaveTextContent("保存失败");
+    expect(screen.queryByText("无法读取本机状态")).not.toBeInTheDocument();
+  });
+
+  it("treats an active direct OAuth projection warning as a successful update", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: true,
       value: {},
@@ -944,7 +983,7 @@ describe("App", () => {
               oauth_profile_id: "oauth-b",
               oauth_profile_alias: "Work B",
               message:
-                "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
+                "所选 OAuth 登录档案未能应用；ChatGPT.app 将保持当前登录账号。模型请求仍走第三方提供商。已同步会话并重启 ChatGPT.app。",
             },
           });
         }
@@ -985,7 +1024,7 @@ describe("App", () => {
       }),
     );
     expect(screen.getByRole("status")).toHaveTextContent(
-      "OAuth 登录档案已写入并验证为所选账号；模型请求仍走第三方提供商。已重启 Codex。",
+      "所选 OAuth 登录档案未能应用；ChatGPT.app 将保持当前登录账号。模型请求仍走第三方提供商。已同步会话并重启 ChatGPT.app。",
     );
     expect(
       native.invoke.mock.calls.some(
