@@ -5047,7 +5047,6 @@ fn usage_breakdown(value: &Value) -> (i64, i64, i64) {
     (input, output, total)
 }
 
-#[cfg(test)]
 fn usage_tokens_from_value(value: &Value) -> i64 {
     usage_breakdown(value).2
 }

@@ -2230,7 +2230,6 @@ impl Repository {
         })
     }
 
-    #[cfg(test)]
     pub fn add_estimated_tokens(&self, estimated_tokens: i64) -> AppResult<()> {
         if estimated_tokens <= 0 {
             return Ok(());
